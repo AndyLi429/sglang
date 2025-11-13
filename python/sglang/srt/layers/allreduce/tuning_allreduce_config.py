@@ -368,8 +368,8 @@ def tune_batch_size(
 
 
 def get_default_batch_sizes() -> List[int]:
-    """Get default batch sizes to tune: range(1,3) + range(32, 512, 8)"""
-    return list(range(1, 32)) + list(range(32, 512, 8))
+    """Get default batch sizes to tune: range(1,513)"""
+    return list(range(1, 513))
 
 
 def main(args):
@@ -519,7 +519,7 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         default=None,
-        help="Batch sizes to tune (default: range(1,32)+range(32,512,8))",
+        help="Batch sizes to tune (default: range(1,513))",
     )
     parser.add_argument(
         "--output-dir",
