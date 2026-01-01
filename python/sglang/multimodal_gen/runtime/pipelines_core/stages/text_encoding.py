@@ -45,6 +45,17 @@ class TextEncodingStage(PipelineStage):
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
 
+    def load_model(self):
+        if self.server_args.text_encoder_cpu_offload:
+            device = get_local_torch_device()
+            for text_encoder in self.text_encoders:
+                text_encoder.to(device)
+
+    def offload_model(self):
+        if self.server_args.text_encoder_cpu_offload:
+            for text_encoder in self.text_encoders:
+                text_encoder.to("cpu", non_blocking=True)
+
     @torch.no_grad()
     def forward(
         self,
