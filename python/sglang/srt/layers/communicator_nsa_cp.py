@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.cp_utils import is_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -29,6 +30,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 
 
 def nsa_enable_prefill_cp():
@@ -105,7 +107,7 @@ class NSACPCommunicateSimpleFn(CommunicateSimpleFn):
         context: CommunicateContext,
     ) -> torch.Tensor:
 
-        if nsa_enable_prefill_cp():
+        if nsa_enable_prefill_cp() or is_enable_prefill_cp():
             return hidden_states
         else:
             assert False, "Not implemented"
@@ -176,7 +178,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         residual_input_mode,
     ):
-        if nsa_enable_prefill_cp():
+        if nsa_enable_prefill_cp() or is_enable_prefill_cp():
             hidden_states += residual
             if hidden_states.shape[0] != 0:
                 hidden_states = layernorm(hidden_states)
@@ -196,6 +198,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
     ):
         if nsa_enable_prefill_cp():
             if hidden_states.shape[0] != 0:
+                hidden_states, residual = layernorm(hidden_states, residual)
+            return hidden_states, residual
+        elif is_enable_prefill_cp():
+            if hidden_states.shape[0] != 0:
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)
             return hidden_states, residual
         else:
@@ -250,7 +257,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        if nsa_enable_prefill_cp():
+        if nsa_enable_prefill_cp() or is_enable_prefill_cp():
             return hidden_states, residual
         else:
             assert False, "not yet handled"
@@ -265,7 +272,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         hidden_states += residual
         residual = None
-        if nsa_enable_prefill_cp():
+        if nsa_enable_prefill_cp() or is_enable_prefill_cp():
             return hidden_states, residual
         else:
             assert False, "not yet handled"
@@ -277,7 +284,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ):
-        if nsa_enable_prefill_cp():
+        if nsa_enable_prefill_cp() or is_enable_prefill_cp():
             return hidden_states, residual
         else:
             assert False, "not yet handled"
