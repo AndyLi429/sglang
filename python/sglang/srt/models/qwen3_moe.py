@@ -19,7 +19,8 @@
 
 import logging
 import math
-from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
+from contextlib import nullcontext
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import nn
@@ -35,7 +36,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -58,6 +59,14 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    prepare_input_dp_with_cp_dsa,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    nsa_use_prefill_cp,
+    is_nsa_enable_prefill_cp,
+)
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -900,8 +909,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.model = Qwen3MoeModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            decoder_layer_type=Qwen3MoeDecoderLayer,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -911,7 +924,19 @@ class Qwen3MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+        # PCP (Prefill Context Parallelism) configuration
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attention_tp_size()
+        else:
+            self.cp_rank = self.cp_size = None
+
+        # Qwen3MoE does not support NSA
+        self.use_nsa = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -925,6 +950,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Prepare PCP metadata if enabled
+        if self.nsa_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    input_ids.device,
+                )
+
         hidden_states = self.model(
             input_ids,
             positions,
@@ -932,11 +968,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states

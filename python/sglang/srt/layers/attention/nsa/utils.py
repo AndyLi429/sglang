@@ -165,7 +165,6 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
-        and use_nsa
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_nsa_enable_prefill_cp()
     ):
