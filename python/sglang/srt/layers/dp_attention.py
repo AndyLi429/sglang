@@ -88,14 +88,14 @@ class DpPaddingMode(IntEnum):
 
 class _DpGatheredBufferWrapper:
 
-    _hidden_size: int
+    _hidden_size: int=0
     _dtype: torch.dtype
     _device: torch.device
-    _global_dp_buffer_len: int
-    _local_dp_buffer_len: int
-    _dp_max_padding: bool
-    _global_num_tokens: Optional[List[int]]
-    _is_extend_in_batch: bool
+    _global_dp_buffer_len: int=0
+    _local_dp_buffer_len: int=0
+    _dp_max_padding: bool=False
+    _global_num_tokens: Optional[List[int]]=None
+    _is_extend_in_batch: bool=False
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -333,11 +333,11 @@ def initialize_dp_attention(
     )
 
 def get_pcp_rank() -> int:
-    assert _ATTN_PCP_RANK is not None, "dp attention not initialized!"
+    assert _ATTN_PCP_RANK is not None, "pcp attention not initialized!"
     return _ATTN_PCP_RANK
 
 def get_pcp_size() -> int:
-    assert _ATTN_PCP_SIZE is not None, "dp attention not initialized!"
+    assert _ATTN_PCP_SIZE is not None, "pcp attention not initialized!"
     return _ATTN_PCP_SIZE
 
 
