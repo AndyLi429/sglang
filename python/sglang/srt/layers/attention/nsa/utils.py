@@ -56,7 +56,7 @@ def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
 
 
 def is_nsa_enable_prefill_cp():
-    return get_global_server_args().enable_nsa_prefill_context_parallel
+    return get_global_server_args().enable_nsa_prefill_context_parallel 
 
 
 def is_nsa_prefill_cp_in_seq_split():
@@ -611,9 +611,5 @@ def prepare_input_dp_with_cp_dsa(
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
             tail_end_global=tail_end_global,
-            kv_len_prev=kv_len_prev,
-            kv_len_next=kv_len_next,
-            actual_seq_q_prev=actual_seq_q_prev,
-            actual_seq_q_next=actual_seq_q_next,
         )
     return cp_metadata

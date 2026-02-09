@@ -566,12 +566,10 @@ class LayerCommunicator:
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
-        dp_padding_mode = forward_batch.dp_padding_mode
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
-            and dp_padding_mode is not None
-            and dp_padding_mode.is_max_len()
+            and forward_batch.dp_padding_mode.is_max_len()
         ):
             return True
         if nsa_use_prefill_cp(forward_batch):

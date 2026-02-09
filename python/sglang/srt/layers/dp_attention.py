@@ -88,14 +88,14 @@ class DpPaddingMode(IntEnum):
 
 class _DpGatheredBufferWrapper:
 
-    _hidden_size: int=0
+    _hidden_size: int
     _dtype: torch.dtype
     _device: torch.device
-    _global_dp_buffer_len: int=0
-    _local_dp_buffer_len: int=0
-    _dp_max_padding: bool=False
-    _global_num_tokens: Optional[List[int]]=None
-    _is_extend_in_batch: bool=False
+    _global_dp_buffer_len: int
+    _local_dp_buffer_len: int
+    _dp_max_padding: bool
+    _global_num_tokens: Optional[List[int]]
+    _is_extend_in_batch: bool
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):

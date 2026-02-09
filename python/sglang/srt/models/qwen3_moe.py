@@ -19,7 +19,6 @@
 
 import logging
 import math
-from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
@@ -62,10 +61,7 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     prepare_input_dp_with_cp_dsa,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    nsa_use_prefill_cp,
-    is_nsa_enable_prefill_cp,
+    is_enable_prefill_cp,
 )
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -909,7 +905,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.model = Qwen3MoeModel(
             config,
             quant_config,
@@ -928,8 +923,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.is_enable_prefill_cp = is_enable_prefill_cp()
+        if self.is_enable_prefill_cp:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
         else:
