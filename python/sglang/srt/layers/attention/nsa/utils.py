@@ -183,14 +183,8 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
     print(
-        "PCP cp_split_and_rebuild_data: input_shape=%s split_mode=%s split_list_len=%s "
-        "zigzag_index_len=%s",
-        tuple(input_.shape),
-        get_global_server_args().nsa_prefill_cp_mode,
-        None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or []),
-        None
-        if nsa_cp_metadata is None
-        else len(nsa_cp_metadata.zigzag_index or []),
+        f"PCP cp_split_and_rebuild_data: input_shape={tuple(input_.shape)} split_mode={get_global_server_args().nsa_prefill_cp_mode} split_list_len={None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or [])} "
+        f"zigzag_index_len={None if nsa_cp_metadata is None else len(nsa_cp_metadata.zigzag_index or [])}"
     )
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
@@ -211,14 +205,8 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
     print(
-        "PCP cp_split_and_rebuild_position: positions_shape=%s split_mode=%s split_list_len=%s "
-        "zigzag_index_len=%s",
-        tuple(positions.shape),
-        get_global_server_args().nsa_prefill_cp_mode,
-        None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or []),
-        None
-        if nsa_cp_metadata is None
-        else len(nsa_cp_metadata.zigzag_index or []),
+        f"PCP cp_split_and_rebuild_position: positions_shape={tuple(positions.shape)} split_mode={get_global_server_args().nsa_prefill_cp_mode} split_list_len={None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or [])} "
+        f"zigzag_index_len={None if nsa_cp_metadata is None else len(nsa_cp_metadata.zigzag_index or [])}"
     )
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
@@ -339,6 +327,9 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
+    print(
+        f"PCP cp_attn_tp_all_gather_reorganazied_into_tensor: input_shape={tuple(input_.shape)} {input_tensor_all.shape=} max_len={max_len} attn_tp_size={attn_tp_size}"
+    )
     get_attention_tp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
@@ -401,6 +392,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         )
         return output_tensor
 
+
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
@@ -413,6 +405,9 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         torch.split(
             output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
         )
+    )
+    print(
+        f"PCP cp_all_gather_rerange_output: outputs_list_len={len(outputs_list)} cp_reverse_index={forward_batch.nsa_cp_metadata.cp_reverse_index}"
     )
     output_tensor = torch.cat(
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
