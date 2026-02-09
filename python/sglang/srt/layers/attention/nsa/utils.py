@@ -166,11 +166,14 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
+        print(
+            f"cur_cp_seq_len={cur_cp_seq_len}, seq_len={seq_len}, cp_size={cp_size}, use_nsa={use_nsa}"
+        )
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_nsa_enable_prefill_cp()
+        # and is_nsa_enable_prefill_cp()
     ):
         return True
     else:
@@ -306,7 +309,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
     if (
         forward_batch.nsa_cp_metadata is not None
-        and nsa_enable_prefill_cp
+        # and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
         return True
