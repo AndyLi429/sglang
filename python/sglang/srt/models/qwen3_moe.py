@@ -435,6 +435,7 @@ class Qwen3MoeAttention(nn.Module):
         attn_tp_size = get_attention_tp_size()
 
         self.config = config
+        self.enable_prefill_cp = is_enable_prefill_cp()
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -645,7 +646,7 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         if (
             forward_batch.nsa_cp_metadata is None
-            or not nsa_use_prefill_cp(forward_batch, self.is_prefill_cp_enable)
+            or not nsa_use_prefill_cp(forward_batch, self.enable_prefill_cp)
             or self.pcp_size <= 1
         ):
             return input_tensor
@@ -944,8 +945,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.is_enable_prefill_cp = is_enable_prefill_cp()
-        if self.is_enable_prefill_cp:
+        self.enable_prefill_cp = is_enable_prefill_cp()
+        if self.enable_prefill_cp:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
         else:
@@ -970,7 +971,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                 f"can_cp_split and prepare metadata: {can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch)}"
             )
         # Prepare PCP metadata if enabled
-        if self.is_enable_prefill_cp:
+        if self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
