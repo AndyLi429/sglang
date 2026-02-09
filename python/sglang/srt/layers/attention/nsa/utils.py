@@ -179,7 +179,7 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
-    logger.info(
+    print(
         "PCP cp_split_and_rebuild_data: input_shape=%s split_mode=%s split_list_len=%s "
         "zigzag_index_len=%s",
         tuple(input_.shape),
@@ -207,7 +207,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
-    logger.info(
+    print(
         "PCP cp_split_and_rebuild_position: positions_shape=%s split_mode=%s split_list_len=%s "
         "zigzag_index_len=%s",
         tuple(positions.shape),
@@ -499,7 +499,6 @@ def prepare_input_dp_with_cp_dsa(
     kv_len,
     cp_rank,
     cp_size,
-    seqs_len,
     device
 ):
     if is_nsa_prefill_cp_round_robin_split():

@@ -69,6 +69,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    is_enable_prefill_cp,
     nsa_use_prefill_cp,
     is_nsa_enable_prefill_cp,
 )
@@ -573,6 +574,7 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.enable_prefill_cp = is_enable_prefill_cp()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -632,7 +634,8 @@ class Qwen2MoeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Apply PCP split and rebuild if enabled (similar to deepseek_v2)
-        if nsa_use_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
+            print(f"qwen2model:nsa_use_prefill_cp: {nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp)}")
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -728,7 +731,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             self.cp_rank = self.cp_size = None
 
         # NSA support flag (can be overridden by subclasses)
-        self.use_nsa = True
+        self.use_nsa = False
 
     @torch.no_grad()
     def forward(
@@ -740,13 +743,15 @@ class Qwen2MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
+        print(
+            f"can_cp_split and prepare metadata: {can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch)}"
+        )
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
                     input_ids.device,
                 )
 

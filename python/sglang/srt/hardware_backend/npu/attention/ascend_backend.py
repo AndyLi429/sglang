@@ -255,20 +255,6 @@ class AscendAttnBackend(AttentionBackend):
         """
         return [None, None]
 
-    def _all_gather_kv_for_cp(
-        self, tensor: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        if (
-            forward_batch.nsa_cp_metadata is None
-            or not nsa_use_prefill_cp(forward_batch, self.is_prefill_cp_enable)
-            or self.pcp_size <= 1
-        ):
-            return tensor
-        flattened = tensor.view(tensor.shape[0], -1)
-        gathered = cp_all_gather_rerange_output(
-            flattened, self.pcp_size, forward_batch, torch.npu.current_stream()
-        )
-        return gathered.view(-1, *tensor.shape[1:])
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -924,11 +910,6 @@ class AscendAttnBackend(AttentionBackend):
         # Combine rope and nope components if provided
         q = torch.cat([q_nope, q_rope], dim=-1) if q_rope is not None else q_nope
         k = torch.cat([k_nope, k_rope], dim=-1) if k_rope is not None else k_nope
-
-        # Allgather k and v for PCP (needed even after split as k/v are computed locally)
-        k = self._all_gather_kv_for_cp(k, forward_batch)
-        v = self._all_gather_kv_for_cp(v, forward_batch)
-
         # Save to KV cache if needed
         if save_kv_cache and k is not None and v is not None:
             cache_loc = (

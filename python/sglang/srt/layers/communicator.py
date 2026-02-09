@@ -928,12 +928,7 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
-        dp_padding_mode = forward_batch.dp_padding_mode
-        if (
-            allow_reduce_scatter
-            and dp_padding_mode is not None
-            and dp_padding_mode.is_max_len()
-        ):
+        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
