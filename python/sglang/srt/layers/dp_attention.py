@@ -298,10 +298,15 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
-    if pcp_size>1:
-        _ATTN_DP_SIZE = 1
-        _LOCAL_ATTN_DP_SIZE = 1
+    if pcp_size > 1:
+        # PCP reuses attention-TP partitioning but should not expose logical DP to
+        # downstream paths that index `global_num_tokens` by DP rank.
+        _ATTN_PCP_RANK = _ATTN_DP_RANK
         _ATTN_PCP_SIZE = pcp_size
+        _ATTN_DP_RANK = 0
+        _ATTN_DP_SIZE = 1
+        _LOCAL_ATTN_DP_RANK = 0
+        _LOCAL_ATTN_DP_SIZE = 1
 
     tp_group = get_tp_group()
     # Trick to solve circular references
