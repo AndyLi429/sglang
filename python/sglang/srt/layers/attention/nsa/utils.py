@@ -1,5 +1,7 @@
 # temp NSA debugging environ
 from itertools import accumulate
+import logging
+
 from typing import TYPE_CHECKING, List, Tuple, Union,Optional
 from dataclasses import dataclass
 
@@ -21,6 +23,8 @@ from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,7 +60,7 @@ def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
 
 
 def is_nsa_enable_prefill_cp():
-    return get_global_server_args().enable_nsa_prefill_context_parallel 
+    return get_global_server_args().enable_nsa_prefill_context_parallel
 
 
 def is_nsa_prefill_cp_in_seq_split():
@@ -174,6 +178,17 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
+    nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
+    logger.info(
+        "PCP cp_split_and_rebuild_data: input_shape=%s split_mode=%s split_list_len=%s "
+        "zigzag_index_len=%s",
+        tuple(input_.shape),
+        get_global_server_args().nsa_prefill_cp_mode,
+        None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or []),
+        None
+        if nsa_cp_metadata is None
+        else len(nsa_cp_metadata.zigzag_index or []),
+    )
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert (
@@ -191,6 +206,17 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
+    nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
+    logger.info(
+        "PCP cp_split_and_rebuild_position: positions_shape=%s split_mode=%s split_list_len=%s "
+        "zigzag_index_len=%s",
+        tuple(positions.shape),
+        get_global_server_args().nsa_prefill_cp_mode,
+        None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or []),
+        None
+        if nsa_cp_metadata is None
+        else len(nsa_cp_metadata.zigzag_index or []),
+    )
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert positions.shape[0] % cp_size == 0, (

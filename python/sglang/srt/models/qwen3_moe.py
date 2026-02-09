@@ -99,6 +99,49 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+def _log_pcp_forward_batch(
+    context: str,
+    forward_batch: ForwardBatch,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    input_embeds: Optional[torch.Tensor],
+) -> None:
+    nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
+    if nsa_cp_metadata is None:
+        return
+    logger.info(
+        "PCP %s: input_ids=%s positions=%s input_embeds=%s forward_mode=%s "
+        "batch_size=%s seq_lens=%s seq_lens_cpu=%s extend_seq_lens_cpu=%s "
+        "extend_prefix_lens_cpu=%s nsa_cp_metadata={split_list_len=%s max_rank_len=%s "
+        "zigzag_index_len=%s per_rank_actual_token=%s kv_len_prev=%s kv_len_next=%s "
+        "actual_seq_q_prev=%s actual_seq_q_next=%s total_seq_lens=%s}",
+        context,
+        tuple(input_ids.shape),
+        tuple(positions.shape),
+        None if input_embeds is None else tuple(input_embeds.shape),
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        None if forward_batch.seq_lens is None else tuple(forward_batch.seq_lens.shape),
+        None
+        if forward_batch.seq_lens_cpu is None
+        else tuple(forward_batch.seq_lens_cpu.shape),
+        forward_batch.extend_seq_lens_cpu,
+        forward_batch.extend_prefix_lens_cpu,
+        None if nsa_cp_metadata.split_list is None else len(nsa_cp_metadata.split_list),
+        nsa_cp_metadata.max_rank_len,
+        None
+        if nsa_cp_metadata.zigzag_index is None
+        else len(nsa_cp_metadata.zigzag_index),
+        nsa_cp_metadata.per_rank_actual_token,
+        nsa_cp_metadata.kv_len_prev,
+        nsa_cp_metadata.kv_len_next,
+        nsa_cp_metadata.actual_seq_q_prev,
+        nsa_cp_metadata.actual_seq_q_next,
+        None
+        if nsa_cp_metadata.total_seq_lens is None
+        else tuple(nsa_cp_metadata.total_seq_lens.shape),
+    )
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
@@ -946,7 +989,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        if self.nsa_enable_prefill_cp:
+        _log_pcp_forward_batch(
+            "Qwen3MoeForCausalLM.forward",
+            forward_batch,
+            input_ids,
+            positions,
+            input_embeds,
+        )
+        if self.is_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),

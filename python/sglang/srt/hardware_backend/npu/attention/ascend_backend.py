@@ -562,6 +562,23 @@ class AscendAttnBackend(AttentionBackend):
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+        logger.info(
+                "PCP do_cp_balance_attn: q_nope=%s k_nope=%s q_pe=%s k_pe=%s topk_indices=%s "
+                "actual_seq_qlen=%s actual_seq_lengths_kv=%s block_tables=%s layer_id=%s",
+                tuple(q_nope.shape),
+                tuple(k_nope.shape),
+                tuple(q_pe.shape),
+                tuple(k_pe.shape),
+                None if topk_indices is None else tuple(topk_indices.shape),
+                None if actual_seq_qlen is None else tuple(actual_seq_qlen.shape),
+                None
+                if actual_seq_lengths_kv is None
+                else tuple(actual_seq_lengths_kv.shape),
+                None
+                if self.forward_metadata.block_tables is None
+                else tuple(self.forward_metadata.block_tables.shape),
+                layer.layer_id,
+            )
 
         attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_prev,
