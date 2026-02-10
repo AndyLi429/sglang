@@ -145,6 +145,8 @@ class RMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
+            x = x.contiguous()
+            residual = residual.contiguous()
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             out, _, residual_out = torch_npu.npu_add_rms_norm(

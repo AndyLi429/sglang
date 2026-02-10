@@ -14,9 +14,9 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
-    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_pcp_group,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -330,8 +330,10 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     print(
         f"PCP cp_attn_tp_all_gather_reorganazied_into_tensor: input_shape={tuple(input_.shape)} {input_tensor_all.shape=} max_len={max_len} attn_tp_size={attn_tp_size}"
     )
+
     input_ = input_.contiguous()
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
+    
+    get_pcp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
     # step3
