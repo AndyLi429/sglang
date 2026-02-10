@@ -453,6 +453,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.pcp_size = get_pcp_size()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -652,10 +653,11 @@ class Qwen3MoeAttention(nn.Module):
         ):
             return input_tensor
         flattened = input_tensor.view(input_tensor.shape[0], -1)
-        print(f"qwen3_moe: _all_gather_kv_for_cp: input_tensor.shape: {input_tensor.shape}")
+        print(f"[qwen3_moe attention]: _all_gather_kv_for_cp: input_tensor.shape: {input_tensor.shape}")
         gathered = cp_all_gather_rerange_output(
             flattened, self.pcp_size, forward_batch, torch.npu.current_stream()
         )
+        print(f"[qwen3_moe attention]: _all_gather_kv_for_cp: gathered.shape: {gathered.shape}")
         return gathered.view(-1, *input_tensor.shape[1:])
 
     def forward_core(self, intermediate_state):
@@ -670,7 +672,7 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
-        if is_enable_prefill_cp():
+        if self.enable_prefill_cp:
             k = self._all_gather_kv_for_cp(k, forward_batch)
             v = self._all_gather_kv_for_cp(v, forward_batch)
 
