@@ -312,14 +312,23 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.use_attention_subgroup = (
+            server_args.enable_dp_attention
+            or server_args.prefill_context_parallel_size > 1
+        )
+        self.attn_world_dp_size = (
+            server_args.prefill_context_parallel_size
+            if server_args.prefill_context_parallel_size > 1
+            else self.dp_size
+        )
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
-                server_args.enable_dp_attention,
+                self.use_attention_subgroup,
                 self.tp_rank,
                 self.tp_size,
-                self.dp_size,
+                self.attn_world_dp_size,
             )
         )
 
@@ -579,7 +588,7 @@ class Scheduler(
         # stream/device coupling (#11910).
         self.dp_tp_group = (
             self.attn_tp_group
-            if self.server_args.enable_dp_attention
+            if self.use_attention_subgroup
             else self.tp_group
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
@@ -631,7 +640,7 @@ class Scheduler(
             is_eagle=self.spec_algorithm.is_eagle(),
             tp_cache_group=(
                 self.attn_tp_cpu_group
-                if self.server_args.enable_dp_attention
+                if self.use_attention_subgroup
                 else self.tp_cpu_group
             ),
             eviction_policy=server_args.radix_eviction_policy,
@@ -1220,7 +1229,7 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        if self.server_args.enable_dp_attention:
+        if self.use_attention_subgroup:
             if self.attn_tp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:

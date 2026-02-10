@@ -452,21 +452,42 @@ def _compute_attention_metadata(
 ):
     """Compute attention metadata for prefill checkpointing."""
     # Compute nomask seqlens
-    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
-    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
-    
+    seq_per_batch = int(seq_per_batch)
+    head_start_global = int(head_start_global)
+    head_end_global = int(head_end_global)
+    tail_start_global = int(tail_start_global)
+    tail_end_global = int(tail_end_global)
+    head_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [head_start_global]], dtype=torch.int32
+    ).to(device=device)
+    tail_attn_nomask_seqlens = torch.tensor(
+        [[seq_per_batch], [tail_start_global]], dtype=torch.int32
+    ).to(device=device)
+    attn_mask_seqlens = torch.tensor(
+        [[seq_per_batch], [seq_per_batch]], dtype=torch.int32
+    ).to(device=device)
+
     # Compute indices using torch.arange for efficiency
-    kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
-    kv_with_q_head_mask_idx_tensor = torch.arange(head_start_global, head_end_global, dtype=torch.int32, device=device)
-    kv_with_q_tail_nomask_idx_tensor = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
-    kv_with_q_tail_mask_idx_tensor = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
-    
+    kv_with_q_head_nomask_idx_tensor = torch.arange(
+        0, head_start_global, dtype=torch.int32, device=device
+    )
+    kv_with_q_head_mask_idx_tensor = torch.arange(
+        head_start_global, head_end_global, dtype=torch.int32, device=device
+    )
+    kv_with_q_tail_nomask_idx_tensor = torch.arange(
+        0, tail_start_global, dtype=torch.int32, device=device
+    )
+    kv_with_q_tail_mask_idx_tensor = torch.arange(
+        tail_start_global, tail_end_global, dtype=torch.int32, device=device
+    )
+
     cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
     cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
-    cp_metadata.kv_with_q_head_nomask_idx_tensor = kv_with_q_head_nomask_idx_tensor
-    cp_metadata.kv_with_q_head_mask_idx_tensor = kv_with_q_head_mask_idx_tensor
-    cp_metadata.kv_with_q_tail_nomask_idx_tensor = kv_with_q_tail_nomask_idx_tensor
-    cp_metadata.kv_with_q_tail_mask_idx_tensor = kv_with_q_tail_mask_idx_tensor
+    cp_metadata.attn_mask_seqlens = attn_mask_seqlens
+    cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx_tensor
+    cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
+    cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
+    cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
     return cp_metadata
 
 
@@ -519,7 +540,7 @@ def prepare_input_dp_with_cp_dsa(
     # just support batch = 1
     kv_len = torch.tensor(kv_len)
     bs_per_cp_group = 1
-    kv_len_origin = kv_len
+    kv_len_origin = int(kv_len.item())
     # get zigzag index
     cp_segment_num = cp_size * 2
     seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment
@@ -611,10 +632,6 @@ def prepare_input_dp_with_cp_dsa(
             head_start_global=head_start_global,
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
-            tail_end_global=tail_end_global,
-            kv_len_prev=kv_len_prev,
-            kv_len_next=kv_len_next,
-            actual_seq_q_prev=actual_seq_q_prev,
-            actual_seq_q_next=actual_seq_q_next,
+            tail_end_global=tail_end_global
         )
     return cp_metadata

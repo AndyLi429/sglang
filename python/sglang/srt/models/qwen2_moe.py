@@ -46,6 +46,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.attention.nsa.utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_input_dp_with_cp_dsa,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -79,6 +85,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_npu,
     make_layers,
     use_intel_amx_backend,
 )
@@ -87,7 +94,34 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+
+def _can_qwen_moe_cp_split(
+    seq_len: int, cp_size: int, forward_batch: ForwardBatch
+) -> bool:
+    if (
+        cp_size is None
+        or cp_size <= 1
+        or seq_len <= 0
+        or forward_batch.batch_size != 1
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+    ):
+        return False
+    # Qwen MoE PCP currently only supports in-seq zigzag split.
+    if get_global_server_args().nsa_prefill_cp_mode == "round-robin-split":
+        return False
+    return (seq_len // (cp_size * 2)) > 0
+
+
+def _cp_split_and_rebuild_1d(forward_batch: ForwardBatch, input_: torch.Tensor):
+    input_list = list(
+        torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
+    )
+    return torch.cat(
+        [input_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index], dim=0
+    ).contiguous()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -612,16 +646,68 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if (
+            _is_npu
+            and get_global_server_args().prefill_context_parallel_size > 1
+            and forward_batch.nsa_cp_metadata is None
+        ):
+            seq_len = (
+                int(positions.shape[0])
+                if positions is not None and positions.numel() > 0
+                else len(input_ids)
+            )
+            cp_size = get_attention_tp_size()
+            if _can_qwen_moe_cp_split(seq_len, cp_size, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    seq_len,
+                    get_attention_tp_rank(),
+                    cp_size,
+                    (
+                        forward_batch.seq_lens_cpu.tolist()
+                        if forward_batch.seq_lens_cpu is not None
+                        else [seq_len]
+                    ),
+                    input_ids.device,
+                )
+
+        use_prefill_cp = (
+            _is_npu
+            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and not forward_batch.can_run_tbo
+        )
+        cp_total_seq_lens = (
+            int(forward_batch.nsa_cp_metadata.total_seq_lens) if use_prefill_cp else None
+        )
+        cp_comm_size = (
+            len(forward_batch.nsa_cp_metadata.per_rank_actual_token)
+            if use_prefill_cp
+            else None
+        )
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
+            if use_prefill_cp and hidden_states.shape[0] == cp_total_seq_lens:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        if use_prefill_cp and positions.shape[0] == cp_total_seq_lens:
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+        if (
+            use_prefill_cp
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.out_cache_loc.shape[0] == cp_total_seq_lens
+        ):
+            forward_batch.out_cache_loc = _cp_split_and_rebuild_1d(
+                forward_batch, forward_batch.out_cache_loc
+            )
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -667,6 +753,19 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
+        if (
+            use_prefill_cp
+            and self.pp_group.is_last_rank
+            and hidden_states.shape[0] != cp_total_seq_lens
+        ):
+            device_module = torch.get_device_module(hidden_states.device)
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states,
+                cp_comm_size,
+                forward_batch,
+                device_module.current_stream(),
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

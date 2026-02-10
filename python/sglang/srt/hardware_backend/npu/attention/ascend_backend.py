@@ -261,14 +261,32 @@ class AscendAttnBackend(AttentionBackend):
         if (
             forward_batch.nsa_cp_metadata is None
             or not nsa_use_prefill_cp(forward_batch, self.is_prefill_cp_enable)
-            or self.pcp_size <= 1
         ):
+            return tensor
+        cp_size = len(forward_batch.nsa_cp_metadata.per_rank_actual_token)
+        if cp_size <= 1:
             return tensor
         flattened = tensor.view(tensor.shape[0], -1)
         gathered = cp_all_gather_rerange_output(
-            flattened, self.pcp_size, forward_batch, torch.npu.current_stream()
+            flattened, cp_size, forward_batch, torch.npu.current_stream()
         )
         return gathered.view(-1, *tensor.shape[1:])
+
+    def _all_gather_cache_loc_for_cp(
+        self, loc: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if (
+            forward_batch.nsa_cp_metadata is None
+            or not nsa_use_prefill_cp(forward_batch, self.is_prefill_cp_enable)
+        ):
+            return loc
+        cp_size = len(forward_batch.nsa_cp_metadata.per_rank_actual_token)
+        if cp_size <= 1:
+            return loc
+        gathered = cp_all_gather_rerange_output(
+            loc.view(-1, 1), cp_size, forward_batch, torch.npu.current_stream()
+        )
+        return gathered.view(-1).to(dtype=loc.dtype)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -939,14 +957,23 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
+            use_cp_prefill = nsa_use_prefill_cp(
+                forward_batch, self.is_prefill_cp_enable
+            )
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
-                # support cross attention
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                if use_cp_prefill:
+                    cache_loc = self._all_gather_cache_loc_for_cp(
+                        cache_loc, forward_batch
+                    )
+                    k = self._all_gather_kv_for_cp(k, forward_batch)
+                    v = self._all_gather_kv_for_cp(v, forward_batch)
+                # support cross attention
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -971,28 +998,124 @@ class AscendAttnBackend(AttentionBackend):
             if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
-                )
-                q_len_offset = 0
-                for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
-                            q[None, q_len_offset : q_len_offset + q_len],
-                            k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
+                if (
+                    use_cp_prefill
+                    and forward_batch.nsa_cp_metadata is not None
+                    and k is not None
+                    and v is not None
+                ):
+                    cp_meta = forward_batch.nsa_cp_metadata
+                    cp_total_seq_lens = int(cp_meta.total_seq_lens)
+                    if k.shape[0] != cp_total_seq_lens:
+                        k = self._all_gather_kv_for_cp(k, forward_batch)
+                    if v.shape[0] != cp_total_seq_lens:
+                        v = self._all_gather_kv_for_cp(v, forward_batch)
+                    split_len = (q.shape[0] + 1) // 2
+                    q_head, q_tail = torch.split(
+                        q, [split_len, q.shape[0] - split_len], dim=0
+                    )
+
+                    def _run_fia_cp_mask_and_nomask(
+                        q_chunk: torch.Tensor,
+                        kv_nomask_idx: torch.Tensor,
+                        kv_mask_idx: torch.Tensor,
+                    ) -> torch.Tensor:
+                        q_len = q_chunk.shape[0]
+                        if q_len == 0:
+                            return q_chunk.new_empty(
+                                (0, layer.tp_q_head_num, layer.v_head_dim)
+                            )
+
+                        if kv_nomask_idx.numel() > 0:
+                            k_nomask = torch.index_select(k, 0, kv_nomask_idx)
+                            v_nomask = torch.index_select(v, 0, kv_nomask_idx)
+                        else:
+                            k_nomask = k.new_empty((0, *k.shape[1:]))
+                            v_nomask = v.new_empty((0, *v.shape[1:]))
+
+                        if kv_mask_idx.numel() > 0:
+                            k_mask = torch.index_select(k, 0, kv_mask_idx)
+                            v_mask = torch.index_select(v, 0, kv_mask_idx)
+                        else:
+                            k_mask = k.new_empty((0, *k.shape[1:]))
+                            v_mask = v.new_empty((0, *v.shape[1:]))
+
+                        # FIA does not expose pre_out + lse merge like MLA ring kernel.
+                        # Build a combined KV chunk [no_mask | mask], where:
+                        # - no_mask part: fully visible for all q tokens
+                        # - mask part: causal mask within the current q chunk
+                        k_chunk = torch.cat([k_nomask, k_mask], dim=0).contiguous()
+                        v_chunk = torch.cat([v_nomask, v_mask], dim=0).contiguous()
+                        no_mask_len = k_nomask.shape[0]
+                        mask_len = k_mask.shape[0]
+                        kv_len = k_chunk.shape[0]
+
+                        cp_mask = torch.zeros(
+                            (q_len, kv_len), dtype=torch.bool, device=q_chunk.device
+                        )
+                        if mask_len > 0:
+                            if (
+                                q_len <= self.fia_mask.shape[0]
+                                and mask_len <= self.fia_mask.shape[1]
+                            ):
+                                mask_block = self.fia_mask[:q_len, :mask_len]
+                            else:
+                                mask_block = torch.ones(
+                                    (q_len, mask_len),
+                                    dtype=torch.bool,
+                                    device=q_chunk.device,
+                                ).triu_(diagonal=1)
+                            cp_mask[:, no_mask_len : no_mask_len + mask_len] = (
+                                mask_block
+                            )
+
+                        return torch.ops.npu.npu_fused_infer_attention_score(
+                            q_chunk.unsqueeze(0),
+                            k_chunk.unsqueeze(0),
+                            v_chunk.unsqueeze(0),
                             num_heads=layer.tp_q_head_num,
                             num_key_value_heads=layer.tp_k_head_num,
                             input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
+                            atten_mask=cp_mask.unsqueeze(0),
+                            sparse_mode=3 if (mask_len > 0 and q_len != 1) else 0,
                             scale=layer.scaling,
                             next_tokens=0,
                         )[0]
+
+                    output_head = _run_fia_cp_mask_and_nomask(
+                        q_head,
+                        cp_meta.kv_with_q_head_nomask_idx,
+                        cp_meta.kv_with_q_head_mask_idx,
                     )
-                    q_len_offset += q_len
+                    output_tail = _run_fia_cp_mask_and_nomask(
+                        q_tail,
+                        cp_meta.kv_with_q_tail_nomask_idx,
+                        cp_meta.kv_with_q_tail_mask_idx,
+                    )
+                    attn_output = torch.cat([output_head, output_tail], dim=0)
+                else:
+                    attn_output = torch.empty(
+                        (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                    q_len_offset = 0
+                    for q_len in forward_batch.extend_seq_lens_cpu:
+                        attn_output[q_len_offset : q_len_offset + q_len] = (
+                            torch.ops.npu.npu_fused_infer_attention_score(
+                                q[None, q_len_offset : q_len_offset + q_len],
+                                k[None, q_len_offset : q_len_offset + q_len],
+                                v[None, q_len_offset : q_len_offset + q_len],
+                                num_heads=layer.tp_q_head_num,
+                                num_key_value_heads=layer.tp_k_head_num,
+                                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                                atten_mask=self.fia_mask.unsqueeze(0),
+                                sparse_mode=3 if q_len != 1 else 0,
+                                scale=layer.scaling,
+                                next_tokens=0,
+                            )[0]
+                        )
+                        q_len_offset += q_len
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
