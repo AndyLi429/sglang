@@ -19,6 +19,7 @@
 
 import logging
 import math
+from re import S
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -453,6 +454,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.pcp_size = get_pcp_size()
+        self.cp_size = get_attention_tp_size()
         self.enable_prefill_cp = is_enable_prefill_cp()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
@@ -655,7 +657,7 @@ class Qwen3MoeAttention(nn.Module):
         flattened = input_tensor.view(input_tensor.shape[0], -1)
         print(f"[qwen3_moe attention]: _all_gather_kv_for_cp: input_tensor.shape: {input_tensor.shape}")
         gathered = cp_all_gather_rerange_output(
-            flattened, self.pcp_size, forward_batch, torch.npu.current_stream()
+            flattened, self.cp_size, forward_batch, torch.npu.current_stream()
         )
         print(f"[qwen3_moe attention]: _all_gather_kv_for_cp: gathered.shape: {gathered.shape}")
         return gathered.view(-1, *input_tensor.shape[1:])
@@ -950,10 +952,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         # PCP (Prefill Context Parallelism) configuration
         self.enable_prefill_cp = is_enable_prefill_cp()
         if self.enable_prefill_cp:
-            self.cp_rank = get_pcp_rank()
-            self.cp_size = get_pcp_size()
+            self.pcp_rank = get_pcp_rank()
+            self.pcp_size = get_pcp_size()
         else:
-            self.cp_rank = self.cp_size = None
+            self.pcp_rank = self.pcp_size = None
 
         # Qwen3MoE does not support NSA
         self.use_nsa = False
@@ -972,15 +974,15 @@ class Qwen3MoeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         print(
                 f"[qwen3moeforcausalLM.forward] can_cp_split and prepare metadata: \
-                    {can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch)}"
+                    {can_cp_split(len(input_ids), self.pcp_size, self.use_nsa, forward_batch)}"
             )
         # Prepare PCP metadata if enabled
         if self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+            if can_cp_split(len(input_ids), self.pcp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
+                    self.pcp_rank,
+                    self.pcp_size,
                     input_ids.device,
                 )
 

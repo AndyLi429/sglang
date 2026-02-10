@@ -46,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
     pcp_ag_rearange_output,
+    get_pcp_size
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -576,6 +577,7 @@ class Qwen2MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         self.enable_prefill_cp = is_enable_prefill_cp()
+        self.cp_size = get_pcp_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
