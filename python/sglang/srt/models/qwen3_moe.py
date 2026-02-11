@@ -650,9 +650,9 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         if (
             forward_batch.nsa_cp_metadata is None
-            or not nsa_use_prefill_cp(forward_batch, self.enable_prefill_cp)
             or self.pcp_size <= 1
         ):
+            print(f"[qwen3_moe attention]: [warn] _all_gather_kv_for_cp: pcp_size: {self.pcp_size}")
             return input_tensor
         flattened = input_tensor.view(input_tensor.shape[0], -1)
         print(f"[qwen3_moe attention]: _all_gather_kv_for_cp: input_tensor.shape: {input_tensor.shape}")
@@ -957,9 +957,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         else:
             self.pcp_rank = self.pcp_size = None
 
-        # Qwen3MoE does not support NSA
-        self.use_nsa = False
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -974,11 +971,11 @@ class Qwen3MoeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         print(
                 f"[qwen3moeforcausalLM.forward] can_cp_split and prepare metadata: \
-                    {can_cp_split(len(input_ids), self.pcp_size, self.use_nsa, forward_batch)}"
+                    {can_cp_split(len(input_ids), self.pcp_size, True, forward_batch)}"
             )
         # Prepare PCP metadata if enabled
         if self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, self.use_nsa, forward_batch):
+            if can_cp_split(len(input_ids), self.pcp_size, True, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.pcp_rank,
