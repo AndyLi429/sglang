@@ -652,7 +652,6 @@ class Qwen3MoeAttention(nn.Module):
             forward_batch.nsa_cp_metadata is None
             or self.pcp_size <= 1
         ):
-            print(f"[qwen3_moe attention]: [warn] _all_gather_kv_for_cp: pcp_size: {self.pcp_size}")
             return input_tensor
         flattened = input_tensor.view(input_tensor.shape[0], -1)
         print(f"[qwen3_moe attention]: _all_gather_kv_for_cp: input_tensor.shape: {input_tensor.shape}")
@@ -675,8 +674,8 @@ class Qwen3MoeAttention(nn.Module):
             and self.compatible_with_fused_kv_buffer
         )
         if self.enable_prefill_cp:
-            k = self._all_gather_kv_for_cp(k, forward_batch)
-            v = self._all_gather_kv_for_cp(v, forward_batch)
+            k = self._all_gather_kv_for_cp(k.contiguous(), forward_batch)
+            v = self._all_gather_kv_for_cp(v.contiguous(), forward_batch)
 
         attn_output = self.attn(
             q,
