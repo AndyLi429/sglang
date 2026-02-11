@@ -1,5 +1,6 @@
 # temp NSA debugging environ
 from itertools import accumulate
+import os
 import logging
 
 from typing import TYPE_CHECKING, List, Tuple, Union,Optional
@@ -25,6 +26,52 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+
+def _is_pcp_precision_debug_enabled() -> bool:
+    return os.getenv("SGLANG_PCP_DEBUG_PRECISION", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if tensor.numel() == 0:
+        return (
+            f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            "numel=0, empty=True)"
+        )
+
+    t = tensor.detach()
+    if t.dtype.is_floating_point or t.is_complex():
+        tf = t.float()
+        finite = torch.isfinite(tf)
+        finite_count = int(finite.sum().item())
+        total = tf.numel()
+        finite_tf = tf[finite]
+        if finite_count > 0:
+            min_v = float(finite_tf.min().item())
+            max_v = float(finite_tf.max().item())
+            mean_v = float(finite_tf.mean().item())
+            std_v = float(finite_tf.std(unbiased=False).item())
+        else:
+            min_v = max_v = mean_v = std_v = float("nan")
+        abs_max = float(tf.abs().max().item())
+        return (
+            f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={total}, "
+            f"finite={finite_count}/{total}, min={min_v:.6e}, max={max_v:.6e}, "
+            f"mean={mean_v:.6e}, std={std_v:.6e}, abs_max={abs_max:.6e})"
+        )
+
+    ti = t.to(torch.int64)
+    return (
+        f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, numel={ti.numel()}, "
+        f"min={int(ti.min().item())}, max={int(ti.max().item())})"
+    )
 
 
 @dataclass
@@ -321,9 +368,16 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
-    print(
-        f"PCP cp_attn_tp_all_gather_reorganazied_into_tensor: input_shape={tuple(input_.shape)} {input_tensor_all.shape=} max_len={max_len} attn_tp_size={attn_tp_size}"
-    )
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] cp_attn_tp_all_gather_reorganazied_into_tensor: "
+            "attn_tp_size=%s total_len=%s max_len=%s pad_size=%s %s",
+            attn_tp_size,
+            total_len,
+            max_len,
+            pad_size,
+            _pcp_tensor_debug_summary("input", input_),
+        )
     
     get_pcp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
@@ -400,13 +454,25 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
         )
     )
-    print(
-        f"PCP cp_all_gather_rerange_output: outputs_list_len={len(outputs_list)} cp_reverse_index={forward_batch.nsa_cp_metadata.cp_reverse_index}"
-    )
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] cp_all_gather_rerange_output: cp_size=%s outputs_list_len=%s "
+            "reverse_split_len=%s cp_reverse_index=%s %s",
+            cp_size,
+            len(outputs_list),
+            forward_batch.nsa_cp_metadata.reverse_split_len,
+            forward_batch.nsa_cp_metadata.cp_reverse_index,
+            _pcp_tensor_debug_summary("gathered", output_tensor),
+        )
     output_tensor = torch.cat(
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] cp_all_gather_rerange_output_done: %s",
+            _pcp_tensor_debug_summary("output", output_tensor),
+        )
     return output_tensor
 
 

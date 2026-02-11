@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -100,6 +101,15 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+
+def _is_pcp_precision_debug_enabled() -> bool:
+    return os.getenv("SGLANG_PCP_DEBUG_PRECISION", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -565,10 +575,28 @@ class Qwen3MoeAttention(nn.Module):
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
-            print(f"+++++before pcp_ag_rearange_output ,{k.shape=},{v.shape=}")
+            if _is_pcp_precision_debug_enabled():
+                logger.info(
+                    "[pcp-debug] before pcp_ag_rearange_output: layer=%s k_shape=%s "
+                    "v_shape=%s k_dtype=%s v_dtype=%s",
+                    self.attn.layer_id,
+                    tuple(k.shape),
+                    tuple(v.shape),
+                    k.dtype,
+                    v.dtype,
+                )
             k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
             v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
-            print(f"+++++after pcp_ag_rearange_output ,{k.shape=},{v.shape=}")
+            if _is_pcp_precision_debug_enabled():
+                logger.info(
+                    "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
+                    "v_shape=%s k_dtype=%s v_dtype=%s",
+                    self.attn.layer_id,
+                    tuple(k.shape),
+                    tuple(v.shape),
+                    k.dtype,
+                    v.dtype,
+                )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 

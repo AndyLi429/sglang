@@ -42,6 +42,32 @@ def _reshape_kv_for_fia_nz(
 
 logger = logging.getLogger(__name__)
 
+
+def _tensor_stats(name: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if tensor.numel() == 0:
+        return f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, numel=0)"
+    t = tensor.detach()
+    if t.dtype.is_floating_point:
+        tf = t.float()
+        finite = torch.isfinite(tf)
+        finite_cnt = int(finite.sum().item())
+        total = tf.numel()
+        if finite_cnt > 0:
+            finite_tf = tf[finite]
+            min_v = float(finite_tf.min().item())
+            max_v = float(finite_tf.max().item())
+        else:
+            min_v = float("nan")
+            max_v = float("nan")
+        return (
+            f"{name}(shape={tuple(t.shape)}, dtype={t.dtype}, "
+            f"finite={finite_cnt}/{total}, min={min_v:.4e}, max={max_v:.4e})"
+        )
+    return f"{name}(shape={tuple(t.shape)}, dtype={t.dtype})"
+
+
 @dataclass
 class ForwardMetadata:
 
@@ -228,6 +254,7 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.fia_precision_debug = get_bool_env_var("SGLANG_ASCEND_FIA_DEBUG", "False")
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -926,9 +953,19 @@ class AscendAttnBackend(AttentionBackend):
         metadata = forward_batch.nsa_cp_metadata
         has_pcp_metadata = (
             metadata is not None and
-            hasattr(metadata, 'kv_with_q_head_mask_idx') and
+            hasattr(metadata, "kv_with_q_head_mask_idx") and
             metadata.kv_with_q_head_mask_idx is not None
         )
+
+        if self.fia_precision_debug:
+            logger.info(
+                "[fia-debug] forward_fia_pcp layer=%s has_pcp_metadata=%s %s %s %s",
+                layer.layer_id,
+                has_pcp_metadata,
+                _tensor_stats("q", q),
+                _tensor_stats("k", k),
+                _tensor_stats("v", v),
+            )
 
         if has_pcp_metadata:
             # PCP with metadata for head/tail split
@@ -1008,6 +1045,16 @@ class AscendAttnBackend(AttentionBackend):
         # For proper ZigZag attention patterns, consider using MLA backend instead
         logger.debug("FIA PCP with metadata: using simplified head/tail split. "
                      "Proper mask/no-mask handling for ZigZag patterns is limited in FIA.")
+        if self.fia_precision_debug:
+            logger.info(
+                "[fia-debug] fia_pcp_metadata layer=%s split_len=%s head_mask=%s head_nomask=%s tail_mask=%s tail_nomask=%s",
+                layer.layer_id,
+                split_len,
+                None if kv_with_q_head_mask_idx is None else int(kv_with_q_head_mask_idx.numel()),
+                None if kv_with_q_head_nomask_idx is None else int(kv_with_q_head_nomask_idx.numel()),
+                None if kv_with_q_tail_mask_idx is None else int(kv_with_q_tail_mask_idx.numel()),
+                None if kv_with_q_tail_nomask_idx is None else int(kv_with_q_tail_nomask_idx.numel()),
+            )
 
         return attn_output
 
@@ -1051,6 +1098,16 @@ class AscendAttnBackend(AttentionBackend):
                 break
             current_len = min(q_len, segment_len - q_len_offset)
             if current_len > 0:
+                if self.fia_precision_debug and q_len_offset == 0:
+                    logger.info(
+                        "[fia-debug] fia_pcp_segment layer=%s is_head=%s q_len_offset=%s current_len=%s kv_mask_num=%s kv_nomask_num=%s",
+                        layer.layer_id,
+                        is_head,
+                        q_len_offset,
+                        current_len,
+                        None if kv_mask_idx is None else int(kv_mask_idx.numel()),
+                        None if kv_nomask_idx is None else int(kv_nomask_idx.numel()),
+                    )
                 attn_output[q_len_offset:q_len_offset + current_len] = (
                     torch.ops.npu.npu_fused_infer_attention_score(
                         q_segment[None, q_len_offset:q_len_offset + current_len],
