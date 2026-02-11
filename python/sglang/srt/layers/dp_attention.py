@@ -415,6 +415,33 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
+        if forward_batch.global_num_tokens_gpu is None:
+            if get_attention_dp_size() > 1:
+                raise RuntimeError(
+                    "global_num_tokens_gpu is required for dp attention when "
+                    "dp_size > 1. Ensure the scheduler prepares the MLP sync batch."
+                )
+            device = (
+                forward_batch.seq_lens.device
+                if forward_batch.seq_lens is not None
+                else forward_batch.input_ids.device
+            )
+            if forward_batch.forward_mode.is_extend(
+                include_draft_extend_v2=True
+            ):
+                local_num_tokens = forward_batch.seq_lens_sum
+            else:
+                local_num_tokens = forward_batch.batch_size
+            forward_batch.dp_local_start_pos = torch.zeros(
+                (), dtype=torch.int64, device=device
+            )
+            forward_batch.dp_local_num_tokens = torch.tensor(
+                local_num_tokens, dtype=torch.int64, device=device
+            )
+            return (
+                forward_batch.dp_local_start_pos,
+                forward_batch.dp_local_num_tokens,
+            )
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
         if dp_rank == 0:
             local_start_pos = torch.zeros_like(cumtokens[0])
