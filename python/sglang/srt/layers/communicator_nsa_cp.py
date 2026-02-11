@@ -218,6 +218,9 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             if hidden_states.shape[0] != 0:
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 if layer_norm is not None:
-                    hidden_states, residual = layer_norm(hidden_states, residual)
+                    try:
+                        hidden_states, residual = layer_norm(hidden_states, residual)
+                    except TypeError:
+                        hidden_states = layer_norm(hidden_states)
             return hidden_states, residual
 

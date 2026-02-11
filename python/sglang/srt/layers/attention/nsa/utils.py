@@ -343,7 +343,6 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     )
     return outputs
 
-
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
