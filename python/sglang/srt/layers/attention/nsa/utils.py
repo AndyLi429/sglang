@@ -14,9 +14,9 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
-    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_pcp_group,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -155,7 +155,7 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     return nsa_cache_seqlens
 
 
-def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
@@ -170,7 +170,7 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         cur_cp_seq_len != 0
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_nsa_enable_prefill_cp()
+        # and is_nsa_enable_prefill_cp()
     ):
         return True
     else:
@@ -178,17 +178,6 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
-    print(
-        "PCP cp_split_and_rebuild_data: input_shape=%s split_mode=%s split_list_len=%s "
-        "zigzag_index_len=%s",
-        tuple(input_.shape),
-        get_global_server_args().nsa_prefill_cp_mode,
-        None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or []),
-        None
-        if nsa_cp_metadata is None
-        else len(nsa_cp_metadata.zigzag_index or []),
-    )
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert (
@@ -206,17 +195,6 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    nsa_cp_metadata = getattr(forward_batch, "nsa_cp_metadata", None)
-    print(
-        "PCP cp_split_and_rebuild_position: positions_shape=%s split_mode=%s split_list_len=%s "
-        "zigzag_index_len=%s",
-        tuple(positions.shape),
-        get_global_server_args().nsa_prefill_cp_mode,
-        None if nsa_cp_metadata is None else len(nsa_cp_metadata.split_list or []),
-        None
-        if nsa_cp_metadata is None
-        else len(nsa_cp_metadata.zigzag_index or []),
-    )
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert positions.shape[0] % cp_size == 0, (
@@ -313,6 +291,13 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     else:
         return False
 
+def use_pcp(forward_batch):
+    if (forward_batch.nsa_cp_metadata is not None
+        and forward_batch.forward_mode.is_context_parallel_extend()):
+            return True
+    else:
+        return False
+
 
 def cp_attn_tp_all_gather_reorganazied_into_tensor(
     input_: torch.Tensor, total_len, attn_tp_size, forward_batch, stream_op
@@ -336,7 +321,11 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
+    print(
+        f"PCP cp_attn_tp_all_gather_reorganazied_into_tensor: input_shape={tuple(input_.shape)} {input_tensor_all.shape=} max_len={max_len} attn_tp_size={attn_tp_size}"
+    )
+    
+    get_pcp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
     # step3
@@ -398,6 +387,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         )
         return output_tensor
 
+
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
@@ -410,6 +400,9 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         torch.split(
             output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
         )
+    )
+    print(
+        f"PCP cp_all_gather_rerange_output: outputs_list_len={len(outputs_list)} cp_reverse_index={forward_batch.nsa_cp_metadata.cp_reverse_index}"
     )
     output_tensor = torch.cat(
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0

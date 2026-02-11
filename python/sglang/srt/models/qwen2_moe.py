@@ -45,6 +45,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    pcp_ag_rearange_output,
+    get_pcp_size,
+    get_pcp_rank,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -72,6 +75,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_enable_prefill_cp,
     nsa_use_prefill_cp,
     is_nsa_enable_prefill_cp,
+    use_pcp,
 )
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -575,6 +579,7 @@ class Qwen2MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         self.enable_prefill_cp = is_enable_prefill_cp()
+        self.pcp_size = get_pcp_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -628,17 +633,15 @@ class Qwen2MoeModel(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            if self.enable_prefill_cp and use_pcp(forward_batch):
+                print(f"+++++ [qwen2moeModel.forward] before split hidden_states ,{hidden_states.shape=}")
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                print(f"+++++ [qwen2moeModel.forward] after cp_split_and_rebuild_data ,{hidden_states.shape=}")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-
-        # Apply PCP split and rebuild if enabled (similar to deepseek_v2)
-        if nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp):
-            print(f"qwen2model:nsa_use_prefill_cp: {nsa_use_prefill_cp(forward_batch,self.enable_prefill_cp)}")
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
+           
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -684,6 +687,10 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+        if self.enable_prefill_cp and use_pcp(forward_batch):      
+            print(f"+++++before split positions ,{positions.shape=}")
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            print(f"+++++after split positions ,{positions.shape=}")
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -723,15 +730,13 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+        self.enable_prefill_cp = is_enable_prefill_cp()
+        if self.enable_prefill_cp:
+            self.pcp_rank = get_pcp_rank()
+            self.pcp_size = get_pcp_size()
         else:
-            self.cp_rank = self.cp_size = None
+            self.pcp_rank = self.pcp_size = None
 
-        # NSA support flag (can be overridden by subclasses)
-        self.use_nsa = False
 
     @torch.no_grad()
     def forward(
@@ -744,10 +749,10 @@ class Qwen2MoeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
         print(
-            f"can_cp_split and prepare metadata: {can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch)}"
+            f"can_cp_split and prepare metadata: {can_cp_split(len(input_ids), self.cp_size, forward_batch)}"
         )
-        if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+        if self.enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
