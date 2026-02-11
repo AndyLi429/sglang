@@ -316,6 +316,8 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     Step 3, removing the padding and reassembling the data according to the actual tokens.
     """
     # step1
+    if input_.shape[0] == 0:
+        return input_
     max_len = (total_len + attn_tp_size - 1) // attn_tp_size
     pad_size = max_len - input_.shape[0]
     if pad_size > 0:
