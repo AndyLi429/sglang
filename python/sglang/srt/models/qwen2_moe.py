@@ -634,14 +634,14 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states = input_embeds
             residual = None
             if self.enable_prefill_cp and use_pcp(forward_batch):
-                print(f"+++++ [qwen2moeModel.forward] before split hidden_states ,{hidden_states.shape=}")
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-                print(f"+++++ [qwen2moeModel.forward] after cp_split_and_rebuild_data ,{hidden_states.shape=}")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-           
+
+        if self.enable_prefill_cp and use_pcp(forward_batch):
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -687,11 +687,6 @@ class Qwen2MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        if self.enable_prefill_cp and use_pcp(forward_batch):      
-            print(f"+++++before split positions ,{positions.shape=}")
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-            print(f"+++++after split positions ,{positions.shape=}")
-
         if len(aux_hidden_states) == 0:
             return hidden_states
 
