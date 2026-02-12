@@ -462,9 +462,8 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.pcp_size = get_pcp_size()
+        self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
         self.cp_size = get_attention_tp_size()
-        self.enable_prefill_cp = is_enable_prefill_cp()
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -995,7 +994,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         if self.enable_prefill_cp:
             cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
             if can_cp_split(cur_cp_seq_len, self.pcp_size, forward_batch):
-                print("prepare input metadata")
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.pcp_rank,

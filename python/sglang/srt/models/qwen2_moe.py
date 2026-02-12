@@ -579,7 +579,7 @@ class Qwen2MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         self.enable_prefill_cp = is_enable_prefill_cp()
-        self.pcp_size = get_pcp_size()
+        self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -743,15 +743,12 @@ class Qwen2MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        print(
-            f"can_cp_split and prepare metadata: {can_cp_split(len(input_ids), self.cp_size, forward_batch)}"
-        )
         if self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
+                    self.pcp_rank,
+                    self.pcp_size,
                     input_ids.device,
                 )
 
