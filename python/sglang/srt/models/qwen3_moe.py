@@ -583,8 +583,8 @@ class Qwen3MoeAttention(nn.Module):
                     self.attn.layer_id,
                     tuple(k.shape),
                     tuple(v.shape),
-                    tuple(k.sum()),
-                    tuple(v.sum()),
+                    (k.sum().item()),
+                    (v.sum().item()),
                     k.dtype,
                     v.dtype,
                 )
@@ -675,17 +675,17 @@ class Qwen3MoeAttention(nn.Module):
 
         q, k, v, fb = inner_state
         if _is_pcp_precision_debug_enabled() and not self.enable_prefill_cp:
-                logger.info(
-                "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
-                    "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
-                    self.attn.layer_id,
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    tuple(k.sum()),
-                    tuple(v.sum()),
-                    k.dtype,
-                    v.dtype,
-                )
+            logger.info(
+            "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
+                "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
+                self.attn.layer_id,
+                tuple(k.shape),
+                tuple(v.shape),
+                (k.sum().item()),
+                (v.sum().item()),
+                k.dtype,
+                v.dtype,
+            )
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
             enable_fused_set_kv_buffer(forward_batch)
