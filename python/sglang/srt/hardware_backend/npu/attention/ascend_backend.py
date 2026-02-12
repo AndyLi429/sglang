@@ -671,7 +671,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             is_prefill
             and is_nsa_enable_prefill_cp()
-            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.cp_metadata is not None
         ):
             attn_out = self.do_cp_balance_attn(
                 q_nope,
@@ -791,7 +791,6 @@ class AscendAttnBackend(AttentionBackend):
         v,
         layer,
         forward_batch,
-        save_kv_cache,
         q_rope,
         k_rope,
     ):
@@ -840,13 +839,13 @@ class AscendAttnBackend(AttentionBackend):
             tail_attn_nomask_seqlens: [2, 2 * pcp_res_rank]
 
         """
-        kv_with_q_head_nomask_idx = forward_batch.nsa_cp_metadata.kv_with_q_head_nomask_idx
-        kv_with_q_head_mask_idx = forward_batch.nsa_cp_metadata.kv_with_q_head_mask_idx
-        kv_with_q_tail_nomask_idx = forward_batch.nsa_cp_metadata.kv_with_q_tail_nomask_idx
-        kv_with_q_tail_mask_idx = forward_batch.nsa_cp_metadata.kv_with_q_tail_mask_idx
-        attn_mask_seqlens = forward_batch.nsa_cp_metadata.attn_mask_seqlens # []
-        head_attn_nomask_seqlens = forward_batch.nsa_cp_metadata.head_attn_nomask_seqlens
-        tail_attn_nomask_seqlens = forward_batch.nsa_cp_metadata.tail_attn_nomask_seqlens
+        kv_with_q_head_nomask_idx = forward_batch.cp_metadata.kv_with_q_head_nomask_idx
+        kv_with_q_head_mask_idx = forward_batch.cp_metadata.kv_with_q_head_mask_idx
+        kv_with_q_tail_nomask_idx = forward_batch.cp_metadata.kv_with_q_tail_nomask_idx
+        kv_with_q_tail_mask_idx = forward_batch.cp_metadata.kv_with_q_tail_mask_idx
+        attn_mask_seqlens = forward_batch.cp_metadata.attn_mask_seqlens # []
+        head_attn_nomask_seqlens = forward_batch.cp_metadata.head_attn_nomask_seqlens
+        tail_attn_nomask_seqlens = forward_batch.cp_metadata.tail_attn_nomask_seqlens
         output_head, lse_head = self._attention_with_mask_and_nomask(
             q_nope=q_nope_head,
             q_pe=q_rope_head,
@@ -880,20 +879,20 @@ class AscendAttnBackend(AttentionBackend):
         # print(f"{layer.layer_id=} === rank:{torch.distributed.get_rank()} {attn_output.sum()=},  {attn_output[:, :10]=}")
         return attn_output
 
-    @staticmethod
-    def _merge_attn_parts(
-        mask_out: torch.Tensor,
-        mask_lse: torch.Tensor,
-        nomask_out: torch.Tensor,
-        nomask_lse: torch.Tensor,
-    ) -> torch.Tensor:
-        merged_lse = torch.logaddexp(mask_lse, nomask_lse)
-        mask_weight = torch.exp(mask_lse - merged_lse)
-        nomask_weight = torch.exp(nomask_lse - merged_lse)
-        while mask_weight.dim() < mask_out.dim():
-            mask_weight = mask_weight.unsqueeze(-1)
-            nomask_weight = nomask_weight.unsqueeze(-1)
-        return mask_out * mask_weight + nomask_out * nomask_weight
+    # @staticmethod
+    # def _merge_attn_parts(
+    #     mask_out: torch.Tensor,
+    #     mask_lse: torch.Tensor,
+    #     nomask_out: torch.Tensor,
+    #     nomask_lse: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     merged_lse = torch.logaddexp(mask_lse, nomask_lse)
+    #     mask_weight = torch.exp(mask_lse - merged_lse)
+    #     nomask_weight = torch.exp(nomask_lse - merged_lse)
+    #     while mask_weight.dim() < mask_out.dim():
+    #         mask_weight = mask_weight.unsqueeze(-1)
+    #         nomask_weight = nomask_weight.unsqueeze(-1)
+    #     return mask_out * mask_weight + nomask_out * nomask_weight
 
     def _fia_attention_with_mask_and_nomask(
         self,
@@ -907,11 +906,11 @@ class AscendAttnBackend(AttentionBackend):
         kv_mask_idx = kv_mask_idx.to(k.device)
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
-
+        print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}")
         mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
-            q.unsqueeze(0),
-            k_mask.unsqueeze(0),
-            v_mask.unsqueeze(0),
+            q,
+            k_mask,
+            v_mask,
             num_heads=layer.tp_q_head_num,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="BSND",
@@ -927,10 +926,11 @@ class AscendAttnBackend(AttentionBackend):
         kv_nomask_idx = kv_nomask_idx.to(k.device)
         k_nomask = torch.index_select(k, 0, kv_nomask_idx)
         v_nomask = torch.index_select(v, 0, kv_nomask_idx)
+        print(f"start to fia attention with nomask, {q.shape=}, {k_nomask.shape=}, {v_nomask.shape=}")
         nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
-            q.unsqueeze(0),
-            k_nomask.unsqueeze(0),
-            v_nomask.unsqueeze(0),
+            q,
+            k_nomask,
+            v_nomask,
             num_heads=layer.tp_q_head_num,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="BSND",
@@ -939,10 +939,11 @@ class AscendAttnBackend(AttentionBackend):
             scale=layer.scaling,
             next_tokens=0,
         )
-        merged_out = self._merge_attn_parts(
-            mask_out[0], mask_lse[0], nomask_out[0], nomask_lse[0]
-        )
-        return merged_out
+        max_lse = torch.maximum(mask_lse.unsqueeze_(-1), nomask_lse.unsqueeze_(-1))
+        w1 = torch.exp(mask_lse - max_lse)
+        w2 = torch.exp(nomask_lse - max_lse)
+        result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
+        return result 
 
     def forward_fia_pcp(
         self,
@@ -958,21 +959,25 @@ class AscendAttnBackend(AttentionBackend):
         q_head = q_head.contiguous()
         q_tail = q_tail.contiguous()
 
-        metadata = forward_batch.nsa_cp_metadata
+        kv_with_q_head_nomask_idx = forward_batch.cp_metadata.kv_with_q_head_nomask_idx
+        kv_with_q_head_mask_idx = forward_batch.cp_metadata.kv_with_q_head_mask_idx
+        kv_with_q_tail_nomask_idx = forward_batch.cp_metadata.kv_with_q_tail_nomask_idx
+        kv_with_q_tail_mask_idx = forward_batch.cp_metadata.kv_with_q_tail_mask_idx
+
         output_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
             k=k,
             v=v,
-            kv_mask_idx=metadata.kv_with_q_head_mask_idx,
-            kv_nomask_idx=metadata.kv_with_q_head_nomask_idx,
+            kv_mask_idx=kv_with_q_head_mask_idx,
+            kv_nomask_idx=kv_with_q_head_nomask_idx,
             layer=layer,
         )
         output_tail = self._fia_attention_with_mask_and_nomask(
             q=q_tail,
             k=k,
             v=v,
-            kv_mask_idx=metadata.kv_with_q_tail_mask_idx,
-            kv_nomask_idx=metadata.kv_with_q_tail_nomask_idx,
+            kv_mask_idx=kv_with_q_tail_mask_idx,
+            kv_nomask_idx=kv_with_q_tail_nomask_idx,
             layer=layer,
         )
         return torch.cat([output_head, output_tail], dim=0)
