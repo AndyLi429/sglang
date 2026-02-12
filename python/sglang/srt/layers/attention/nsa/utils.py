@@ -367,18 +367,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         device=input_.device,
         dtype=input_.dtype,
     )
-    # step2
-    if _is_pcp_precision_debug_enabled():
-        logger.info(
-            "[pcp-debug] cp_attn_tp_all_gather_reorganazied_into_tensor: "
-            "attn_tp_size=%s total_len=%s max_len=%s pad_size=%s %s",
-            attn_tp_size,
-            total_len,
-            max_len,
-            pad_size,
-            _pcp_tensor_debug_summary("input", input_),
-        )
-    
+    # step2    
     get_pcp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
@@ -454,25 +443,10 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0
         )
     )
-    if _is_pcp_precision_debug_enabled():
-        logger.info(
-            "[pcp-debug] cp_all_gather_rerange_output: cp_size=%s outputs_list_len=%s "
-            "reverse_split_len=%s cp_reverse_index=%s %s",
-            cp_size,
-            len(outputs_list),
-            forward_batch.cp_metadata.reverse_split_len,
-            forward_batch.cp_metadata.cp_reverse_index,
-            _pcp_tensor_debug_summary("gathered", output_tensor),
-        )
     output_tensor = torch.cat(
         [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
-    if _is_pcp_precision_debug_enabled():
-        logger.info(
-            "[pcp-debug] cp_all_gather_rerange_output_done: %s",
-            _pcp_tensor_debug_summary("output", output_tensor),
-        )
     return output_tensor
 
 
