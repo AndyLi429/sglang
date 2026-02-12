@@ -713,7 +713,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             is_prefill
             and is_nsa_enable_prefill_cp()
-            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.cp_metadata is not None
         ):
             attn_out = self.do_cp_balance_attn(
                 q_nope,
@@ -882,13 +882,13 @@ class AscendAttnBackend(AttentionBackend):
             tail_attn_nomask_seqlens: [2, 2 * pcp_res_rank]
 
         """
-        kv_with_q_head_nomask_idx = forward_batch.nsa_cp_metadata.kv_with_q_head_nomask_idx
-        kv_with_q_head_mask_idx = forward_batch.nsa_cp_metadata.kv_with_q_head_mask_idx
-        kv_with_q_tail_nomask_idx = forward_batch.nsa_cp_metadata.kv_with_q_tail_nomask_idx
-        kv_with_q_tail_mask_idx = forward_batch.nsa_cp_metadata.kv_with_q_tail_mask_idx
-        attn_mask_seqlens = forward_batch.nsa_cp_metadata.attn_mask_seqlens # []
-        head_attn_nomask_seqlens = forward_batch.nsa_cp_metadata.head_attn_nomask_seqlens
-        tail_attn_nomask_seqlens = forward_batch.nsa_cp_metadata.tail_attn_nomask_seqlens
+        kv_with_q_head_nomask_idx = forward_batch.cp_metadata.kv_with_q_head_nomask_idx
+        kv_with_q_head_mask_idx = forward_batch.cp_metadata.kv_with_q_head_mask_idx
+        kv_with_q_tail_nomask_idx = forward_batch.cp_metadata.kv_with_q_tail_nomask_idx
+        kv_with_q_tail_mask_idx = forward_batch.cp_metadata.kv_with_q_tail_mask_idx
+        attn_mask_seqlens = forward_batch.cp_metadata.attn_mask_seqlens # []
+        head_attn_nomask_seqlens = forward_batch.cp_metadata.head_attn_nomask_seqlens
+        tail_attn_nomask_seqlens = forward_batch.cp_metadata.tail_attn_nomask_seqlens
         output_head, lse_head = self._attention_with_mask_and_nomask(
             q_nope=q_nope_head,
             q_pe=q_rope_head,
@@ -950,7 +950,7 @@ class AscendAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         # Check if we have PCP metadata for head/tail split
-        metadata = forward_batch.nsa_cp_metadata
+        metadata = forward_batch.cp_metadata
         has_pcp_metadata = (
             metadata is not None and
             hasattr(metadata, "kv_with_q_head_mask_idx") and

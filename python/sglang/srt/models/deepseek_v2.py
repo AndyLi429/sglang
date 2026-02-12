@@ -64,7 +64,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_cp
+    is_enable_prefill_pcp
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -2507,7 +2507,7 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_pcp()
         if self.enable_prefill_cp and self.use_nsa:
             self.cp_size = get_attention_tp_size()
         elif self.enable_prefill_cp:
@@ -2825,7 +2825,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = False
 
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
+        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_pcp()
         if self.enable_prefill_cp and self.use_nsa:
             #3.2
             self.cp_rank = get_attention_tp_rank()
@@ -2904,7 +2904,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> torch.Tensor:
         if self.enable_prefill_cp and self.use_nsa:
             if can_cp_split(len(input_ids), self.cp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
@@ -2914,7 +2914,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         elif self.enable_prefill_cp:
             cur_cp_seq_len = len(input_ids) // (self.pcp_size * 2)
             if can_cp_split(cur_cp_seq_len, self.pcp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     cur_cp_seq_len,
                     self.pcp_rank,
                     self.pcp_size,

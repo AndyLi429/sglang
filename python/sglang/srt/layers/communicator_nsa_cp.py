@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_pcp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -214,7 +214,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             ]
             attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
             return hidden_states, residual
-        elif is_enable_prefill_cp():
+        elif is_enable_prefill_pcp():
             if hidden_states.shape[0] != 0:
                 hidden_states = get_attention_tp_group().all_reduce(hidden_states)
                 if layer_norm is not None:

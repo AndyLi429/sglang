@@ -627,8 +627,8 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     # NOTE: `pcp_size` from model config can diverge from runtime CP metadata when
     # DP/TP topology is enabled. Use metadata-derived rank count for output shaping,
     # but communicate on PCP group (not attention-TP group).
-    cp_rank_count = len(forward_batch.nsa_cp_metadata.max_rank_len)
-    max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
+    cp_rank_count = len(forward_batch.cp_metadata.max_rank_len)
+    max_len = forward_batch.cp_metadata.max_rank_len[0]
 
     if cp_rank_count <= 1:
         if _is_pcp_precision_debug_enabled():
@@ -651,10 +651,10 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
             cp_rank_count,
             max_len,
             pad_size,
-            forward_batch.nsa_cp_metadata.max_rank_len,
-            forward_batch.nsa_cp_metadata.per_rank_actual_token,
-            forward_batch.nsa_cp_metadata.reverse_split_len,
-            forward_batch.nsa_cp_metadata.cp_reverse_index,
+            forward_batch.cp_metadata.max_rank_len,
+            forward_batch.cp_metadata.per_rank_actual_token,
+            forward_batch.cp_metadata.reverse_split_len,
+            forward_batch.cp_metadata.cp_reverse_index,
             _pcp_tensor_debug_summary("input", input_tensor),
         )
 
@@ -681,7 +681,7 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     splitted_tensor = list(
         torch.split(
             all_shuffled_sensor,
-            forward_batch.nsa_cp_metadata.max_rank_len,
+            forward_batch.cp_metadata.max_rank_len,
             dim=0,
         )
     )
@@ -689,18 +689,18 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
         [
             splitted_tensor[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
+                forward_batch.cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
     )
     outputs_list = list(
         torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
+            output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0
         )
     )
     outputs = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
     )
 
     if _is_pcp_precision_debug_enabled():
@@ -710,7 +710,7 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
             float(all_shuffled_sensor.sum().item()) if all_shuffled_sensor.numel() else 0.0,
             float(output_tensor.sum().item()) if output_tensor.numel() else 0.0,
             float(outputs.sum().item()) if outputs.numel() else 0.0,
-            sum(forward_batch.nsa_cp_metadata.reverse_split_len),
+            sum(forward_batch.cp_metadata.reverse_split_len),
             _pcp_tensor_debug_summary("output", outputs),
         )
 

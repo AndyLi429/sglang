@@ -123,7 +123,7 @@ def is_nsa_prefill_cp_round_robin_split():
         and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
-def is_enable_prefill_cp():
+def is_enable_prefill_pcp():
     return get_global_server_args().prefill_context_parallel_size > 1
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
@@ -233,10 +233,10 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
         return nsa_cp_round_robin_split_data(input_)
 
     input_list = list(
-        torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
+        torch.split(input_, forward_batch.cp_metadata.split_list, dim=0)
     )
     result = torch.cat(
-        [input_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index], dim=0
+        [input_list[i] for i in forward_batch.cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
     return result
 
@@ -251,10 +251,10 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         return nsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
-        torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
+        torch.split(positions, forward_batch.cp_metadata.split_list, dim=-1)
     )
     positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index],
+        [position_id_list[i] for i in forward_batch.cp_metadata.zigzag_index],
         dim=-1,
     )
     return positions
@@ -330,7 +330,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
     if (
-        forward_batch.nsa_cp_metadata is not None
+        forward_batch.cp_metadata is not None
         and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
@@ -339,7 +339,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return False
 
 def use_pcp(forward_batch):
-    if (forward_batch.nsa_cp_metadata is not None
+    if (forward_batch.cp_metadata is not None
         and forward_batch.forward_mode.is_context_parallel_extend()):
             return True
     else:
@@ -384,13 +384,13 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     )
     # step3
     outputs_list_max = list(
-        torch.split(input_tensor_all, forward_batch.nsa_cp_metadata.max_rank_len, dim=0)
+        torch.split(input_tensor_all, forward_batch.cp_metadata.max_rank_len, dim=0)
     )
     outputs = torch.cat(
         [
             outputs_list_max[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
+                forward_batch.cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
@@ -444,14 +444,14 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
-        forward_batch.nsa_cp_metadata.total_seq_lens,
+        forward_batch.cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
     )
     outputs_list = list(
         torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
+            output_tensor, forward_batch.cp_metadata.reverse_split_len, dim=0
         )
     )
     if _is_pcp_precision_debug_enabled():
@@ -460,12 +460,12 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             "reverse_split_len=%s cp_reverse_index=%s %s",
             cp_size,
             len(outputs_list),
-            forward_batch.nsa_cp_metadata.reverse_split_len,
-            forward_batch.nsa_cp_metadata.cp_reverse_index,
+            forward_batch.cp_metadata.reverse_split_len,
+            forward_batch.cp_metadata.cp_reverse_index,
             _pcp_tensor_debug_summary("gathered", output_tensor),
         )
     output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in forward_batch.cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
     if _is_pcp_precision_debug_enabled():
@@ -685,7 +685,7 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
     )
-    if is_enable_prefill_cp():
+    if is_enable_prefill_pcp():
         return _compute_attention_metadata(
             cp_metadata,
             device=device,

@@ -72,7 +72,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    is_enable_prefill_cp,
+    is_enable_prefill_pcp,
     nsa_use_prefill_cp,
     is_nsa_enable_prefill_cp,
     use_pcp,
@@ -578,7 +578,7 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.enable_prefill_cp = is_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_pcp()
         self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
 
         if self.pp_group.is_first_rank:
@@ -725,7 +725,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.enable_prefill_cp = is_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_pcp()
         if self.enable_prefill_cp:
             self.pcp_rank = get_pcp_rank()
             self.pcp_size = get_pcp_size()
@@ -745,7 +745,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         # Prepare PCP metadata if enabled
         if self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.pcp_rank,
                     self.pcp_size,

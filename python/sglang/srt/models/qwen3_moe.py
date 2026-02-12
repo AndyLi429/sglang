@@ -63,7 +63,7 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_cp,
+    is_enable_prefill_pcp,
     use_pcp,
 )
 from sglang.srt.layers.utils import get_layer_id
@@ -445,7 +445,7 @@ class Qwen3MoeAttention(nn.Module):
         attn_tp_size = get_attention_tp_size()
 
         self.config = config
-        self.enable_prefill_cp = is_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_pcp()
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -575,40 +575,8 @@ class Qwen3MoeAttention(nn.Module):
 
 
         if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1 and use_pcp(forward_batch):
-            if _is_pcp_precision_debug_enabled():
-                logger.info(
-                    "[pcp-debug] before pcp_ag_rearange_output: layer=%s q_shape=%s "
-                    "k_shape=%s v_shape=%s q_sum=%s k_sum=%s v_sum=%s q_dtype=%s "
-                    "k_dtype=%s v_dtype=%s",
-                    self.attn.layer_id,
-                    tuple(q.shape),
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    (q.sum().item()) if q.numel() else 0.0,
-                    (k.sum().item()) if k.numel() else 0.0,
-                    (v.sum().item()) if v.numel() else 0.0,
-                    q.dtype,
-                    k.dtype,
-                    v.dtype,
-                )
             k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
             v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
-            if _is_pcp_precision_debug_enabled():
-                logger.info(
-                    "[pcp-debug] after pcp_ag_rearange_output: layer=%s q_shape=%s "
-                    "k_shape=%s v_shape=%s q_sum=%s k_sum=%s v_sum=%s q_dtype=%s "
-                    "k_dtype=%s v_dtype=%s",
-                    self.attn.layer_id,
-                    tuple(q.shape),
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    (q.sum().item()) if q.numel() else 0.0,
-                    (k.sum().item()) if k.numel() else 0.0,
-                    (v.sum().item()) if v.numel() else 0.0,
-                    q.dtype,
-                    k.dtype,
-                    v.dtype,
-                )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -695,18 +663,6 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
-        if _is_pcp_precision_debug_enabled() and not self.enable_prefill_cp:
-            logger.info(
-            "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
-                "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
-                self.attn.layer_id,
-                tuple(k.shape),
-                tuple(v.shape),
-                (k.sum().item()),
-                (v.sum().item()),
-                k.dtype,
-                v.dtype,
-            )
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
             enable_fused_set_kv_buffer(forward_batch)
@@ -787,7 +743,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
-        self.enable_prefill_cp = is_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_pcp()
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -995,7 +951,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.enable_prefill_cp = is_enable_prefill_cp()
+        self.enable_prefill_cp = is_enable_prefill_pcp()
         if self.enable_prefill_cp:
             self.pcp_rank = get_pcp_rank()
             self.pcp_size = get_pcp_size()
@@ -1017,34 +973,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         # Prepare PCP metadata if enabled
         if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.pcp_rank,
                     self.pcp_size,
                     input_ids.device,
                 )
-                if _is_pcp_precision_debug_enabled():
-                    md = forward_batch.nsa_cp_metadata
-                    logger.info(
-                        "[pcp-debug] prepare_input_dp_with_cp_dsa: pcp_rank=%s pcp_size=%s "
-                        "input_len=%s split_list=%s max_rank_len=%s per_rank_actual_token=%s "
-                        "reverse_split_len=%s cp_reverse_index=%s",
-                        self.pcp_rank,
-                        self.pcp_size,
-                        len(input_ids),
-                        md.split_list,
-                        md.max_rank_len,
-                        md.per_rank_actual_token,
-                        md.reverse_split_len,
-                        md.cp_reverse_index,
-                    )
-
-
-        elif self.enable_prefill_cp and _is_pcp_precision_debug_enabled():
-            logger.info(
-                "[pcp-debug] skip prepare_input_dp_with_cp_dsa because pcp_size=%s",
-                self.pcp_size,
-            )
         hidden_states = self.model(
             input_ids,
             positions,
