@@ -30,6 +30,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _is_pcp_precision_debug_enabled() -> bool:
+    return get_bool_env_var("SGLANG_PCP_DEBUG_PRECISION")
+
+
+def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
+    if tensor.numel() == 0:
+        return (
+            f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"device={tensor.device} sum=0.0"
+        )
+    return (
+        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} sum={float(tensor.sum().item())}"
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -612,6 +628,23 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
 
     pad_size = max_len - input_tensor.shape[0]
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] pcp_ag_rearange_output_enter: "
+            "pcp_size_arg=%s cp_rank_count=%s max_len=%s pad_size=%s "
+            "max_rank_len=%s per_rank_actual_token=%s reverse_split_len=%s "
+            "cp_reverse_index=%s %s",
+            pcp_size,
+            cp_rank_count,
+            max_len,
+            pad_size,
+            forward_batch.nsa_cp_metadata.max_rank_len,
+            forward_batch.nsa_cp_metadata.per_rank_actual_token,
+            forward_batch.nsa_cp_metadata.reverse_split_len,
+            forward_batch.nsa_cp_metadata.cp_reverse_index,
+            _pcp_tensor_debug_summary("input", input_tensor),
+        )
+
     if pad_size > 0:
         input_tensor = F.pad(
             input_tensor,
@@ -656,4 +689,16 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     outputs = torch.cat(
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
+
+    if _is_pcp_precision_debug_enabled():
+        logger.info(
+            "[pcp-debug] pcp_ag_rearange_output_done: gathered_sum=%s "
+            "post_trim_sum=%s post_reverse_sum=%s expected_total_token=%s %s",
+            float(all_shuffled_sensor.sum().item()) if all_shuffled_sensor.numel() else 0.0,
+            float(output_tensor.sum().item()) if output_tensor.numel() else 0.0,
+            float(outputs.sum().item()) if outputs.numel() else 0.0,
+            sum(forward_batch.nsa_cp_metadata.reverse_split_len),
+            _pcp_tensor_debug_summary("output", outputs),
+        )
+
     return outputs

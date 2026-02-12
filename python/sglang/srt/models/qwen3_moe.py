@@ -574,17 +574,37 @@ class Qwen3MoeAttention(nn.Module):
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
+            if _is_pcp_precision_debug_enabled():
+                logger.info(
+                    "[pcp-debug] before pcp_ag_rearange_output: layer=%s q_shape=%s "
+                    "k_shape=%s v_shape=%s q_sum=%s k_sum=%s v_sum=%s q_dtype=%s "
+                    "k_dtype=%s v_dtype=%s",
+                    self.attn.layer_id,
+                    tuple(q.shape),
+                    tuple(k.shape),
+                    tuple(v.shape),
+                    (q.sum().item()) if q.numel() else 0.0,
+                    (k.sum().item()) if k.numel() else 0.0,
+                    (v.sum().item()) if v.numel() else 0.0,
+                    q.dtype,
+                    k.dtype,
+                    v.dtype,
+                )
             k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
             v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
             if _is_pcp_precision_debug_enabled():
                 logger.info(
-                "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
-                    "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
+                    "[pcp-debug] after pcp_ag_rearange_output: layer=%s q_shape=%s "
+                    "k_shape=%s v_shape=%s q_sum=%s k_sum=%s v_sum=%s q_dtype=%s "
+                    "k_dtype=%s v_dtype=%s",
                     self.attn.layer_id,
+                    tuple(q.shape),
                     tuple(k.shape),
                     tuple(v.shape),
-                    (k.sum().item()),
-                    (v.sum().item()),
+                    (q.sum().item()) if q.numel() else 0.0,
+                    (k.sum().item()) if k.numel() else 0.0,
+                    (v.sum().item()) if v.numel() else 0.0,
+                    q.dtype,
                     k.dtype,
                     v.dtype,
                 )
@@ -1002,6 +1022,21 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.pcp_size,
                     input_ids.device,
                 )
+                if _is_pcp_precision_debug_enabled():
+                    md = forward_batch.nsa_cp_metadata
+                    logger.info(
+                        "[pcp-debug] prepare_input_dp_with_cp_dsa: pcp_rank=%s pcp_size=%s "
+                        "input_len=%s split_list=%s max_rank_len=%s per_rank_actual_token=%s "
+                        "reverse_split_len=%s cp_reverse_index=%s",
+                        self.pcp_rank,
+                        self.pcp_size,
+                        len(input_ids),
+                        md.split_list,
+                        md.max_rank_len,
+                        md.per_rank_actual_token,
+                        md.reverse_split_len,
+                        md.cp_reverse_index,
+                    )
 
         hidden_states = self.model(
             input_ids,
