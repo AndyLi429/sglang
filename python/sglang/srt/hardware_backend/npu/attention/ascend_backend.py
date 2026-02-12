@@ -1461,18 +1461,18 @@ class AscendAttnBackend(AttentionBackend):
                         q_rope=q_rope,
                         k_rope=k_rope,
                     )
-            else:
-                # FIA PCP
-                attn_output = self.forward_fia_pcp(
-                        q_nope,
-                        k_nope,
-                        v,
-                        layer,
-                        forward_batch,
-                        save_kv_cache,
-                        q_rope=q_rope,
-                        k_rope=k_rope,
-                    )
+        elif  self.is_prefill_cp_enable and self.use_fia:
+            attn_output = self.forward_fia_pcp(
+                    q_nope,
+                    k_nope,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope=q_rope,
+                    k_rope=k_rope,
+                )
+                
         else:
             assert (
                 layer.qk_head_dim != layer.v_head_dim

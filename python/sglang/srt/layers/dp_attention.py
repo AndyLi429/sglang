@@ -46,6 +46,9 @@ def _pcp_tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
         f"device={tensor.device} sum={float(tensor.sum().item())}"
     )
 
+
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -627,6 +630,16 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     cp_rank_count = len(forward_batch.nsa_cp_metadata.max_rank_len)
     max_len = forward_batch.nsa_cp_metadata.max_rank_len[0]
 
+    if cp_rank_count <= 1:
+        if _is_pcp_precision_debug_enabled():
+            logger.info(
+                "[pcp-debug] pcp_ag_rearange_output_skip: cp_rank_count=%s pcp_size_arg=%s %s",
+                cp_rank_count,
+                pcp_size,
+                _pcp_tensor_debug_summary("input", input_tensor),
+            )
+        return input_tensor
+
     pad_size = max_len - input_tensor.shape[0]
     if _is_pcp_precision_debug_enabled():
         logger.info(
@@ -693,7 +706,7 @@ def pcp_ag_rearange_output(input_tensor, pcp_size, forward_batch):
     if _is_pcp_precision_debug_enabled():
         logger.info(
             "[pcp-debug] pcp_ag_rearange_output_done: gathered_sum=%s "
-            "post_trim_sum=%s post_reverse_sum=%s expected_total_token=%s %s",
+            "post_trim_cksum=%s post_reverse_cksum=%s expected_total_token=%s %s",
             float(all_shuffled_sensor.sum().item()) if all_shuffled_sensor.numel() else 0.0,
             float(output_tensor.sum().item()) if output_tensor.numel() else 0.0,
             float(outputs.sum().item()) if outputs.numel() else 0.0,

@@ -573,7 +573,8 @@ class Qwen3MoeAttention(nn.Module):
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+
+        if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1 and use_pcp(forward_batch):
             if _is_pcp_precision_debug_enabled():
                 logger.info(
                     "[pcp-debug] before pcp_ag_rearange_output: layer=%s q_shape=%s "
@@ -1014,7 +1015,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp:
+        if self.enable_prefill_cp and self.pcp_size and self.pcp_size > 1:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
@@ -1038,6 +1039,12 @@ class Qwen3MoeForCausalLM(nn.Module):
                         md.cp_reverse_index,
                     )
 
+
+        elif self.enable_prefill_cp and _is_pcp_precision_debug_enabled():
+            logger.info(
+                "[pcp-debug] skip prepare_input_dp_with_cp_dsa because pcp_size=%s",
+                self.pcp_size,
+            )
         hidden_states = self.model(
             input_ids,
             positions,
