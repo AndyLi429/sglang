@@ -574,23 +574,11 @@ class Qwen3MoeAttention(nn.Module):
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
         if self.enable_prefill_cp and use_pcp(forward_batch):
-            if _is_pcp_precision_debug_enabled() and self.attn.layer_id == 1:
-                logger.info(
-                    "[pcp-debug] before pcp_ag_rearange_output: layer=%s k_shape=%s "
-                    "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
-                    self.attn.layer_id,
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    tuple(k.sum()),
-                    tuple(v.sum()),
-                    k.dtype,
-                    v.dtype,
-                )
             k = pcp_ag_rearange_output(k.contiguous(), self.pcp_size, forward_batch)
             v = pcp_ag_rearange_output(v.contiguous(), self.pcp_size, forward_batch)
-            if _is_pcp_precision_debug_enabled() and self.attn.layer_id == 1:
+            if _is_pcp_precision_debug_enabled():
                 logger.info(
-                    "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
+                "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
                     "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
                     self.attn.layer_id,
                     tuple(k.shape),
@@ -686,7 +674,18 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
-
+        if _is_pcp_precision_debug_enabled() and not self.enable_prefill_cp:
+                logger.info(
+                "[pcp-debug] after pcp_ag_rearange_output: layer=%s k_shape=%s "
+                    "v_shape=%s k_sum=%s v_sum=%s k_dtype=%s v_dtype=%s",
+                    self.attn.layer_id,
+                    tuple(k.shape),
+                    tuple(v.shape),
+                    tuple(k.sum()),
+                    tuple(v.sum()),
+                    k.dtype,
+                    v.dtype,
+                )
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
             enable_fused_set_kv_buffer(forward_batch)
@@ -996,7 +995,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
         if self.enable_prefill_cp:
-            if can_cp_split(input_ids, self.pcp_size, forward_batch):
+            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),
                     self.pcp_rank,
