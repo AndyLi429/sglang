@@ -890,42 +890,53 @@ class AscendAttnBackend(AttentionBackend):
         atten_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         kv_mask_idx = kv_mask_idx.to(k.device)
+        kv_nomask_idx = kv_nomask_idx.to(k.device)
+        if kv_mask_idx.shape[0] == 0 and kv_nomask_idx.shape[0] == 0:
+            return torch.zeros(
+                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                device=q.device,
+                dtype=q.dtype,
+            )
+
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
 
         print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}")
         q_4d = q.unsqueeze(0)
-        v_mask_4d = v_mask.unsqueeze(0)
-        k_mask_4d = k_mask.unsqueeze(0)
+        mask_out = None
+        mask_lse = None
 
         curr_atten_mask = None
         if atten_mask is not None:
             curr_atten_mask = atten_mask.unsqueeze(0).unsqueeze(0)
-    
-        mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
-            q_4d,
-            k_mask_4d,
-            v_mask_4d,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="BSND",
-            atten_mask=curr_atten_mask,
-            sparse_mode=3 if q.shape[0] != 1 else 0,
-            scale=layer.scaling,
-            next_tokens=0,
-            inner_precise = 0
-        )
 
-        mask_out = mask_out.squeeze(0)
-        mask_lse = mask_lse.squeeze(0)
-        if mask_lse.dim()==2:
-            mask_lse = mask_lse.unsqueeze(-1)
-        mask_lse = mask_lse.transpose(0, 1)
+        if kv_mask_idx.shape[0] > 0:
+            v_mask_4d = v_mask.unsqueeze(0)
+            k_mask_4d = k_mask.unsqueeze(0)
+            sparse_mode = 3 if (q.shape[0] != 1 and curr_atten_mask is not None) else 0
+            mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q_4d,
+                k_mask_4d,
+                v_mask_4d,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="BSND",
+                atten_mask=curr_atten_mask,
+                sparse_mode=sparse_mode,
+                scale=layer.scaling,
+                next_tokens=0,
+                inner_precise=0,
+            )
+
+            mask_out = mask_out.squeeze(0)
+            mask_lse = mask_lse.squeeze(0)
+            if mask_lse.dim() == 2:
+                mask_lse = mask_lse.unsqueeze(-1)
+            mask_lse = mask_lse.transpose(0, 1)
 
         if kv_nomask_idx.shape[0] == 0:
             return mask_out[0]
 
-        kv_nomask_idx = kv_nomask_idx.to(k.device)
         k_nomask = torch.index_select(k, 0, kv_nomask_idx).unsqueeze(0)
         v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
 
@@ -950,10 +961,16 @@ class AscendAttnBackend(AttentionBackend):
             nomask_lse = nomask_lse.unsqueeze(-1)
         nomask_lse = nomask_lse.transpose(0, 1)
 
+        if mask_out is None:
+            return nomask_out[0]
+
+        mask_lse = mask_lse.float()
+        nomask_lse = nomask_lse.float()
         max_lse = torch.maximum(mask_lse, nomask_lse)
         w1 = torch.exp(mask_lse - max_lse)
         w2 = torch.exp(nomask_lse - max_lse)
-        result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
+        result = (w1 * mask_out.float() + w2 * nomask_out.float()) / (w1 + w2)
+        result = result.to(mask_out.dtype)
         return result 
 
     def forward_fia_pcp(
