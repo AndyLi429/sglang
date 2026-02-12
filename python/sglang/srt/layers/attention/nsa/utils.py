@@ -520,10 +520,10 @@ def _compute_attention_metadata(
     
     cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
     cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
-    cp_metadata.kv_with_q_head_nomask_idx_tensor = kv_with_q_head_nomask_idx_tensor
-    cp_metadata.kv_with_q_head_mask_idx_tensor = kv_with_q_head_mask_idx_tensor
-    cp_metadata.kv_with_q_tail_nomask_idx_tensor = kv_with_q_tail_nomask_idx_tensor
-    cp_metadata.kv_with_q_tail_mask_idx_tensor = kv_with_q_tail_mask_idx_tensor
+    cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx_tensor
+    cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
+    cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
+    cp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx_tensor
     return cp_metadata
 
 
