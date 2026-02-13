@@ -72,7 +72,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    is_enable_prefill_pcp,
+    is_enable_prefill_cp,
     nsa_use_prefill_cp,
     is_nsa_enable_prefill_cp,
     use_pcp,
@@ -578,7 +578,7 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.enable_prefill_cp = is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         self.pcp_size = get_pcp_size() if self.enable_prefill_cp else None
 
         if self.pp_group.is_first_rank:
@@ -725,7 +725,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.enable_prefill_cp = is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         if self.enable_prefill_cp:
             self.pcp_rank = get_pcp_rank()
             self.pcp_size = get_pcp_size()

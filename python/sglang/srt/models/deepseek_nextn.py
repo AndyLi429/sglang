@@ -31,7 +31,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_pcp,
+    is_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -124,7 +124,7 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.enable_prefill_cp = is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_tp_size()
         elif self.is_enable_prefill_cp():
@@ -217,7 +217,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp()  if self.use_nsa else is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_nsa_enable_prefill_cp()  if self.use_nsa else is_enable_prefill_cp()
         if self.enable_prefill_cp and self.use_nsa:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()

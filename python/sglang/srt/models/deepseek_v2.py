@@ -64,7 +64,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_pcp
+    is_enable_prefill_cp
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -2507,7 +2507,7 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
         if self.enable_prefill_cp and self.use_nsa:
             self.cp_size = get_attention_tp_size()
         elif self.enable_prefill_cp:
@@ -2825,7 +2825,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = False
 
         self.use_nsa = is_deepseek_nsa(config)
-        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_nsa_enable_prefill_cp() if self.use_nsa else is_enable_prefill_cp()
         if self.enable_prefill_cp and self.use_nsa:
             #3.2
             self.cp_rank = get_attention_tp_rank()

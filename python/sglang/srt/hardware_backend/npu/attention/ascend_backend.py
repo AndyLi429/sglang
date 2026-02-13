@@ -901,7 +901,7 @@ class AscendAttnBackend(AttentionBackend):
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
 
-        print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}")
+        
         q_4d = q.unsqueeze(0)
         mask_out = None
         mask_lse = None
@@ -914,6 +914,9 @@ class AscendAttnBackend(AttentionBackend):
             v_mask_4d = v_mask.unsqueeze(0)
             k_mask_4d = k_mask.unsqueeze(0)
             sparse_mode = 3 if (q.shape[0] != 1 and curr_atten_mask is not None) else 0
+            print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}, {kv_mask_idx.max().item()=}\
+             , {kv_nomask_idx.max().item()=},{k_mask.shape[0]=},{sparse_mode.shape[0]=},{curr_atten_mask.shape=}")
+
             mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
                 q_4d,
                 k_mask_4d,
@@ -934,13 +937,16 @@ class AscendAttnBackend(AttentionBackend):
                 mask_lse = mask_lse.unsqueeze(-1)
             mask_lse = mask_lse.transpose(0, 1)
 
+        print(f"after mask attention caclulate {mask_out.shape=}, {mask_lse.shape=}")
+
         if kv_nomask_idx.shape[0] == 0:
             return mask_out[0]
 
         k_nomask = torch.index_select(k, 0, kv_nomask_idx).unsqueeze(0)
         v_nomask = torch.index_select(v, 0, kv_nomask_idx).unsqueeze(0)
 
-        print(f"start to fia attention with nomask, {q.shape=}, {k_nomask.shape=}, {v_nomask.shape=}")
+        print(f"start to fia attention with mask and nomask, {q.shape=}, {k_mask.shape=}, {v_mask.shape=}, {kv_mask_idx.max().item()=}\
+             , {kv_nomask_idx.max().item()=},{k_nomask.shape[0]=},{sparse_mode.shape[0]=},{curr_atten_mask.shape=}")
         
         nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
             q_4d,
@@ -963,6 +969,8 @@ class AscendAttnBackend(AttentionBackend):
 
         if mask_out is None:
             return nomask_out[0]
+        
+        print(f"after nomask attention caclulate {nomask_out.shape=}, {nomask_lse.shape=}")
 
 
         max_lse = torch.maximum(mask_lse, nomask_lse)

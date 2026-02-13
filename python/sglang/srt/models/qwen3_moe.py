@@ -63,7 +63,7 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     prepare_input_dp_with_cp_dsa,
-    is_enable_prefill_pcp,
+    is_enable_prefill_cp,
     use_pcp,
 )
 from sglang.srt.layers.utils import get_layer_id
@@ -445,7 +445,7 @@ class Qwen3MoeAttention(nn.Module):
         attn_tp_size = get_attention_tp_size()
 
         self.config = config
-        self.enable_prefill_cp = is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -743,7 +743,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
-        self.enable_prefill_cp = is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -956,7 +956,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
 
         # PCP (Prefill Context Parallelism) configuration
-        self.enable_prefill_cp = is_enable_prefill_pcp()
+        self.enable_prefill_cp = is_enable_prefill_cp()
         if self.enable_prefill_cp:
             self.pcp_rank = get_pcp_rank()
             self.pcp_size = get_pcp_size()

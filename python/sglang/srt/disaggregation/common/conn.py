@@ -29,7 +29,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_pcp
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -129,7 +129,7 @@ class CommonKVManager(BaseKVManager):
         attn_dp_rank = self.attn_dp_rank
         attn_tp_size = self.attn_tp_size
         attn_dp_size = self.attn_dp_size
-        if is_enable_prefill_pcp():
+        if is_enable_prefill_cp():
             attn_dp_rank = 0
             attn_tp_size = PREFILL_CP_ATTN_TP_SIZE
             attn_dp_size = 1

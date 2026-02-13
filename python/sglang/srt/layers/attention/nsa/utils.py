@@ -123,7 +123,7 @@ def is_nsa_prefill_cp_round_robin_split():
         and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
     )
 
-def is_enable_prefill_pcp():
+def is_enable_prefill_cp():
     return get_global_server_args().prefill_context_parallel_size > 1
 
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
@@ -341,7 +341,7 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
 def use_pcp(forward_batch):
     if (forward_batch.cp_metadata is not None
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_enable_prefill_pcp()):
+        and is_enable_prefill_cp()):
             return True
     else:
         return False
@@ -660,7 +660,7 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
     )
-    if is_enable_prefill_pcp():
+    if is_enable_prefill_cp():
         return _compute_attention_metadata(
             cp_metadata,
             device=device,
