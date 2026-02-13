@@ -964,12 +964,11 @@ class AscendAttnBackend(AttentionBackend):
         if mask_out is None:
             return nomask_out[0]
 
-        mask_lse = mask_lse.float()
-        nomask_lse = nomask_lse.float()
+
         max_lse = torch.maximum(mask_lse, nomask_lse)
         w1 = torch.exp(mask_lse - max_lse)
         w2 = torch.exp(nomask_lse - max_lse)
-        result = (w1 * mask_out.float() + w2 * nomask_out.float()) / (w1 + w2)
+        result = (w1 * mask_out + w2 * nomask_out) / (w1 + w2)
         result = result.to(mask_out.dtype)
         return result 
 
@@ -1100,6 +1099,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia:
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                print(f"+++ use fia pcp: {q.shape=},{k.shape=},{v.shape=},{forward_batch.extend_seq_lens=}")
                 if use_pcp(forward_batch):
                     attn_output = self.forward_fia_pcp(
                         q=q,

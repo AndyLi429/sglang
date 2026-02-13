@@ -340,7 +340,8 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
 
 def use_pcp(forward_batch):
     if (forward_batch.cp_metadata is not None
-        and forward_batch.forward_mode.is_context_parallel_extend()):
+        and forward_batch.forward_mode.is_context_parallel_extend()
+        and is_enable_prefill_pcp()):
             return True
     else:
         return False

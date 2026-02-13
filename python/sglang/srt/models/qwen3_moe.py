@@ -809,8 +809,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        if self.layer_id==0:
-            print(f"after prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:10]}") 
+        # if self.layer_id==0:
+        #     print(f"after prepare attn and capture, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:10]}") 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -821,8 +821,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if self.layer_id==0:
-            print(f"after prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:10]}") 
+        # if self.layer_id==0:
+        #     print(f"after prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:10]}") 
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -838,8 +838,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        if self.layer_id==0:
-            print(f"after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:10]}") 
+        if self.layer_id==0 or self.layer_id == 1:
+            print(f"after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:,:5]}") 
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
