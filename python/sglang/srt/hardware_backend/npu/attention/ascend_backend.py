@@ -843,8 +843,7 @@ class AscendAttnBackend(AttentionBackend):
         kv_with_q_head_mask_idx = forward_batch.cp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = forward_batch.cp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = forward_batch.cp_metadata.kv_with_q_tail_mask_idx
-        head_attn_mask_seqlens = forward_batch.cp_metadata.head_attn_mask_seqlens
-        tail_attn_mask_seqlens = forward_batch.cp_metadata.tail_attn_mask_seqlens
+        attn_mask_seqlens = forward_batch.cp_metadata.attn_mask_seqlens # []
         head_attn_nomask_seqlens = forward_batch.cp_metadata.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = forward_batch.cp_metadata.tail_attn_nomask_seqlens
         output_head, lse_head = self._attention_with_mask_and_nomask(
@@ -855,7 +854,7 @@ class AscendAttnBackend(AttentionBackend):
             value=v,
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
-            attn_mask_seqlens=head_attn_mask_seqlens,
+            attn_mask_seqlens=attn_mask_seqlens,
             attn_nomask_seqlens=head_attn_nomask_seqlens,
             mask=self.ringmla_mask,
             layer=layer,
@@ -869,7 +868,7 @@ class AscendAttnBackend(AttentionBackend):
             value=v,
             kv_mask_idx=kv_with_q_tail_mask_idx,
             kv_nomask_idx=kv_with_q_tail_nomask_idx,
-            attn_mask_seqlens=tail_attn_mask_seqlens,
+            attn_mask_seqlens=attn_mask_seqlens,
             attn_nomask_seqlens=tail_attn_nomask_seqlens,
             mask=self.ringmla_mask,
             layer=layer,
@@ -996,13 +995,16 @@ class AscendAttnBackend(AttentionBackend):
         kv_with_q_head_mask_idx = pcp_metadata.kv_with_q_head_mask_idx
         kv_with_q_tail_nomask_idx = pcp_metadata.kv_with_q_tail_nomask_idx
         kv_with_q_tail_mask_idx = pcp_metadata.kv_with_q_tail_mask_idx
-        head_attn_mask_seqlens = pcp_metadata.head_attn_mask_seqlens
-        tail_attn_mask_seqlens = pcp_metadata.tail_attn_mask_seqlens
+        attn_mask_seqlens = pcp_metadata.attn_mask_seqlens
         head_attn_nomask_seqlens = pcp_metadata.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = pcp_metadata.tail_attn_nomask_seqlens
 
         head_q_seqlens = pcp_metadata.head_q_seqlens
         tail_q_seqlens = pcp_metadata.tail_q_seqlens
+
+        # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+        #     print(f"+++ fia pcp get metadata rank:{torch.distributed.get_rank()} {attn_mask_seqlens=} {head_attn_nomask_seqlens=} {tail_attn_nomask_seqlens=}\
+        #         {head_q_seqlens=} {tail_q_seqlens=},{kv_with_q_head_mask_idx=} {kv_with_q_head_nomask_idx=} {kv_with_q_tail_mask_idx=} {kv_with_q_tail_nomask_idx=}")
 
         output_head, attn_lse_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
@@ -1010,12 +1012,14 @@ class AscendAttnBackend(AttentionBackend):
             v=v,
             kv_mask_idx=kv_with_q_head_mask_idx,
             kv_nomask_idx=kv_with_q_head_nomask_idx,
-            kv_mask_seqlens=head_attn_mask_seqlens,
+            kv_mask_seqlens=attn_mask_seqlens,
             kv_nomask_seqlens=head_attn_nomask_seqlens,
-            q_seqlens=head_attn_mask_seqlens,
+            q_seqlens=attn_mask_seqlens,
             layer=layer,
             atten_mask=atten_mask,
         )
+        # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+        #     print(f"+++ output head is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_head.sum()=},  {output_head[:2, :5,:5]=}")
 
         output=[output_head]
         if q_tail.shape[0]>0:
@@ -1025,9 +1029,9 @@ class AscendAttnBackend(AttentionBackend):
                 v=v,
                 kv_mask_idx=kv_with_q_tail_mask_idx,
                 kv_nomask_idx=kv_with_q_tail_nomask_idx,
-                q_seqlens=tail_attn_mask_seqlens,
+                q_seqlens=attn_mask_seqlens,
                 kv_nomask_seqlens=tail_attn_nomask_seqlens,
-                kv_mask_seqlens=tail_attn_mask_seqlens,
+                kv_mask_seqlens=attn_mask_seqlens,
                 layer=layer,
                 atten_mask=atten_mask,
             )
