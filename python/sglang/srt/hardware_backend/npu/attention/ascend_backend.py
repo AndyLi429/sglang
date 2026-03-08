@@ -892,17 +892,20 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         atten_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-        #     print(f"+++ start to fia attention with mask and nomask, {q.shape=}, {k.shape=}, {v.shape=}, {kv_mask_idx.max().item()=}\
-        #         , {kv_nomask_idx.max().item()=},{k.shape[0]=},{q_seqlens=},{kv_mask_seqlens=},{kv_nomask_seqlens=}")
-        has_no_mask = (kv_nomask_idx.shape[0] != 0) and (sum(kv_nomask_seqlens) != 0)
+        has_no_mask = kv_nomask_idx.shape[0] != 0
+
+        # FIA (npu_fused_infer_attention_score) with TND layout expects
+        # actual_seq_lengths and actual_seq_lengths_kv as 1D tensors of
+        # shape [batch_size].  Derive them from the actual tensor shapes
+        # to avoid format issues with the 2D metadata tensors used by the
+        # MLA path (npu_ring_mla).
+        fia_q_seqlens = [q.shape[0]]
 
         if has_no_mask:
             kv_nomask_idx = kv_nomask_idx.to(k.device)
             k_nomask = torch.index_select(k, 0, kv_nomask_idx)
             v_nomask = torch.index_select(v, 0, kv_nomask_idx)
-            # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-            #     print(f"+++ fia pcp nomask k is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {k_nomask.sum()=},  {k_nomask[:2, :5,:5]=}")
+            fia_kv_nomask_seqlens = [k_nomask.shape[0]]
             nomask_out, nomask_lse = torch.ops.npu.npu_fused_infer_attention_score(
                 q,
                 k_nomask,
@@ -912,26 +915,20 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="TND",
                 atten_mask=None,
                 sparse_mode=0,
-                antiquant_mode = 0,
+                antiquant_mode=0,
                 scale=layer.scaling,
                 next_tokens=0,
                 inner_precise=0,
                 antiquant_scale=None,
                 softmax_lse_flag=True,
-                actual_seq_lengths_kv=kv_nomask_seqlens,
-                actual_seq_lengths=q_seqlens,
+                actual_seq_lengths_kv=fia_kv_nomask_seqlens,
+                actual_seq_lengths=fia_q_seqlens,
             )
-            # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-            #     print(f"+++ fia pcp nomask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {nomask_out.sum()=},  {nomask_out[:2, :5,:5]=}")
 
         kv_mask_idx = kv_mask_idx.to(k.device)
         k_mask = torch.index_select(k, 0, kv_mask_idx)
         v_mask = torch.index_select(v, 0, kv_mask_idx)
-
-        # if torch.distributed.get_rank() == 0 and layer.layer_id == 0:
-        #     print(f"HEAD: k_mask[:2, 0, :3] = {k_mask[:2, 0, :3]}")
-        #     # 对比 forward_fia_pcp 里 k 的前3个元素
-
+        fia_kv_mask_seqlens = [k_mask.shape[0]]
 
         mask_out, mask_lse = torch.ops.npu.npu_fused_infer_attention_score(
             q,
@@ -942,25 +939,23 @@ class AscendAttnBackend(AttentionBackend):
             input_layout="TND",
             atten_mask=atten_mask,
             sparse_mode=3,
-            antiquant_mode = 0,
+            antiquant_mode=0,
             antiquant_scale=None,
             scale=layer.scaling,
             next_tokens=0,
             inner_precise=0,
             softmax_lse_flag=True,
-            actual_seq_lengths_kv=kv_mask_seqlens,
-            actual_seq_lengths=q_seqlens,
+            actual_seq_lengths_kv=fia_kv_mask_seqlens,
+            actual_seq_lengths=fia_q_seqlens,
         )
-        # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-        #     print(f"+++ fia pcp mask out is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {mask_out.sum()=}, {mask_out.shape=} {mask_out[:2, :5,:5]=}")
 
         if not has_no_mask:
             return mask_out, mask_lse
-        attn_output,attn_lse = self._update_out_and_lse(
+        attn_output, attn_lse = self._update_out_and_lse(
             torch.stack([nomask_out, mask_out], dim=0),
             torch.stack([nomask_lse, mask_lse], dim=0),
         )
-        return attn_output,attn_lse
+        return attn_output, attn_lse
 
     def _update_out_and_lse(
         self,
@@ -1007,9 +1002,9 @@ class AscendAttnBackend(AttentionBackend):
         head_q_seqlens = pcp_metadata.head_q_seqlens
         tail_q_seqlens = pcp_metadata.tail_q_seqlens
 
-        if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-            print(f"+++ fia pcp get metadata rank:{torch.distributed.get_rank()} {attn_mask_seqlens=} {head_attn_nomask_seqlens=} {tail_attn_nomask_seqlens=}\
-                {head_q_seqlens=} {tail_q_seqlens=},{kv_with_q_head_mask_idx=} {kv_with_q_head_nomask_idx=} {kv_with_q_tail_mask_idx=} {kv_with_q_tail_nomask_idx=}")
+        # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+        #     print(f"+++ fia pcp get metadata rank:{torch.distributed.get_rank()} {attn_mask_seqlens=} {head_attn_nomask_seqlens=} {tail_attn_nomask_seqlens=}\
+        #         {head_q_seqlens=} {tail_q_seqlens=},{kv_with_q_head_mask_idx=} {kv_with_q_head_nomask_idx=} {kv_with_q_tail_mask_idx=} {kv_with_q_tail_nomask_idx=}")
 
         output_head, attn_lse_head = self._fia_attention_with_mask_and_nomask(
             q=q_head,
@@ -1040,8 +1035,8 @@ class AscendAttnBackend(AttentionBackend):
                 layer=layer,
                 atten_mask=atten_mask,
             )
-            if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
-                print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
+            # if torch.distributed.get_rank() in (0,4) and layer.layer_id == 0:
+            #     print(f"+++ output tail is {layer.layer_id=} === rank:{torch.distributed.get_rank()} {output_tail.sum()=},  {output_tail[:2, :5,:5]=}")
             output = torch.cat([output_head,output_tail], dim=0)
         else:
             output = torch.cat(output, dim=0)
