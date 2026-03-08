@@ -457,20 +457,19 @@ def calculate_cp_seq_idx(cp_chunks_len, seqs_len):
 def _compute_attention_metadata(
     cp_metadata,
     device,
-    seq_per_batch,
+    head_chunk_len,
+    tail_chunk_len,
     head_start_global,
     head_end_global,
     tail_start_global,
     tail_end_global,
 ):
-    head_chunk_len = head_end_global - head_start_global
-    tail_chunk_len = tail_end_global - tail_start_global
     head_q_seqlens = [head_chunk_len]
     tail_q_seqlens = [tail_chunk_len]
 
-    # Compute nomask seqlens
-    head_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [head_start_global]], dtype=torch.int32).to(device=device)
-    tail_attn_nomask_seqlens = torch.tensor([[seq_per_batch], [tail_start_global]], dtype=torch.int32).to(device=device)
+    # Use actual chunk lengths (not floor-divided seq_per_batch) as max_seqlen for attention kernels
+    head_attn_nomask_seqlens = torch.tensor([[head_chunk_len], [head_start_global]], dtype=torch.int32).to(device=device)
+    tail_attn_nomask_seqlens = torch.tensor([[tail_chunk_len], [tail_start_global]], dtype=torch.int32).to(device=device)
 
     # Compute indices using torch.arange for efficiency
     kv_with_q_head_nomask_idx_tensor = torch.arange(0, head_start_global, dtype=torch.int32, device=device)
@@ -606,7 +605,10 @@ def prepare_input_dp_with_cp_dsa(
         device=device, dtype=torch.int32
     )
 
-    attn_mask_seqlens = torch.tensor([[seq_per_batch], [seq_per_batch]], dtype=torch.int32)
+    # Use actual head/tail chunk lengths (not floor-divided seq_per_batch which may be off by 1)
+    attn_mask_seqlens = torch.tensor(
+        [[actual_seq_q_prev], [actual_seq_q_next]], dtype=torch.int32
+    )
 
     cp_metadata = ContextParallelMetadata(
         split_list=split_list,
@@ -630,7 +632,8 @@ def prepare_input_dp_with_cp_dsa(
         return _compute_attention_metadata(
             cp_metadata,
             device=device,
-            seq_per_batch=seq_per_batch,
+            head_chunk_len=actual_seq_q_prev,
+            tail_chunk_len=actual_seq_q_next,
             head_start_global=head_start_global,
             head_end_global=head_end_global,
             tail_start_global=tail_start_global,
