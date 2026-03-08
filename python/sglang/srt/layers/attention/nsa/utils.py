@@ -49,6 +49,8 @@ class ContextParallelMetadata:
     kv_with_q_tail_mask_idx: Optional[torch.Tensor] = None
     head_attn_nomask_seqlens: Optional[torch.Tensor] = None
     tail_attn_nomask_seqlens: Optional[torch.Tensor] = None
+    head_attn_mask_seqlens: Optional[torch.Tensor] = None
+    tail_attn_mask_seqlens: Optional[torch.Tensor] = None
     attn_mask_seqlens: Optional[torch.Tensor] = None
 
 
@@ -477,8 +479,19 @@ def _compute_attention_metadata(
     kv_with_q_tail_nomask_idx_tensor = torch.arange(0, tail_start_global, dtype=torch.int32, device=device)
     kv_with_q_tail_mask_idx_tensor = torch.arange(tail_start_global, tail_end_global, dtype=torch.int32, device=device)
 
+    # Separate mask seqlens for head and tail: format is [[q_seqlen], [kv_seqlen]].
+    # In the mask region, Q and KV come from the same chunk, so q_seqlen == kv_seqlen.
+    head_attn_mask_seqlens = torch.tensor(
+        [[head_chunk_len], [head_chunk_len]], dtype=torch.int32
+    ).to(device=device)
+    tail_attn_mask_seqlens = torch.tensor(
+        [[tail_chunk_len], [tail_chunk_len]], dtype=torch.int32
+    ).to(device=device)
+
     cp_metadata.head_attn_nomask_seqlens = head_attn_nomask_seqlens
     cp_metadata.tail_attn_nomask_seqlens = tail_attn_nomask_seqlens
+    cp_metadata.head_attn_mask_seqlens = head_attn_mask_seqlens
+    cp_metadata.tail_attn_mask_seqlens = tail_attn_mask_seqlens
     cp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx_tensor
     cp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx_tensor
     cp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx_tensor
