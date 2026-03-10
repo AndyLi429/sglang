@@ -1019,7 +1019,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp and self.pcp_size > 1:
+        if self.enable_prefill_cp:
             if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
                 forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),

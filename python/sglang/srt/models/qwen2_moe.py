@@ -753,14 +753,6 @@ class Qwen2MoeForCausalLM(nn.Module):
             self.pcp_rank = self.pcp_size = None
 
 
-        # PCP (Prefill Context Parallelism) configuration
-        self.enable_prefill_cp = is_enable_prefill_cp()
-        if self.enable_prefill_cp:
-            self.pcp_rank = get_pcp_rank()
-            self.pcp_size = get_pcp_size()
-        else:
-            self.pcp_rank = self.pcp_size = None
-
 
     @torch.no_grad()
     def forward(
