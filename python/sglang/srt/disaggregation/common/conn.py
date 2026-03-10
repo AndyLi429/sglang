@@ -22,15 +22,14 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group,get_context_parallel_rank
+from sglang.srt.distributed import get_pp_group,get_context_parallel_rank,get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
-from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import is_enable_prefill_cp,ContextParallelMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
