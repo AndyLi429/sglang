@@ -280,8 +280,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         )
         return nsa_cp_round_robin_split_data(positions)
 
-    cp_metadata = _get_cp_metadata(forward_batch)
-    assert cp_metadata is not None, "CP metadata is not available"
+    cp_metadata = forward_batch.cp_metadata
 
     if cp_metadata.rank_valid_ranges is not None:
         parts = []
