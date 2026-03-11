@@ -173,7 +173,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             return hidden_states, residual
         elif use_pcp(forward_batch) and forward_batch.cp_metadata.is_gqa:
             if hidden_states.shape[0] != 0:
-                hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+                hidden_states = get_attention_tp_group().all_reduce(hidden_states.contiguous())
                 hidden_states, residual = layernorm(hidden_states, residual)
                 local_hidden_states = hidden_states
                 pcp_size = get_pcp_size()
