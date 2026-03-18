@@ -58,7 +58,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    calculate_cp_transfer_metadata,
+    calculate_cp_metadata,
 )
 from sglang.srt.distributed.parallel_state import (
     get_context_parallel_world_size,
@@ -825,8 +825,9 @@ class Req:
         
         # For CP mode KV transfer
         self.cp_metadata: Optional["ContextParallelMetadata"] = None
-        # For CP mode extra allocated KV indices (padding) to be freed on finish
-        self.cp_overallocated_kv_indices: Optional[torch.Tensor] = None
+        # CP page ownership tracked during req_to_token writes.
+        self.cp_written_pages: Optional[torch.Tensor] = None
+        self.cp_padding_pages: Optional[torch.Tensor] = None
 
     @property
     def seqlen(self) -> int:
@@ -1145,7 +1146,8 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
-        self.cp_overallocated_kv_indices = None
+        self.cp_written_pages = None
+        self.cp_padding_pages = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1537,125 +1539,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
 
-        # Check if CP mode is enabled
         enable_cp = is_enable_prefill_cp()
         server_args = get_global_server_args()
-        # Compatibility mode for non-PD + PCP:
-        # allocate full-sequence KV slots (like pcp=1) so decode can always
-        # observe a complete sequence view on each TP rank.
-        force_full_alloc_non_pd_cp = (
-            enable_cp and server_args.disaggregation_mode == "null"
-        )
         if enable_cp:
-            if not server_args.disable_radix_cache:
-                raise ValueError(
-                    "CP mode requires radix cache to be disabled. "
-                    "Please set --disable-radix-cache when enabling CP mode."
-                )
-
-            # check prefix_indices should be empty when radix cache is disabled
-            for req in reqs:
-                if len(req.prefix_indices) > 0:
-                    raise ValueError(
-                        f"CP mode requires radix cache to be disabled, "
-                        f"but prefix_indices length is {len(req.prefix_indices)} for request {req.rid}"
-                    )
-
-            # Get CP configuration
-            cp_size = get_context_parallel_world_size()
-            cp_rank = get_pcp_rank()
-            page_size = self.token_to_kv_pool_allocator.page_size
-            """
-            CP Mode Memory Allocation Example:
-            - actual_seq_len = 12345, page_size = 32, cp_size = 4
-            - aligned_seq_len = 12544 (aligned to page_size * cp_size * 2 = 256)
-            - split_list = [1568, 1568, 1568, 1568, 1568, 1568, 1568, 1568] (8 blocks)
-            - For CP_Rank 0: zigzag_index = [0, 7], extend_tokens = 1568 + 1568 = 3136
-            - Memory allocated: 3136 tokens
-            - KV indices written: 2937 tokens (block 0: [0, 1568), block 7: [10976, 12345))
-            """
-            
-            # Calculate CP metadata for each request
-            cp_extend_tokens_list = []
-            extend_lens_alloc = []
-            extend_lens_actual = []
-            seq_lens_alloc = []
-            for i, req in enumerate(reqs):
-                actual_seq_len = len(req.fill_ids)
-                seq_lens_actual[i] = actual_seq_len
-                # Calculate CP metadata
-                req.cp_metadata = calculate_cp_transfer_metadata(
-                    actual_seq_len=actual_seq_len,
-                    cp_size=cp_size,
-                    cp_rank=cp_rank,
-                    page_size=page_size,
-                )
-                # Precompute per-rank valid ranges in original sequence index space.
-                prefix_offsets = [0]
-                for block_len in req.cp_metadata.split_list:
-                    prefix_offsets.append(prefix_offsets[-1] + block_len)
-                rank_valid_ranges = []
-                for block_idx in req.cp_metadata.zigzag_index:
-                    block_start = prefix_offsets[block_idx]
-                    block_end = prefix_offsets[block_idx + 1]
-                    if block_start < actual_seq_len:
-                        valid_end = min(block_end, actual_seq_len)
-                        rank_valid_ranges.append((block_start, valid_end))
-                req.cp_metadata.rank_valid_ranges = rank_valid_ranges
-                # Build actual block lengths (intersected with real sequence length).
-                cp_block_num = cp_size * 2
-                block_actual_lens = []
-                for block_idx in range(cp_block_num):
-                    block_start = prefix_offsets[block_idx]
-                    block_end = prefix_offsets[block_idx + 1]
-                    if block_start >= actual_seq_len:
-                        block_actual_lens.append(0)
-                    else:
-                        block_actual_lens.append(min(block_end, actual_seq_len) - block_start)
-                # Per-rank actual token counts and max rank length.
-                per_rank_actual_token = []
-                for r in range(cp_size):
-                    head = r
-                    tail = cp_block_num - 1 - r
-                    per_rank_actual_token.append(
-                        block_actual_lens[head] + block_actual_lens[tail]
-                    )
-                max_rank_len = max(per_rank_actual_token) if per_rank_actual_token else 0
-                req.cp_metadata.per_rank_actual_token = per_rank_actual_token
-                req.cp_metadata.max_rank_len = [max_rank_len] * cp_size
-                # Reverse split lengths in zigzag order, clipped to actual length.
-                reverse_split_len = []
-                for r in range(cp_size):
-                    reverse_split_len.append(block_actual_lens[r])
-                    reverse_split_len.append(block_actual_lens[cp_block_num - 1 - r])
-                req.cp_metadata.reverse_split_len = reverse_split_len
-                req.cp_metadata.total_seq_lens = actual_seq_len
-
-                # Calculate extend tokens for current CP_Rank (allocation length)
-                prefix_len = len(req.prefix_indices)
-                cp_extend_tokens = (
-                    sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index)
-                    - prefix_len
-                )
-                cp_extend_tokens_list.append(cp_extend_tokens)
-                extend_lens_alloc.append(cp_extend_tokens)
-                extend_lens_actual.append(actual_seq_len - prefix_len)
-                # For allocation only, synthesize seq_len = prefix + local-alloc
-                seq_lens_alloc.append(prefix_len + cp_extend_tokens)
-
-            extend_num_tokens_actual = sum(extend_lens_actual)
-            if force_full_alloc_non_pd_cp:
-                # Compatibility mode: allocate with full actual sequence length.
-                extend_num_tokens = extend_num_tokens_actual
-                seq_lens = seq_lens_actual.copy()
-                extend_lens = extend_lens_actual
-            else:
-                # Default CP mode: allocate by local zigzag block lengths.
-                extend_num_tokens = sum(cp_extend_tokens_list)
-                seq_lens = seq_lens_alloc
-                extend_lens = extend_lens_alloc
+            (
+                seq_lens_actual,
+                seq_lens,
+                extend_lens_actual,
+                extend_lens,
+                extend_num_tokens_actual,
+                extend_num_tokens,
+            ) = self._prepare_cp_extend(reqs, prefix_lens, server_args)
         else:
-            # Non-CP mode: keep original logic
             extend_lens = [r.extend_input_len for r in reqs]
             extend_num_tokens = sum(len(ids) for ids in input_ids)
             extend_lens_actual = extend_lens
@@ -1831,35 +1726,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
-        if enable_cp and not force_full_alloc_non_pd_cp:
-            # Build compact out_cache_loc for forward: only keep real tokens in zigzag order.
-            compact_out_cache_loc = []
-            pt = 0
-            for req in reqs:
-                cp_metadata = req.cp_metadata
-                actual_seq_len = cp_metadata.actual_seq_len
-                for block_idx in cp_metadata.zigzag_index:
-                    block_size = cp_metadata.split_list[block_idx]
-                    block_token_start = 0
-                    for j in range(block_idx):
-                        block_token_start += cp_metadata.split_list[j]
-                    block_token_end = block_token_start + block_size
-
-                    if block_token_start < actual_seq_len:
-                        write_size = min(block_token_end, actual_seq_len) - block_token_start
-                        if write_size > 0:
-                            compact_out_cache_loc.append(
-                                out_cache_loc[pt : pt + write_size]
-                            )
-                    # Always advance by full block size (allocation length)
-                    pt += block_size
-
-            if compact_out_cache_loc:
-                self.out_cache_loc = torch.cat(compact_out_cache_loc)
-            else:
-                self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
-                    self.device, non_blocking=True
-                )
+        if enable_cp and server_args.disaggregation_mode != "null":
+            self.out_cache_loc = self._get_cp_out_cache_loc(reqs, out_cache_loc)
         else:
             self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -1884,14 +1752,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         if enable_cp:
-            # Restore forward-visible lengths to actual sequence lengths.
-            self.seq_lens = torch.tensor(seq_lens_actual, dtype=torch.int64).to(
-                self.device, non_blocking=True
+            self._restore_extend_actual_view(
+                seq_lens_actual, extend_lens_actual, extend_num_tokens_actual
             )
-            self.seq_lens_cpu = torch.tensor(seq_lens_actual, dtype=torch.int64)
-            self.extend_lens = extend_lens_actual
-            self.extend_num_tokens = extend_num_tokens_actual
-            self.seq_lens_sum = sum(seq_lens_actual)
         else:
             self.seq_lens_sum = sum(seq_lens)
 
@@ -1929,6 +1792,99 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+    def _prepare_cp_extend(self, reqs, prefix_lens, server_args):
+        if not server_args.disable_radix_cache:
+            raise ValueError(
+                "CP mode requires radix cache to be disabled. "
+                "Please set --disable-radix-cache when enabling CP mode."
+            )
+
+        for req in reqs:
+            if len(req.prefix_indices) > 0:
+                raise ValueError(
+                    "CP mode requires radix cache to be disabled, "
+                    f"but prefix_indices length is {len(req.prefix_indices)} for request {req.rid}"
+                )
+
+        cp_size = get_context_parallel_world_size()
+        cp_rank = get_pcp_rank()
+        page_size = self.token_to_kv_pool_allocator.page_size
+        seq_lens_actual = []
+        seq_lens_alloc = []
+        extend_lens_actual = []
+        extend_lens_alloc = []
+        for req, prefix_len in zip(reqs, prefix_lens):
+            actual_seq_len = len(req.fill_ids)
+            seq_lens_actual.append(actual_seq_len)
+            req.cp_metadata = calculate_cp_metadata(
+                actual_seq_len=actual_seq_len,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                page_size=page_size,
+                device=self.device,
+            )
+
+            cp_extend_tokens = (
+                sum(req.cp_metadata.split_list[j] for j in req.cp_metadata.zigzag_index)
+                - prefix_len
+            )
+            extend_lens_alloc.append(cp_extend_tokens)
+            extend_lens_actual.append(actual_seq_len - prefix_len)
+            seq_lens_alloc.append(prefix_len + cp_extend_tokens)
+
+        extend_num_tokens_actual = sum(extend_lens_actual)
+        if server_args.disaggregation_mode == "null":
+            seq_lens = seq_lens_actual.copy()
+            extend_lens = extend_lens_actual
+            extend_num_tokens = extend_num_tokens_actual
+        else:
+            seq_lens = seq_lens_alloc
+            extend_lens = extend_lens_alloc
+            extend_num_tokens = sum(extend_lens_alloc)
+
+        return (
+            seq_lens_actual,
+            seq_lens,
+            extend_lens_actual,
+            extend_lens,
+            extend_num_tokens_actual,
+            extend_num_tokens,
+        )
+
+    def _get_cp_out_cache_loc(self, reqs, out_cache_loc):
+        compact_out_cache_loc = []
+        pt = 0
+        for req in reqs:
+            cp_metadata = req.cp_metadata
+            actual_seq_len = cp_metadata.actual_seq_len
+            for block_idx in cp_metadata.zigzag_index:
+                block_size = cp_metadata.split_list[block_idx]
+                block_token_start = 0
+                for j in range(block_idx):
+                    block_token_start += cp_metadata.split_list[j]
+                block_token_end = block_token_start + block_size
+
+                if block_token_start < actual_seq_len:
+                    write_size = min(block_token_end, actual_seq_len) - block_token_start
+                    if write_size > 0:
+                        compact_out_cache_loc.append(out_cache_loc[pt : pt + write_size])
+                pt += block_size
+
+        if compact_out_cache_loc:
+            return torch.cat(compact_out_cache_loc)
+        return torch.zeros(0, dtype=torch.int64).to(self.device, non_blocking=True)
+
+    def _restore_extend_actual_view(
+        self, seq_lens_actual, extend_lens_actual, extend_num_tokens_actual
+    ):
+        self.seq_lens = torch.tensor(seq_lens_actual, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens_cpu = torch.tensor(seq_lens_actual, dtype=torch.int64)
+        self.extend_lens = extend_lens_actual
+        self.extend_num_tokens = extend_num_tokens_actual
+        self.seq_lens_sum = sum(seq_lens_actual)
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,

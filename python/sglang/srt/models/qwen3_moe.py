@@ -38,7 +38,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size, pcp_ag_rearange_output
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_pcp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -61,10 +61,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    prepare_input_dp_with_cp_dsa,
     is_enable_prefill_cp,
-    cp_all_gather_rerange_output,
+    cp_pad_local_tokens,
     use_pcp,
 )
 from sglang.srt.layers.utils import get_layer_id
@@ -538,19 +536,9 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            hidden_states.shape[0] == 0
-            and self.enable_prefill_cp
-            and use_pcp(forward_batch)
-        ):
-            # Avoid NPU rope on empty tensors; still participate in PCP comms.
-            empty_kv = torch.empty(
-                (0, self.kv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            return hidden_states, forward_batch, None
+        if use_pcp(forward_batch):
+            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
+            positions = cp_pad_local_tokens(forward_batch, positions)
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -571,42 +559,18 @@ class Qwen3MoeAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
-    def _rebuild_pcp_kv(self, k, v, forward_batch):
-        kv = torch.cat([k, v], dim=-1)
-        kv_full = cp_all_gather_rerange_output(kv.contiguous(), self.pcp_size, forward_batch,torch.cuda.current_stream())
-        k, v = kv_full.split(split_size=self.kv_size, dim=-1)
-        return k, v
-
     def forward_prepare_native(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            hidden_states.shape[0] == 0
-            and self.enable_prefill_cp
-            and use_pcp(forward_batch)
-        ):
-            # Avoid rope on empty tensors; still participate in PCP comms.
-            empty_kv = torch.empty(
-                (0, self.kv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            pcp_ag_rearange_output(empty_kv, self.pcp_size, forward_batch)
-            return hidden_states, forward_batch, None
+        if use_pcp(forward_batch):
+            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
+            positions = cp_pad_local_tokens(forward_batch, positions)
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
-
-
-        # if self.enable_prefill_cp and use_pcp(forward_batch):
-        #     # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-        #         # print(f"+++[Qwen3MoeAttention] before _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")
-        #     k,v = self._rebuild_pcp_kv(k, v, forward_batch)
-        #     # if self.attn.layer_id==0 and torch.distributed.get_rank() in (0, 4):
-        #         # print(f"+++[Qwen3MoeAttention] after _rebuild_pcp_kv, {torch.distributed.get_rank()=},{k.sum()=},{k.shape=}")
 
         inner_state = q, k, v, forward_batch
 
@@ -661,6 +625,7 @@ class Qwen3MoeAttention(nn.Module):
                         forward_batch=forward_batch,
                     )
                     if enable_fused_set_kv_buffer(forward_batch)
+                    and not use_pcp(forward_batch)
                     and self.compatible_with_fused_kv_buffer
                     else None
                 ),
@@ -675,9 +640,10 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
-            # In CP mode, still participate in pcp all_gather to avoid
-            # communicator mismatch when some ranks have zero tokens.
-            if not (self.enable_prefill_cp and use_pcp(forward_batch)):
+            # Outside PCP, the empty rank can exit early. In PCP we still route
+            # through forward_prepare_* so the rank stays on the shared path and
+            # pad to the fixed local PCP layout before attention.
+            if not use_pcp(forward_batch):
                 return hidden_states, forward_batch, None
         if not _is_npu or forward_batch.forward_mode.is_extend():
             return self.forward_prepare_native(
@@ -711,11 +677,7 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
-        # if torch.distributed.get_rank() in (0,4) and self.attn.layer_id == 0 and forward_batch.forward_mode.is_extend():
-        #     print(f"+++ fia pcp output is {self.attn.layer_id=} === rank:{torch.distributed.get_rank()} {attn_output.sum()=},  {attn_output[:, :10]=}")
         output, _ = self.o_proj(attn_output)
-        # if self.attn.layer_id == 0 and torch.distributed.get_rank() in (0,4) and forward_batch.forward_mode.is_extend():
-        #     print(f'O========{self.attn.layer_id=},{torch.distributed.get_rank()=},{output.sum()=},{output[:, :10]}')
         return output
 
     def forward(
@@ -848,24 +810,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
-        # if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            # print(f"+++[Qwen3MoeDecoderLayer] prepare attn and capture last layer outputs, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}")
 
-        if hidden_states.shape[0] != 0 or (
-            self.enable_prefill_cp and use_pcp(forward_batch)
-        ):
+        if hidden_states.shape[0] != 0 or use_pcp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        
+        if use_pcp(forward_batch):
+            hidden_states = cp_pad_local_tokens(forward_batch, hidden_states)
+            if residual is not None:
+                residual = cp_pad_local_tokens(forward_batch, residual)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        # if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-            # print(f"+++[Qwen3MoeDecoderLayer] after attention and prepare mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}")
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -875,13 +834,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        # if self.layer_id == 0 and torch.distributed.get_rank() in (0,4):
-        #     print(f'========{self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}')
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
-        # if self.layer_id==0 and torch.distributed.get_rank() in (0,4):
-        #     # print(f"+++[Qwen3MoeDecoderLayer] after mlp, {self.layer_id=},{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:1,:3]}")
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1018,23 +973,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp and self.pcp_size > 1:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
-                    input_ids.device,
-                    is_gqa=True
-                )
-                # if torch.distributed.get_rank() == 0 or torch.distributed.get_rank() == 4:
-                #     # print(f"+++[Qwen3MoeForCausalLM] pcp metadata {torch.distributed.get_rank()=},{forward_batch.cp_metadata.split_list=}, {forward_batch.cp_metadata.max_rank_len=},\
-                #     {forward_batch.cp_metadata.reverse_split_len=},{forward_batch.cp_metadata.cp_reverse_index=}, {forward_batch.cp_metadata.zigzag_index=}")
-                #     # print(f"[rank={torch.distributed.get_rank()}] "
-                #         f"pcp_rank={self.pcp_rank}, "
-                #         f"zigzag_index={forward_batch.cp_metadata.zigzag_index}")
-
         hidden_states = self.model(
             input_ids,
             positions,

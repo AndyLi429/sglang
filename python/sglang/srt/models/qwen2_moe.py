@@ -68,8 +68,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    prepare_input_dp_with_cp_dsa,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     is_enable_prefill_cp,
@@ -634,22 +632,14 @@ class Qwen2MoeModel(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
-            # if self.enable_prefill_cp and use_pcp(forward_batch):
-            #     hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            #     if torch.distributed.get_rank() in range(5):
-            #         print(f"+++ cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}") 
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            # if torch.distributed.get_rank() in (0,4):
-            #     print(f"+++[Qwen2MoeModel] after cp split and rebuild position,{torch.distributed.get_rank()=},{positions.sum()=},{positions=},{forward_batch.cp_metadata.split_list=},\
-            #         {forward_batch.extend_seq_lens=},{forward_batch.extend_seq_lens.sum()=}") 
-            #     print(f"+++[Qwen2MoeModel] after cp split and rebuild hidden states,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]}")
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -682,9 +672,6 @@ class Qwen2MoeModel(nn.Module):
                             else None
                         ),
                     )
-                    # if layer.layer_id == 0 and torch.distributed.get_rank() in (0,1):
-                    #     print(f"+++ hidden_states and positions,{torch.distributed.get_rank()=},{hidden_states.sum()=},{positions[:]}") 
-                    
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -699,14 +686,12 @@ class Qwen2MoeModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
                 
-        if self.enable_prefill_cp and use_pcp(forward_batch):
+        if use_pcp(forward_batch):
             hidden_states = pcp_ag_rearange_output(
                 hidden_states.contiguous(),
                 self.pcp_size,
                 forward_batch,
-                )
-            # if torch.distributed.get_rank() in (0,4):
-            #     print(f"+++[Qwen2MoeModel] model output hidden states after pcp ag rearange output,{torch.distributed.get_rank()=},{hidden_states.sum()=},{hidden_states[:3,:5]=},{hidden_states.shape=}")
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -771,16 +756,6 @@ class Qwen2MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Prepare PCP metadata if enabled
-        if self.enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.pcp_size, forward_batch):
-                forward_batch.cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.pcp_rank,
-                    self.pcp_size,
-                    input_ids.device,
-                )
-
         hidden_states = self.model(
             input_ids,
             positions,
