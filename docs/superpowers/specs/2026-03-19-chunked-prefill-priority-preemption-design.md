@@ -61,10 +61,9 @@ Each scheduler iteration:
 ```
 
 **Remaining prefill tokens** — correct field references:
-- **Chunked request**: `chunked_req.extend_input_len` — this is set by the prior round's
-  `add_chunked_req()` to the number of tokens remaining. It is read at the start of the next
-  iteration before `init_next_round_input()` is called, so it reflects the prior round's
-  truncation point. This is an acceptable approximation (off by at most one chunk size).
+- **Chunked request**: `chunked_req.extend_input_len` — `init_next_round_input()` is called
+  **before** the preemption check so this field holds the accurate remaining token count for
+  this round. Calling `init_next_round_input()` multiple times is safe (idempotent).
 - **Waiting request**: `len(top_req.origin_input_ids)` — `init_next_round_input()` has not
   been called yet on waiting requests, so `extend_input_len` and `prefix_indices` are stale.
   `origin_input_ids` is the raw input and is always valid. Prefix cache hits are not subtracted
@@ -143,10 +142,11 @@ def _should_preempt_chunked_req(self, waiting_queue: List[Req]) -> bool:
 
 # In _get_new_batch_prefill_raw(), replace lines ~2257-2259:
 if self.chunked_req is not None:
+    # init_next_round_input() called first so extend_input_len is accurate
+    self.chunked_req.init_next_round_input()
     if self._should_preempt_chunked_req(self.waiting_queue):
-        pass  # yield this round to waiting_queue
+        pass  # yield this round; init_next_round_input is idempotent
     else:
-        self.chunked_req.init_next_round_input()
         self.chunked_req = adder.add_chunked_req(self.chunked_req)
 ```
 
@@ -212,4 +212,4 @@ does not provide enough TTFT benefit to warrant disrupting the long request's pr
 | `python/sglang/srt/managers/schedule_batch.py` | +1 field in `Req` |
 | `python/sglang/srt/server_args.py` | +3 dataclass fields + 3 CLI args in `add_cli_args()` |
 | `python/sglang/srt/managers/scheduler.py` | +~35 lines (helper method + modified block) |
-| `test/unit/srt/test_chunked_prefill_preemption.py` | New unit test: preemption triggers, anti-starvation reset, disabled-by-default path |
+| `test/srt/cpu/test_chunked_prefill_preemption.py` | New unit test: preemption triggers, anti-starvation reset, disabled-by-default path |
