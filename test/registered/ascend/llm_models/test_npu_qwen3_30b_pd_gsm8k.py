@@ -1,8 +1,8 @@
 """Test Qwen3-30B-A3B PD disaggregation GSM8K accuracy on NPU (Ascend).
 
 NPU layout (8 NPUs total):
-  Prefill server: TP=4, MOE_DP=2, EP=2, ATTN_CP=2 — NPUs 0–3
-  Decode  server: TP=4, EP=2                        — NPUs 4–7 (base-gpu-id=4)
+  Prefill server: TP=4, MOE_DP=2,  ATTN_CP=2 — NPUs 0–3
+  Decode  server: TP=4,                      — NPUs 4–7 (base-gpu-id=4)
 
 Within the prefill server, MOE_DP=2 creates 2 DP groups of TP=2 GPUs each.
 ATTN_CP=2 splits the context across 2 CP workers within each DP group, so
@@ -16,7 +16,9 @@ import os
 import unittest
 from types import SimpleNamespace
 
+from sglang.bench_serving import run_benchmark
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import get_benchmark_args
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -35,14 +37,12 @@ QWEN3_MOE_MODEL = QWEN3_30B_A3B_WEIGHTS_PATH
 # Each DP group has 2 GPUs; each CP worker handles 1/2 of the context.
 PREFILL_TP = 4
 PREFILL_MOE_DP = 2
-PREFILL_EP = 2
 PREFILL_CP = 2
 PREFILL_BASE_GPU_ID = 0
 
 # Decode server uses the remaining 4 NPUs (4-7).
 # No moe_dp — decode does single-token steps; moe_dp would require attn_cp to match.
 DECODE_TP = 4
-DECODE_EP = 2
 DECODE_BASE_GPU_ID = PREFILL_TP  # = 4
 
 # GSM8K accuracy floor — Qwen3-30B-A3B should comfortably exceed this.
@@ -112,6 +112,8 @@ class TestQwen3MoePDNpu(PDDisaggregationServerBase):
             "prefill",
             "--max-running-requests",
             "1",
+            "--chunked-prefill-size",
+            "8192",
             "--tp",
             str(PREFILL_TP),
             "--moe-dp-size",
@@ -170,6 +172,34 @@ class TestQwen3MoePDNpu(PDDisaggregationServerBase):
             f"{metrics['accuracy']:.3f}"
         )
         self.assertGreater(metrics["accuracy"], GSM8K_MIN_ACCURACY)
+
+    def test_random_large_request_perf(self):
+        """Benchmark one random long-context request through the PD load balancer."""
+        args = get_benchmark_args(
+            base_url=self.lb_url,
+            dataset_name="random",
+            tokenizer=self.model,
+            num_prompts=1,
+            random_input_len=36000,
+            random_output_len=10,
+            request_rate=float("inf"),
+            max_concurrency=1,
+        )
+        args.model = self.model
+        args.ready_check_timeout_sec = 0
+
+        res = run_benchmark(args)
+        print(
+            "Random large request perf: "
+            f"ttft={res['mean_ttft_ms']:.2f} ms, "
+            f"e2e={res['mean_e2e_latency_ms']:.2f} ms, "
+            f"input_tps={res['input_throughput']:.2f} tok/s, "
+            f"output_tps={res['output_throughput']:.2f} tok/s"
+        )
+
+        self.assertEqual(res["completed"], 1)
+        self.assertGreater(res["mean_ttft_ms"], 0)
+        self.assertGreater(res["mean_e2e_latency_ms"], 0)
 
 
 if __name__ == "__main__":
