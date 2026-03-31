@@ -230,10 +230,10 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
 
     # Flatten trailing dims then concat → one all-gather instead of two.
     # Works for GQA where tp_k_head_num != tp_v_head_num.
-    k_flat = k.contiguous().reshape(k.shape[0], -1)   # [S_local, k_feat]
-    v_flat = v.contiguous().reshape(v.shape[0], -1)   # [S_local, v_feat]
+    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
+    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
     k_feat_size = k_flat.shape[-1]
-    kv_flat = torch.cat([k_flat, v_flat], dim=-1)     # [S_local, k_feat + v_feat]
+    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
 
     kv_full = cp_all_gather_rerange_kv_cache(
         kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
@@ -746,12 +746,8 @@ class AscendAttnBackend(AttentionBackend):
         # torch.chunk(q, 2) gives ceil(n/2) and floor(n/2), matching
         # actual_seq_q_prev and actual_seq_q_next.
         q_prev, q_next = torch.chunk(q, 2, dim=0)
-        q_prev = q_prev.contiguous().reshape(
-            -1, layer.tp_q_head_num, layer.qk_head_dim
-        )
-        q_next = q_next.contiguous().reshape(
-            -1, layer.tp_q_head_num, layer.qk_head_dim
-        )
+        q_prev = q_prev.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_next = q_next.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         k_cache_paged = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
