@@ -121,8 +121,6 @@ class TestQwen3MoePDNpu(PDDisaggregationServerBase):
             "--attn-cp-size",
             str(PREFILL_CP),
             "--enable-prefill-context-parallel",
-            "--max-running-requests",
-            "1",
             "--base-gpu-id",
             str(PREFILL_BASE_GPU_ID),
             *cls.transfer_backend,

@@ -25,7 +25,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -216,7 +216,8 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
     k shape: [S_local, tp_k_head_num, qk_head_dim]
     v shape: [S_local, tp_v_head_num, v_head_dim]
 
-    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py but uses
+    Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
+    a single all-gather for both K and V.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -235,7 +236,7 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
     kv_flat = torch.cat([k_flat, v_flat], dim=-1)     # [S_local, k_feat + v_feat]
 
     kv_full = cp_all_gather_rerange_kv_cache(
-        kv_flat, cp_size, forward_batch, torch.cuda.current_stream()
+        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
     )  # [S_full, k_feat + v_feat]
 
     key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)

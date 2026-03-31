@@ -87,6 +87,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
+    get_current_device_stream_fast,
     is_cpu,
     is_cuda,
     make_layers,
@@ -714,7 +715,7 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states,
                 self.moe_dp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
             )
 
         if len(aux_hidden_states) == 0:
