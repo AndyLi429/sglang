@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=500, suite="nightly-4-npu-a3", nightly=True)
 
 QWEN3_30B_MODEL = QWEN3_30B_A3B_WEIGHTS_PATH
-GSM8K_MIN_ACCURACY = 0.90
+GSM8K_MIN_ACCURACY = 0.92
 GSM8K_NUM_QUESTIONS = 100
 
 _NPU_ENV_VARS = {
@@ -74,6 +74,8 @@ class TestQwen330BAttnCP(CustomTestCase):
                 "2",
                 "--attn-cp-size",
                 "2",
+                "--cuda-graph-max-bs",
+                "32",
                 "--enable-prefill-context-parallel",
             ],
             env=cls.npu_env,
@@ -90,14 +92,14 @@ class TestQwen330BAttnCP(CustomTestCase):
             data_path=None,
             num_questions=GSM8K_NUM_QUESTIONS,
             max_new_tokens=512,
-            parallel=32,
+            parallel=100,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(
             "GSM8K accuracy "
-            f"(mixed TP=4 MOE_DP=2 EP=2 CP=2, {GSM8K_NUM_QUESTIONS} samples): "
+            f"(mixed TP=4 MOE_DP=2 ATTN_CP=2, {GSM8K_NUM_QUESTIONS} samples): "
             f"{metrics['accuracy']:.3f}"
         )
         self.assertGreaterEqual(metrics["accuracy"], GSM8K_MIN_ACCURACY)
