@@ -20,17 +20,7 @@ GSM8K_MIN_ACCURACY = 0.92
 GSM8K_NUM_QUESTIONS = 100
 
 _NPU_ENV_VARS = {
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "ASCEND_USE_FIA": "1",
-    "ASCEND_MF_STORE_URL": "tcp://127.0.0.1:24666",
-    "HCCL_BUFFSIZE": "200",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "24",
-    "USE_VLLM_CUSTOM_ALLREDUCE": "1",
-    "HCCL_EXEC_TIMEOUT": "200",
-    "STREAMS_PER_DEVICE": "32",
-    "SGLANG_ENBLE_TORCH_COMILE": "1",
-    "AUTO_USE_UC_MEMORY": "0",
-    "P2P_HCCL_BUFFSIZE": "20",
 }
 
 
@@ -64,7 +54,6 @@ class TestQwen330BAttnCP(CustomTestCase):
                 "32",
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
                 "--tp-size",
                 "4",
                 "--moe-dp-size",
@@ -89,7 +78,7 @@ class TestQwen330BAttnCP(CustomTestCase):
             data_path=None,
             num_questions=GSM8K_NUM_QUESTIONS,
             max_new_tokens=512,
-            parallel=100,
+            parallel=32,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
