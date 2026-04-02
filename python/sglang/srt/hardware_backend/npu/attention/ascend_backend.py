@@ -249,6 +249,8 @@ def _cp_allgather_and_save_kv_npu(forward_batch, layer, k, v, cp_size):
         value_cache_full,
     )
 
+    return key_cache_full, value_cache_full
+
 
 class AscendAttnBackend(AttentionBackend):
 
@@ -719,22 +721,22 @@ class AscendAttnBackend(AttentionBackend):
     def do_cp_attn_fia(
         self,
         q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        k_dense: torch.Tensor,
+        v_dense: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """CP-aware attention for standard (non-MLA) models using FIA on Ascend NPU.
 
-        Uses npu_fused_infer_attention_score with paged KV cache (block_table).
-        The KV cache must already contain the full gathered sequence
-        (written by _cp_allgather_and_save_kv_npu before this call).
+        Uses npu_fused_infer_attention_score with dense KV tensors (no paging).
+        The dense KV comes directly from the all-gather, avoiding the overhead
+        of indirect paged access through block_table.
 
         Args:
-            q:            Query tensor, shape [total_q_tokens, tp_q_head_num * qk_head_dim]
-            k_cache:      Full key cache from token_to_kv_pool
-            v_cache:      Full value cache from token_to_kv_pool
-            layer:        RadixAttention layer
+            q:        Query tensor, shape [total_q_tokens, tp_q_head_num * qk_head_dim]
+            k_dense:  Dense key tensor from all-gather, shape [S_full, tp_k_head_num, qk_head_dim]
+            v_dense:  Dense value tensor from all-gather, shape [S_full, tp_v_head_num, v_head_dim]
+            layer:    RadixAttention layer
             forward_batch: ForwardBatch with attn_cp_metadata populated
 
         Returns:
@@ -749,19 +751,12 @@ class AscendAttnBackend(AttentionBackend):
         q_prev = q_prev.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
         q_next = q_next.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        k_cache_paged = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
-        )
-        v_cache_paged = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-        )
-
+        # Use dense KV directly (TND layout, no block_table) for efficient
+        # sequential memory access instead of indirect paged access.
         attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_prev,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
+            k_dense,
+            v_dense,
             num_heads=layer.tp_q_head_num,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="TND",
@@ -775,10 +770,8 @@ class AscendAttnBackend(AttentionBackend):
 
         attn_out_next, _ = torch.ops.npu.npu_fused_infer_attention_score(
             q_next,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
+            k_dense,
+            v_dense,
             num_heads=layer.tp_q_head_num,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout="TND",
@@ -971,10 +964,13 @@ class AscendAttnBackend(AttentionBackend):
             )
 
             # In cross attention layer, when there is no vision input,the values of k and v is None
+            k_dense_cp = None
+            v_dense_cp = None
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
-                    # All-gather K/V from all CP ranks and write full sequence to KV pool
-                    _cp_allgather_and_save_kv_npu(
+                    # All-gather K/V from all CP ranks and write full sequence to KV pool.
+                    # Also return dense KV to avoid slow paged cache read-back.
+                    k_dense_cp, v_dense_cp = _cp_allgather_and_save_kv_npu(
                         forward_batch, layer, k, v, self.attn_cp_size
                     )
                 else:
@@ -985,6 +981,19 @@ class AscendAttnBackend(AttentionBackend):
                         else forward_batch.encoder_out_cache_loc
                     )
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+            if is_cp_mode:
+                if self.use_fia:
+                    # Use dense KV directly from all-gather to avoid paged access overhead.
+                    attn_output = self.do_cp_attn_fia(
+                        q, k_dense_cp, v_dense_cp, layer, forward_batch
+                    )
+                else:
+                    raise NotImplementedError(
+                        "CP attention for non-FIA path on Ascend is not yet implemented. "
+                        "Set ASCEND_USE_FIA=1 to use FIA-based CP attention."
+                    )
+                return attn_output
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1009,18 +1018,6 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_k_head_num,
                 )
                 return attn_out
-
-            if is_cp_mode:
-                if self.use_fia:
-                    attn_output = self.do_cp_attn_fia(
-                        q, k_cache, v_cache, layer, forward_batch
-                    )
-                else:
-                    raise NotImplementedError(
-                        "CP attention for non-FIA path on Ascend is not yet implemented. "
-                        "Set ASCEND_USE_FIA=1 to use FIA-based CP attention."
-                    )
-                return attn_output
 
             if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
