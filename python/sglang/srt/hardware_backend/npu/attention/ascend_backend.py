@@ -350,6 +350,22 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
+        # For MIXED mode: grow mix_mask once per batch instead of per layer.
+        # mix_mask must be >= total query tokens to avoid FIA dispatching the
+        # slow unpad_flashattention_bf16_1048576_mix_aic kernel (pre_tokens=1048576).
+        if forward_batch.forward_mode.is_mixed():
+            total_q_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+            if total_q_tokens > self.mix_mask.shape[0]:
+                logger.warning(
+                    "MIXED batch total_q_tokens=%d exceeds mix_mask size %d; "
+                    "rebuilding mix_mask to avoid pre_tokens=1048576 slow path.",
+                    total_q_tokens,
+                    self.mix_mask.shape[0],
+                )
+                self.mix_mask = self.ascend_attn_mask_builder.get_splitfuse_attn_mask(
+                    total_q_tokens
+                )
+
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
@@ -2052,6 +2068,29 @@ class AscendAttnBackend(AttentionBackend):
         value = v_cache.view(num_block, block_size, -1)
 
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        # mix_mask is pre-sized in init_forward_metadata; log if still mismatched (safety check).
+        total_q_tokens = query.shape[0]
+        if total_q_tokens > self.mix_mask.shape[0]:
+            logger.warning(
+                "forward_mixed: mix_mask (%dx%d) still too small for total_q_tokens=%d "
+                "after init_forward_metadata; rebuilding. This triggers unpad_flashattention "
+                "pre_tokens=1048576 slow path until fixed.",
+                self.mix_mask.shape[0],
+                self.mix_mask.shape[1],
+                total_q_tokens,
+            )
+            self.mix_mask = self.ascend_attn_mask_builder.get_splitfuse_attn_mask(
+                total_q_tokens
+            )
+        logger.debug(
+            "forward_mixed layer=%s: total_q_tokens=%d mix_mask=%dx%d max_kv=%d",
+            layer.layer_id,
+            total_q_tokens,
+            self.mix_mask.shape[0],
+            self.mix_mask.shape[1],
+            int(self.forward_metadata.seq_lens_cpu_int.max().item()),
+        )
 
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query,
