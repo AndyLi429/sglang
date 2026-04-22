@@ -25,6 +25,7 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+    from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -267,6 +268,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+        # Pre-compute chunk_indices for extend path to eliminate GPU sync in forward hot-path.
+        # target_verify uses fused_sigmoid_gating_delta_rule_update (no chunk_indices needed).
+        if not is_cpu() and forward_batch.forward_mode.is_extend():
+            cu_seqlens = self.forward_metadata.query_start_loc
+            self.forward_metadata.gdn_chunk_indices = prepare_chunk_indices(
+                cu_seqlens, FLA_CHUNK_SIZE
+            )
 
     def forward_decode(
         self,
@@ -465,6 +473,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                chunk_indices=forward_metadata.gdn_chunk_indices,
             )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:

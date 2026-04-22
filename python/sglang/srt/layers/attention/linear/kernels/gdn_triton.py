@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -133,6 +135,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        chunk_indices: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -140,6 +143,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         if is_npu() or is_cpu():
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
+        chunk_indices_kwargs = {} if is_cpu() else {"chunk_indices": chunk_indices}
         return chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -150,6 +154,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
+            **chunk_indices_kwargs,
             **recurrent_state_indices_args,
         )
 

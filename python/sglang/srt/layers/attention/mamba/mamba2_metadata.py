@@ -45,6 +45,8 @@ class ForwardMetadata:
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
+    # Pre-computed GDN chunk indices for extend path (eliminates GPU sync in hot-path)
+    gdn_chunk_indices: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
