@@ -143,7 +143,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         if is_npu() or is_cpu():
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
-        chunk_indices_kwargs = {} if is_cpu() else {"chunk_indices": chunk_indices}
+        chunk_indices_kwargs = (
+            {} if (is_cpu() or is_npu()) else {"chunk_indices": chunk_indices}
+        )
         return chunk_gated_delta_rule(
             q=q,
             k=k,
