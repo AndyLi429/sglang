@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
 )
+from sglang.srt.layers.attention.linear.gdn_chunk_meta import (
+    build_gdn_chunked_prefill_meta,
+)
 from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
@@ -37,11 +40,19 @@ class AscendGDNKernelDispatcher(GDNKernelDispatcher):
 
 class AscendGDNAttnBackend(GDNAttnBackend):
 
+    # Chunk size used by the NPU GDN chunked-prefill kernel; must match the
+    # internal tile size of `sgl_kernel_npu.fla.chunk.chunk_gated_delta_rule_npu`.
+    GDN_CHUNK_SIZE: int = 64
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # transpose last two dim for _init_npu_conv_state
         self.conv_states_shape = torch.Size(
-            (*self.conv_states_shape[:-2], self.conv_states_shape[-1], self.conv_states_shape[-2])
+            (
+                *self.conv_states_shape[:-2],
+                self.conv_states_shape[-1],
+                self.conv_states_shape[-2],
+            )
         )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
@@ -67,7 +78,9 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             self.actual_seq_lengths = self.actual_seq_lengths * seq_len
             # indices
             self.ssm_state_indices = torch.arange(
-                cache_indices.shape[0] * seq_len, dtype=torch.int32, device=cache_indices.device
+                cache_indices.shape[0] * seq_len,
+                dtype=torch.int32,
+                device=cache_indices.device,
             )
         else:
             self.ssm_state_indices = cache_indices
@@ -82,6 +95,25 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             forward_batch.spec_info,
         )
         self.graph_mode = False
+        # Precompute chunked-prefill indices on CPU once per step for the
+        # non-spec extend path, so per-layer forwards don't trigger D2H syncs.
+        self.forward_metadata.non_spec_chunked_prefill_meta = None
+        if (
+            forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            seq_lens = forward_batch.extend_seq_lens_cpu
+            if not isinstance(seq_lens, list):
+                seq_lens = list(seq_lens)
+            self.forward_metadata.non_spec_chunked_prefill_meta = (
+                build_gdn_chunked_prefill_meta(
+                    extend_seq_lens_cpu=seq_lens,
+                    chunk_size=self.GDN_CHUNK_SIZE,
+                    device=self.forward_metadata.query_start_loc.device,
+                )
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -246,7 +278,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             mixed_qkv = causal_conv1d_update_v2(
                 x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
                 conv_state=conv_states.contiguous(),
-                weight=layer.conv_weights.transpose(0,1).contiguous(),
+                weight=layer.conv_weights.transpose(0, 1).contiguous(),
                 bias=layer.bias,
                 activation=layer.activation,
                 conv_state_indices=cache_indices,
@@ -344,6 +376,9 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                prebuilt_meta=getattr(
+                    forward_metadata, "non_spec_chunked_prefill_meta", None
+                ),
             )
             if is_cpu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
