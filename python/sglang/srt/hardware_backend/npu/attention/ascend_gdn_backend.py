@@ -87,6 +87,10 @@ class AscendGDNAttnBackend(GDNAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend(True):
+            # forward_metadata is reused from the previous step; clear the
+            # prebuilt meta so draft-extend layers don't consume stale indices.
+            if hasattr(self, "forward_metadata") and self.forward_metadata is not None:
+                self.forward_metadata.non_spec_chunked_prefill_meta = None
             return
         super().init_forward_metadata(forward_batch)
         self.prepare_gdn_inputs(
