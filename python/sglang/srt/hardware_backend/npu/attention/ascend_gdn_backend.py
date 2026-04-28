@@ -15,6 +15,10 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
 )
+from sglang.srt.layers.attention.linear.gdn_chunk_meta import (
+    GDNChunkedPrefillBufferPool,
+    GDNChunkedPrefillMetadata,
+)
 from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
@@ -31,6 +35,39 @@ causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
 
+def _get_gdn_num_heads(model_runner: ModelRunner) -> int:
+    hf_text_config = getattr(model_runner.model_config, "hf_text_config", None)
+    if hf_text_config is not None and hasattr(hf_text_config, "linear_num_value_heads"):
+        return hf_text_config.linear_num_value_heads // model_runner.tp_size
+    hf_config = getattr(model_runner.model_config, "hf_config", None)
+    if hf_config is not None and hasattr(hf_config, "linear_num_value_heads"):
+        return hf_config.linear_num_value_heads // model_runner.tp_size
+    raise ValueError(
+        "linear_num_value_heads not found in model config. "
+        "Cannot determine GDN num_heads for prebuilt chunk metadata. "
+        "Set --disable-ascend-gdn-prebuilt-chunk-meta to skip prebuilding."
+    )
+
+
+def _maybe_build_non_spec_chunked_prefill_meta(
+    backend,
+    cu_seqlens_cpu: torch.Tensor | None,
+    has_prefill: bool,
+) -> GDNChunkedPrefillMetadata | None:
+    if not has_prefill or cu_seqlens_cpu is None or cu_seqlens_cpu.numel() <= 1:
+        return None
+    if backend._disable_prebuilt_chunk_meta:
+        return None
+    if backend._gdn_chunk_meta_pool is None:
+        backend._gdn_chunk_meta_pool = GDNChunkedPrefillBufferPool(
+            device=backend.device,
+            max_num_batched_tokens=backend._max_num_batched_tokens,
+            max_num_seqs=backend._max_num_seqs,
+            num_heads=backend._gdn_num_heads,
+        )
+    return backend._gdn_chunk_meta_pool.build(cu_seqlens_cpu)
+
+
 class AscendGDNKernelDispatcher(GDNKernelDispatcher):
     pass
 
@@ -41,12 +78,32 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         super().__init__(model_runner)
         # transpose last two dim for _init_npu_conv_state
         self.conv_states_shape = torch.Size(
-            (*self.conv_states_shape[:-2], self.conv_states_shape[-1], self.conv_states_shape[-2])
+            (
+                *self.conv_states_shape[:-2],
+                self.conv_states_shape[-1],
+                self.conv_states_shape[-2],
+            )
         )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = AscendGDNKernelDispatcher(
             decode_backend, prefill_backend
+        )
+        self._gdn_chunk_meta_pool = None
+        self._gdn_num_heads = _get_gdn_num_heads(model_runner)
+        self._max_num_batched_tokens = max(
+            getattr(model_runner.server_args, "max_prefill_tokens", 16384),
+            getattr(model_runner, "max_total_num_tokens", 0),
+        )
+        self._max_num_seqs = (
+            getattr(model_runner.server_args, "max_running_requests", None)
+            or getattr(model_runner, "max_running_requests", None)
+            or 256
+        )
+        self._disable_prebuilt_chunk_meta = getattr(
+            model_runner.server_args,
+            "disable_ascend_gdn_prebuilt_chunk_meta",
+            False,
         )
 
     def prepare_gdn_inputs(
@@ -67,7 +124,9 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             self.actual_seq_lengths = self.actual_seq_lengths * seq_len
             # indices
             self.ssm_state_indices = torch.arange(
-                cache_indices.shape[0] * seq_len, dtype=torch.int32, device=cache_indices.device
+                cache_indices.shape[0] * seq_len,
+                dtype=torch.int32,
+                device=cache_indices.device,
             )
         else:
             self.ssm_state_indices = cache_indices
@@ -80,6 +139,29 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             forward_batch.batch_size,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+        )
+        has_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
+        if has_prefill and forward_batch.extend_seq_lens_cpu:
+            extend_lens = torch.tensor(
+                forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+            )
+            cu_seqlens_cpu = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(extend_lens, dim=0),
+                ]
+            )
+        else:
+            cu_seqlens_cpu = None
+        self.forward_metadata.non_spec_chunked_prefill_meta = (
+            _maybe_build_non_spec_chunked_prefill_meta(
+                self,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                has_prefill=has_prefill,
+            )
         )
         self.graph_mode = False
 
@@ -105,6 +187,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             spec_info,
         )
         self.prepare_gdn_inputs(bs, forward_mode, spec_info)
+        self.forward_metadata.non_spec_chunked_prefill_meta = None
         self.graph_mode = True
 
     def init_forward_metadata_replay_cuda_graph(
@@ -131,6 +214,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             seq_lens_cpu,
         )
         self.prepare_gdn_inputs(bs, forward_mode, spec_info)
+        self.forward_metadata.non_spec_chunked_prefill_meta = None
         self.graph_mode = True
 
     def forward_decode(
@@ -224,6 +308,15 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
+            # Compute host-side bool from CPU prefix lens to avoid device sync per layer
+            _prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            if _prefix_lens_cpu is not None:
+                if isinstance(_prefix_lens_cpu, torch.Tensor):
+                    has_initial_state_any = bool((_prefix_lens_cpu > 0).any())
+                else:
+                    has_initial_state_any = any(x > 0 for x in _prefix_lens_cpu)
+            else:
+                has_initial_state_any = bool(has_initial_states.any())
         if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
             if (
@@ -246,7 +339,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             mixed_qkv = causal_conv1d_update_v2(
                 x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
                 conv_state=conv_states.contiguous(),
-                weight=layer.conv_weights.transpose(0,1).contiguous(),
+                weight=layer.conv_weights.transpose(0, 1).contiguous(),
                 bias=layer.bias,
                 activation=layer.activation,
                 conv_state_indices=cache_indices,
@@ -255,20 +348,20 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 validate_data=False,
             ).view(seq_len, -1)
         else:
-            mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
                 forward_batch.mamba_track_mask is not None
                 and forward_batch.mamba_track_mask.any()
             ):
                 conv_dst = forward_batch.mamba_track_indices
-                mixed_qkv_to_track = mixed_qkv[
+                mixed_qkv_dim_token = mixed_qkv.transpose(0, 1)
+                mixed_qkv_to_track = mixed_qkv_dim_token[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states.transpose(1, 2)[conv_dst[mask_indices]] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
             conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
-            conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
+            conv_states_tmp = conv_states_for_prefill.contiguous()
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
@@ -280,10 +373,10 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
-            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
-                1, 2
-            ).contiguous()
+                has_initial_state_any=has_initial_state_any,
+                input_layout="token_dim",
+            )[:seq_len]
+            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp
         if is_target_verify:
             g, beta = fused_gdn_gating_kernel_without_sigmoid(
                 layer.A_log, a, b, layer.dt_bias
@@ -335,6 +428,9 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            prebuilt_meta = getattr(
+                forward_metadata, "non_spec_chunked_prefill_meta", None
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -344,6 +440,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                prebuilt_meta=prebuilt_meta,
             )
             if is_cpu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(

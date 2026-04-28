@@ -456,6 +456,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            prebuilt_meta = getattr(
+                forward_metadata, "non_spec_chunked_prefill_meta", None
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -465,6 +468,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                prebuilt_meta=prebuilt_meta,
             )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:

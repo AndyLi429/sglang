@@ -363,6 +363,7 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
+    disable_ascend_gdn_prebuilt_chunk_meta: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
@@ -2215,7 +2216,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda(), is_npu()
+                is_cuda(),
+                is_npu(),
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
@@ -4163,6 +4165,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_dynamic_chunking,
             help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+        )
+        parser.add_argument(
+            "--disable-ascend-gdn-prebuilt-chunk-meta",
+            action="store_true",
+            default=ServerArgs.disable_ascend_gdn_prebuilt_chunk_meta,
+            help="Disable Ascend GDN prebuilt chunk metadata optimization for debugging and A/B profiling.",
         )
         parser.add_argument(
             "--max-prefill-tokens",

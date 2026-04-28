@@ -28,6 +28,7 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    non_spec_chunked_prefill_meta: Optional[object] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None

@@ -133,6 +133,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        prebuilt_meta=None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -140,18 +141,38 @@ class TritonGDNKernel(LinearAttnKernelBase):
         if is_npu() or is_cpu():
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
-        return chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=recurrent_state,
-            cu_seqlens=query_start_loc,
-            head_first=False,
-            use_qk_l2norm_in_kernel=True,
-            **recurrent_state_indices_args,
-        )
+        extra = {}
+        if prebuilt_meta is not None:
+            extra["prebuilt_meta"] = prebuilt_meta
+        try:
+            return chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+                **extra,
+                **recurrent_state_indices_args,
+            )
+        except TypeError as err:
+            if "prebuilt_meta" not in str(err):
+                raise
+            return chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+                **recurrent_state_indices_args,
+            )
 
     def target_verify(
         self,
