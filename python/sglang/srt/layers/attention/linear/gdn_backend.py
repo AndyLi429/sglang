@@ -359,6 +359,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
+        prebuilt_meta = getattr(forward_metadata, "non_spec_chunked_prefill_meta", None)
+        cu_seqlens_cpu = getattr(forward_metadata, "cu_seqlens_cpu", None)
         cache_indices = forward_metadata.mamba_cache_indices
         retrieve_next_token = forward_metadata.retrieve_next_token
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
@@ -465,6 +467,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                prebuilt_meta=prebuilt_meta,
+                cu_seqlens_cpu=cu_seqlens_cpu,
             )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
