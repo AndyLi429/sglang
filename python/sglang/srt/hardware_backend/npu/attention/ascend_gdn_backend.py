@@ -56,8 +56,6 @@ def _maybe_build_non_spec_chunked_prefill_meta(
 ):
     if not has_prefill or cu_seqlens_cpu is None or cu_seqlens_cpu.numel() <= 1:
         return None
-    if backend._disable_prebuilt_chunk_meta:
-        return None
     if backend._gdn_chunk_meta_cache is None:
         backend._gdn_chunk_meta_cache = GDNChunkedPrefillCache(
             num_heads=backend._gdn_num_heads,
@@ -75,9 +73,6 @@ class AscendGDNAttnBackend(GDNAttnBackend):
             cache_params.shape.temporal[0] if cache_params is not None else 1
         )
         self._gdn_chunk_meta_cache = None
-        self._disable_prebuilt_chunk_meta = (
-            model_runner.server_args.disable_ascend_gdn_prebuilt_chunk_meta
-        )
         # transpose last two dim for _init_npu_conv_state
         self.conv_states_shape = torch.Size(
             (
