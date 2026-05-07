@@ -301,6 +301,17 @@ def rms_norm_gated(
         bias = bias.contiguous()
     if _is_npu:
         assert activation == "swish", "NPU only supports swish activation"
+        if torch.compiler.is_compiling():
+            return rms_norm_ref(
+                x,
+                weight,
+                bias,
+                z=z,
+                eps=eps,
+                group_size=group_size,
+                norm_before_gate=norm_before_gate,
+                upcast=True,
+            ).reshape(x_shape_og)
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
