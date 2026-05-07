@@ -80,7 +80,6 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         if (
             self.graph_mode
             or not forward_batch.forward_mode.is_extend_without_speculative()
-            or not forward_batch.spec_algorithm.is_none()
             or forward_batch.extend_seq_lens_cpu is None
         ):
             return None, None
