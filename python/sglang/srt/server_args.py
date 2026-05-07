@@ -2655,6 +2655,13 @@ class ServerArgs:
             )
 
     def _handle_context_parallelism(self):
+        if self.enable_nsa_prefill_context_parallel:
+            assert self.attn_cp_size > 1, (
+                "--enable-nsa-prefill-context-parallel requires "
+                "--attention-context-parallel-size/--attn-cp-size > 1. "
+                "Otherwise the CP path is not actually enabled."
+            )
+
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (

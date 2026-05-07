@@ -22,8 +22,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -638,15 +642,15 @@ class AscendAttnBackend(AttentionBackend):
                 for idx, seq_len in enumerate(forward_batch.seq_lens_cpu):
                     if seq_len == 0:
                         continue
-                    positions_per_bs = (
+                    full_positions = (
                         torch.arange(seq_len, dtype=torch.int32, device="npu")
                         + page_offset * self.page_size
                     )
-                    swa_kv_tobe_scatter_index.append(positions_per_bs)
+                    swa_kv_tobe_scatter_index.append(full_positions)
                     page_offset = cum_num_pages_swa[idx]
                     self.forward_metadata.swa_page_table[
-                        idx, : positions_per_bs.numel()
-                    ].copy_(positions_per_bs)
+                        idx, : full_positions.numel()
+                    ].copy_(full_positions)
                 self.forward_metadata.swa_kv_tobe_scatter_index = torch.cat(
                     swa_kv_tobe_scatter_index
                 )
@@ -665,6 +669,7 @@ class AscendAttnBackend(AttentionBackend):
                 c4_offset = 0
                 swa_offset = 0
                 full_offset = 0
+                local_offset = 0  # cumulative CP-local token count
                 c4_out_loc_list = []
                 swa_out_loc_list = []
                 swa_kv_local_list = []

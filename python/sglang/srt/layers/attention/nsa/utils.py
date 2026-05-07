@@ -157,10 +157,7 @@ class NSAContextParallelMetadata:
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
-        cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        cur_cp_seq_len = ceil_div(seq_len, cp_size)
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -181,10 +178,6 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
     input_list = list(
@@ -198,11 +191,6 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert positions.shape[0] % cp_size == 0, (
-            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
-            f"cp size {cp_size}"
-        )
         return nsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
@@ -366,11 +354,22 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |   +-------------------------+
     """
     if is_nsa_prefill_cp_round_robin_split():
+        total_seq_lens = forward_batch.nsa_cp_metadata.total_seq_lens
+        total_len = int(total_seq_lens.item())
+        max_len = ceil_div(total_len, cp_size)
+        pad_size = max_len - input_tensor.shape[0]
+        if pad_size > 0:
+            input_tensor = F.pad(
+                input_tensor,
+                (0, 0) * (input_tensor.ndim - 1) + (0, pad_size),
+                mode="constant",
+                value=0,
+            )
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+                (max_len * cp_size, *input_tensor.shape[1:]),
             )
         attn_cp_all_gather_into_tensor(
             output_tensor,
@@ -382,7 +381,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             .transpose(0, 1)
             .reshape(out_shape)
         )
-        return output_tensor
+        return output_tensor[:total_len]
 
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
@@ -459,7 +458,16 @@ def prepare_input_dp_with_cp_dsa(
     seqs_len,
 ):
     if is_nsa_prefill_cp_round_robin_split():
-        return True
+        kv_len_tensor = torch.tensor(kv_len)
+        max_rank_len = ceil_div(kv_len, cp_size)
+        per_rank_actual_token = [
+            len(range(rank, kv_len, cp_size)) for rank in range(cp_size)
+        ]
+        return NSAContextParallelMetadata(
+            max_rank_len=[max_rank_len] * cp_size,
+            per_rank_actual_token=per_rank_actual_token,
+            total_seq_lens=kv_len_tensor,
+        )
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):
     Description:
@@ -550,13 +558,14 @@ def prepare_input_dp_with_cp_dsa(
     kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
-    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device="cuda", dtype=torch.int32)
-    kv_len_next_tensor = torch.tensor(kv_len_next).to(device="cuda", dtype=torch.int32)
+    device = get_global_server_args().device
+    kv_len_prev_tensor = torch.tensor(kv_len_prev).to(device=device, dtype=torch.int32)
+    kv_len_next_tensor = torch.tensor(kv_len_next).to(device=device, dtype=torch.int32)
     actual_seq_q_prev_tensor = torch.tensor(actual_seq_q_prev).to(
-        device="cuda", dtype=torch.int32
+        device=device, dtype=torch.int32
     )
     actual_seq_q_next_tensor = torch.tensor(actual_seq_q_next).to(
-        device="cuda", dtype=torch.int32
+        device=device, dtype=torch.int32
     )
 
     nsa_cp_metadata = NSAContextParallelMetadata(

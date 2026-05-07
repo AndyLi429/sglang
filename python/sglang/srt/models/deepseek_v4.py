@@ -82,6 +82,8 @@ from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_gather_partial,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_id_buffer,
@@ -181,6 +183,13 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _current_cp_stream():
+    if get_global_server_args().device == "npu":
+        return torch.npu.current_stream()
+    return torch.cuda.current_stream()
+
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -865,9 +874,9 @@ class DeepseekV4MoE(nn.Module):
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=False,
-            num_expert_group=config.n_group,
+            num_expert_group=getattr(config, "n_group", None),
             num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
+            topk_group=getattr(config, "topk_group", None),
             scoring_func=config.scoring_func,
             is_hash_layer=self.gate.is_hash_layer,
             tid2eid=self.gate.tid2eid,
@@ -957,8 +966,8 @@ class DeepseekV4MoE(nn.Module):
                 + get_global_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
-            self.topk_group = config.topk_group
-            self.num_expert_group = config.n_group
+            self.topk_group = getattr(config, "topk_group", None)
+            self.num_expert_group = getattr(config, "n_group", None)
             self.correction_bias = (
                 self.gate.e_score_correction_bias.data
                 if self.gate.e_score_correction_bias is not None
@@ -1505,12 +1514,12 @@ class DeepseekV4AttentionMLA(nn.Module):
         self.local_o_groups = self.o_groups // attn_tp_size
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
-        # cp reuse the attn_tp comm group but need to duplicate the weights
+            assert self.use_nsa, "CP currently only supports NSA attention"
+        # CP uses the attention context-parallel group and duplicates attention weights.
         if self.nsa_enable_prefill_cp and self.use_nsa:
             attn_tp_rank = 0
             attn_tp_size = 1
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -1857,6 +1866,14 @@ class DeepseekV4AttentionMLA(nn.Module):
                     self.rotary_emb.position_cos_layer_cache,
                 )
 
+        if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+            kv = cp_all_gather_rerange_output(
+                kv.contiguous(),
+                self.cp_size,
+                forward_batch,
+                _current_cp_stream(),
+            )
+
         is_prefill = (
             forward_batch.forward_mode.is_prefill()
             and not forward_batch.forward_mode.is_target_verify()
@@ -1948,10 +1965,20 @@ class DeepseekV4AttentionMLA(nn.Module):
                     (num_pages.sum().item() * page_size, kv.shape[-1])
                 )
                 assert metadata.swa_kv_tobe_scatter_index is not None
-                kv_pad[metadata.swa_kv_tobe_scatter_index] = kv
+                n = metadata.swa_kv_tobe_scatter_index.numel()
+                # kv may have extra DP-attention padding tokens beyond the real tokens;
+                # swa_kv_tobe_scatter_index only covers real tokens, so slice kv[:n].
+                assert (
+                    kv.shape[0] >= n
+                ), f"SWA scatter mismatch: kv rows={kv.shape[0]} < scatter indices={n}"
+                kv_pad[metadata.swa_kv_tobe_scatter_index] = kv[:n]
             else:
                 kv_pad = kv
-            if self.compress_ratio > 1:
+            # In CP prefill mode, x is only the CP-local token subset (non-contiguous
+            # in the full sequence), so the compressor kernel (which requires contiguous
+            # full-sequence input) cannot run.  Skip it; the SWA window KV is enough for
+            # correctness when seq_len <= sliding_window_size.
+            if self.compress_ratio > 1 and not nsa_use_prefill_cp(forward_batch):
                 if (
                     kv_compress := self.compressor(
                         x, positions, forward_batch
@@ -1972,13 +1999,23 @@ class DeepseekV4AttentionMLA(nn.Module):
                         kv_pad = kv_list
             kv = kv_pad
         else:
+            swa_loc = forward_batch.attn_backend.forward_metadata.swa_loc
+            kv_to_cache = kv
+            if (
+                self.nsa_enable_prefill_cp
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and swa_loc.numel() > 0
+                and kv.shape[0] == swa_loc.numel() * self.cp_size
+            ):
+                cp_rank = get_attention_cp_rank()
+                kv_to_cache = kv[cp_rank :: self.cp_size].contiguous()
             forward_batch.token_to_kv_pool.set_swa_buffer(
                 self.attn_mha,
-                forward_batch.attn_backend.forward_metadata.swa_loc,
-                kv,
+                swa_loc,
+                kv_to_cache,
                 None,
             )
-            if self.compress_ratio > 1:
+            if self.compress_ratio > 1 and not nsa_use_prefill_cp(forward_batch):
                 self.compressor(x, positions, forward_batch)
 
         return q, kv, kv, forward_batch, positions, topk_idxs
@@ -2047,7 +2084,7 @@ class DeepseekV4AttentionMLA(nn.Module):
             latent_cache.contiguous(),
             self.cp_size,
             forward_batch,
-            torch.cuda.current_stream(),
+            _current_cp_stream(),
         )
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
@@ -2876,14 +2913,14 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.padding_id = config.pad_token_id
+        self.padding_id = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.hc_mult = config.hc_mult
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -3140,7 +3177,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                _current_cp_stream(),
             )
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -3236,8 +3273,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = self.cp_size = None
 
@@ -3310,6 +3347,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                # init_forward_metadata was called before nsa_cp_metadata was set,
+                # so SWA scatter indices were computed without CP awareness.
+                # Re-run now that CP metadata is available.
+                if forward_batch.attn_backend is not None:
+                    forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
@@ -3699,7 +3741,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.n_routed_experts,
-            num_groups=config.n_group,
+            num_groups=getattr(config, "n_group", None),
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):

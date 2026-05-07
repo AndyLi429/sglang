@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
+    nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import (
@@ -2045,6 +2046,13 @@ class Indexer(MultiPlatformOp):
         weights = weights * (
             self.softmax_scale * self.n_heads**-0.5
         )  # [t, n_local_heads]
+
+        # In CP prefill mode x is CP-local (non-contiguous round-robin tokens).
+        # The compressor kernel requires a contiguous full-sequence input, so skip it
+        # and return trivial (all-zero) topk indices.  For short sequences that fit
+        # entirely within the SWA window, the compressed context does not contribute.
+        if nsa_use_prefill_cp(forward_batch):
+            return torch.zeros(bs, self.index_topk, dtype=torch.int32, device=x.device)
 
         # # compressor path, rotate=True 内部对kv做hadamard变换
         self.compressor(x, positions, forward_batch)  # 放c4 index compress + state
