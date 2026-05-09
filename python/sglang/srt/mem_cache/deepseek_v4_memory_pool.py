@@ -103,11 +103,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
-        )
-        assert self.store_dtype == torch.uint8
+        # The CUDA path packs fp8 K_nope + bf16 K_rope + fp8 scales into a
+        # uint8 byte buffer because torch.float8_e4m3fn doesn't support
+        # index_put_. NPU has no fp8 dtype at all, so the kv_cache_dtype gate
+        # in apply_deepseek_v4_defaults forces bfloat16; in that mode we
+        # allocate the buffer as bf16 directly (no packing). The forward
+        # accessors will need a separate NPU code path — until that is
+        # wired the boot still progresses to memory pool init.
+        is_npu_bf16 = self.store_dtype == torch.bfloat16
+        if not is_npu_bf16:
+            assert bytes_per_token == 448 + 64 * 2 + 8, (
+                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            )
+            assert self.store_dtype == torch.uint8
 
         return torch.zeros(
             num_pages,
