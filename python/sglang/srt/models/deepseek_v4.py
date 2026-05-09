@@ -1473,8 +1473,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Hot weight reload (RL workflows). torch.cuda.{empty_cache,synchronize}
+        # raise on NPU (no CUDA device); gate so V4 stays usable on Ascend.
+        if _is_cuda or _is_hip:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
