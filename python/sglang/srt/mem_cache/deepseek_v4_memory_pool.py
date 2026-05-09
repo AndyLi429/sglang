@@ -551,8 +551,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             overlap = ratio == 4
             compress_state_pool = indexer_compress_state_pool = None
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
-            ring_size = self.get_ring_size(ratio) if ratio != 0 else 0
-            if ratio != 0:
+            # ratio == 1 (V4-Flash dense edge layers) is treated like
+            # ratio == 0 here: no compress-state pool, no ring buffer.
+            # get_compress_state_ring_size only handles 4 and 128.
+            has_compress_state = ratio in (4, 128)
+            ring_size = self.get_ring_size(ratio) if has_compress_state else 0
+            if has_compress_state:
                 compress_state_pool = CompressStatePool(
                     size=size,
                     ring_size=ring_size,
@@ -585,10 +589,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.layer_mapping: List[DeepSeekV4LayerItem] = []
 
         for ratio in self.compression_ratios:
-            if ratio == 0:
+            # V4-Flash adds compress_ratio=1 for dense edge layers (e.g.
+            # [1, 1, 4, 128, ..., 1] for the 43-layer Flash variant). Both
+            # 0 and 1 mean "this layer has no compression / compressor", so
+            # they share the same uncompressed mapping bucket.
+            if ratio in (0, 1):
                 self.layer_mapping.append(
                     DeepSeekV4LayerItem(
-                        compress_ratio=0,
+                        compress_ratio=ratio,
                         compress_layer_id=c1_cnt,
                     )
                 )
