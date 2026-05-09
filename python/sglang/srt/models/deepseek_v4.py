@@ -177,8 +177,15 @@ class MQALayer(nn.Module):
             if compress_ratio_override is not None
             else config.compress_ratios[layer_id]
         )
-        assert compress_ratio in [0, 4, 128]
-        self.compress_ratio: Literal[0, 4, 128] = compress_ratio
+        # V4-Flash uses ratio=1 for the dense (uncompressed) edge layers
+        # (e.g. [1, 1, 4, 128, ..., 1] for the 43-layer Flash variant), in
+        # addition to the {0, 4, 128} the original V4 model ships. Treat 0
+        # and 1 the same throughout: neither has a Compressor/C4Indexer and
+        # neither uses the compress_rope_theta / yarn original_seq_len.
+        assert compress_ratio in (0, 1, 4, 128), (
+            f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
+        )
+        self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -187,12 +194,15 @@ class MQALayer(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
+        rope_base = (
+            config.compress_rope_theta
+            if self.compress_ratio in (4, 128)
+            else rope_theta
+        )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        assert self.compress_ratio in {0, 4, 128}
-        if self.compress_ratio:
+        if self.compress_ratio in (4, 128):
             original_seq_len = rope_scaling["original_max_position_embeddings"]
         else:
             original_seq_len = 0
@@ -222,7 +232,7 @@ class MQALayer(nn.Module):
 
         self.compressor = None
         self.indexer = None
-        if self.compress_ratio:
+        if self.compress_ratio in (4, 128):
             self.compressor = Compressor(
                 config,
                 layer_id=self.layer_id,
@@ -1078,7 +1088,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         for layer in self.model.layers:
             self_attn = layer.self_attn
-            if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
+            if (
+                self_attn.compress_ratio in (4, 128)
+                and not self_attn.compressor.ape_converted
+            ):
                 self_attn.compressor.apply_ape_hotfix()
             if (
                 self_attn.compress_ratio == 4

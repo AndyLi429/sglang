@@ -108,15 +108,16 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        if compress_ratio not in (0, 4, 128):
+        if compress_ratio not in (0, 1, 4, 128):
             raise ValueError(
-                f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
+                f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
-        if compress_ratio == 0:
-            # Regular MQA layer — delegate to ascend's forward. ``attn_sink``
-            # is V4-only and not exposed on the ascend signature; if the V4
-            # model passes it on a compress_ratio==0 layer we drop it for
-            # now (TODO: verify this is safe; CUDA path uses attn_sink
+        if compress_ratio in (0, 1):
+            # Regular (uncompressed) MQA layer — delegate to ascend's forward.
+            # V4 ratio=0 and Flash ratio=1 (dense edge layers) both run
+            # standard attention here.  ``attn_sink`` is V4-only and not
+            # exposed on the ascend signature; we drop it for now (TODO:
+            # verify this is safe; the CUDA path passes attn_sink through
             # whenever it isn't None).
             return AscendAttnBackend.forward(
                 self,
