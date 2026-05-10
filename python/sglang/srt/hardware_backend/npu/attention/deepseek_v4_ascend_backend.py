@@ -281,9 +281,17 @@ class DeepseekV4AscendAttnBackend(
             )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
-        return self._forward_compressed(
-            q, layer, forward_batch, attn_sink, compress_ratio
-        )
+        # ratio 4 / 128: compressed-KV sparse attention. The full kernel
+        # call (npu_sparse_attn_sharedkv with has_cmp_kv=True) requires:
+        #  - cmp_kv populated by the compressor write path (still stubbed)
+        #  - cmp_block_table sized for the c4 / c128 pool (we currently
+        #    only build swa_page_table; sizes don't match, the kernel
+        #    rejects the call with aclnnSparseAttnSharedkv failed)
+        #  - cmp_sparse_indices produced by the lightning indexer
+        # Until those land, fall back to dense SWA attention — produces a
+        # partial but well-defined result instead of zeros, and exercises
+        # the same kernel path as ratio 0/1 layers.
+        return self._forward_dense(q, layer, forward_batch, attn_sink)
 
     def _forward_dense(
         self,
