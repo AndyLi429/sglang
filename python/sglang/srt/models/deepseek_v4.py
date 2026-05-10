@@ -79,9 +79,10 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 def _v4_rope_inplace_npu(
     q_rope: torch.Tensor,
-    kv_rope: torch.Tensor,
+    kv_rope: Optional[torch.Tensor],
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    inverse: bool = False,
 ) -> None:
     """In-place rotary embedding for V4 — torch fallback used on NPU.
 
@@ -91,8 +92,9 @@ def _v4_rope_inplace_npu(
     last dim = qk_rope_head_dim with consecutive (even, odd) entries
     forming a complex pair (interleaved layout, mirroring fused_rope.cuh).
 
-    Mutates ``q_rope`` and ``kv_rope`` through their views; the upstream q
-    and kv tensors see the rotation.
+    Mutates input tensors through their views. If ``inverse=True``, applies
+    the conjugate rotation (used by MQALayer.forward post-attention for V4
+    latent inverse rope). ``kv_rope`` may be None — only ``q_rope`` rotates.
     """
     # NPU's aclnnIndex doesn't support complex tensors, so split first
     # (.real / .imag are pointer-level views on a complex storage and
@@ -110,16 +112,21 @@ def _v4_rope_inplace_npu(
         im = pair[..., 1].clone()
         c = cos
         s = sin
-        # cos / sin shape: (T, dim/2). pair shape: (T, ..., dim/2, 2).
-        # Insert head dims into c / s so they broadcast.
         while c.ndim < pair.ndim - 1:
             c = c.unsqueeze(-2)
             s = s.unsqueeze(-2)
-        pair[..., 0] = re * c - im * s
-        pair[..., 1] = re * s + im * c
+        if inverse:
+            # x * conj(f) = (re + i im)(c - i s) = (re*c + im*s) + i(im*c - re*s)
+            pair[..., 0] = re * c + im * s
+            pair[..., 1] = im * c - re * s
+        else:
+            # x * f = (re + i im)(c + i s) = (re*c - im*s) + i(re*s + im*c)
+            pair[..., 0] = re * c - im * s
+            pair[..., 1] = re * s + im * c
 
     _apply(q_rope)
-    _apply(kv_rope)
+    if kv_rope is not None:
+        _apply(kv_rope)
 
 
 if TYPE_CHECKING:
@@ -625,13 +632,22 @@ class MQALayer(nn.Module):
             save_kv_cache=not self.overlap_store_cache,
         )
         o = o[:, tp_slice, :]
-        fused_rope(
-            o[..., -self.qk_rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-            inverse=True,
-        )
+        if _is_npu:
+            _v4_rope_inplace_npu(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions,
+                inverse=True,
+            )
+        else:
+            fused_rope(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
