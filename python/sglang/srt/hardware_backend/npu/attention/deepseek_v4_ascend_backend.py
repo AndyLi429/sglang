@@ -515,15 +515,14 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        fm = self.forward_metadata
-        # Stage 2: NPU q computation via wq_b + _v4_rope_inplace_npu + torch
-        # hadamard. Stored on fm for the eventual indexer kernel call.
-        if c4_indexer is not None and forward_batch.positions is not None:
-            fm.c4_indexer_q = _compute_c4_q_npu(
-                c4_indexer,
-                q_lora,
-                forward_batch.positions,
-            )
-        # Stage 1 placeholder — real topk_indices land when the indexer
-        # kernel is wired (Stage 5).
-        fm.c4_topk_indices = self._seed_c4_topk_indices(forward_batch)
+        # Stage 2 (NPU q compute via wq_b + _v4_rope_inplace_npu + torch
+        # hadamard) was reverted — calling c4_indexer.wq_b for the first
+        # time produced an async aicore exception that surfaced through
+        # the next NPU sync (aclnnNonzeroV2 in MoE topk masking during
+        # decode). _compute_c4_q_npu / _build_hadamard_matrix kept around
+        # for the eventual real path; needs further debugging (likely the
+        # W8A8 quantized wq_b dequant kernel + decode T=1 shape interaction
+        # or a freqs_cis indexing issue). Until then stay at Stage 1.
+        self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
+            forward_batch
+        )
