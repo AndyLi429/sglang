@@ -683,6 +683,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb
 
+        # NPU fast path: the cann8.5.0-a3 image ships a `custom_ops` wheel
+        # that registers torch.ops.custom.npu_hc_pre — a fused RMS-norm +
+        # linear projection + sinkhorn iteration kernel that returns the
+        # same (post, comb, y) triple the rest of this method computes via
+        # tilelang/deep_gemm/torch. Use it instead of mhc.py on Ascend (where
+        # tilelang isn't available and the torch fallback would be slow).
+        if _is_npu:
+            import custom_ops  # noqa: F401  registers torch.ops.custom.*
+
+            post, comb, y = torch.ops.custom.npu_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                hc_mult=self.hc_mult,
+                hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
+            return y, post, comb
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
@@ -741,6 +762,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
+
+        # NPU fast path mirroring hc_pre: torch.ops.custom.npu_hc_post is
+        # the fused output replication + mixing kernel shipped in the
+        # cann8.5.0-a3 image's custom_ops wheel.
+        if _is_npu:
+            import custom_ops  # noqa: F401
+
+            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
