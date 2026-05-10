@@ -77,6 +77,48 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
+def _v4_rope_inplace_npu(
+    q_rope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """In-place rotary embedding for V4 — torch fallback used on NPU.
+
+    Replaces the tvm_ffi-compiled CUDA `fused_rope` kernel. ``freqs_cis`` is
+    a complex tensor (max_positions, qk_rope_head_dim/2), where the real
+    part holds cos and imag holds sin. ``q_rope`` / ``kv_rope`` slices have
+    last dim = qk_rope_head_dim with consecutive (even, odd) entries
+    forming a complex pair (interleaved layout, mirroring fused_rope.cuh).
+
+    Mutates ``q_rope`` and ``kv_rope`` through their views; the upstream q
+    and kv tensors see the rotation.
+    """
+    # (T, dim/2) complex -> (T, dim/2) cos / sin in q's dtype
+    f = freqs_cis[positions]
+    cos = f.real.to(q_rope.dtype)
+    sin = f.imag.to(q_rope.dtype)
+
+    def _apply(x: torch.Tensor) -> None:
+        # x has shape (T, n_heads, dim) with consecutive pairs forming
+        # complex pairs along the last dim. Broadcast cos/sin across heads.
+        pair = x.view(*x.shape[:-1], -1, 2)
+        re = pair[..., 0].clone()
+        im = pair[..., 1].clone()
+        c = cos
+        s = sin
+        # cos / sin shape: (T, dim/2). pair shape: (T, ..., dim/2, 2).
+        # Insert head dims into c / s so they broadcast.
+        while c.ndim < pair.ndim - 1:
+            c = c.unsqueeze(-2)
+            s = s.unsqueeze(-2)
+        pair[..., 0] = re * c - im * s
+        pair[..., 1] = re * s + im * c
+
+    _apply(q_rope)
+    _apply(kv_rope)
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -480,12 +522,25 @@ class MQALayer(nn.Module):
 
         kv = self.kv_norm(kv)
 
-        fused_rope(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
+        if _is_npu:
+            # `fused_rope` is a tvm_ffi-compiled CUDA kernel; NPU images don't
+            # ship tvm_ffi, so do the same operation (in-place rotary on the
+            # last qk_rope_head_dim of q and kv) with a torch fallback. The
+            # interleaved pair convention here matches fused_rope's CUDA
+            # source (consecutive even/odd indices form a complex pair).
+            _v4_rope_inplace_npu(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions,
+            )
+        else:
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
             kv = cp_all_gather_rerange_output(
