@@ -346,6 +346,14 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    # Activate the in-module NPU compute path inside dsv4 Compressor / C4Indexer.
+    # OFF (default): NPU c4/c128 layers fall back to dense SWA in the backend
+    # (current 2026-05-10 baseline; partial output but stable).
+    # ON: drives the iforgetmyname-style forward_ori / forward_npu_dsv4 branches
+    # — depends on DeepSeekV4TokenToKVPool.{get,set}_compress_{,state_}buffer
+    # and DeepseekV4AscendAttnBackend.forward_metadata.{c4,c128}_{state_,}*
+    # which arrive in roadmap steps 2-3.
+    SGLANG_DSV4_NPU_REAL_COMPRESSOR = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
