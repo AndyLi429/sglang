@@ -786,7 +786,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item = self.layer_mapping[layer_id]
         buf = self.swa_kv_pool.kv_buffer[item.compress_layer_id]
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
-        # Match dtype just in case caller passed a different precision.
+        # Caller (V4 MQALayer) hands us cache shaped (T, dim) — the kv tensor
+        # before it splits heads. The buffer has an explicit num_kv_heads=1
+        # axis, so insert it.
+        if cache.ndim == buf_flat.ndim - 1:
+            cache = cache.unsqueeze(1)
         buf_flat[loc] = cache.to(buf_flat.dtype)
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
