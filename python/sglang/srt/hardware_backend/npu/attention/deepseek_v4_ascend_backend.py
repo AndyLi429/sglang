@@ -70,6 +70,66 @@ def _stub(method_name: str):
     )
 
 
+def _build_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """Sylvester-construction Walsh-Hadamard matrix of size n × n.
+
+    n must be a power of 2 (asserted by callers). Caches per (n, dtype, device)
+    on the function so repeated calls within a forward batch don't rebuild.
+    """
+    cache = _build_hadamard_matrix._cache  # type: ignore[attr-defined]
+    key = (n, dtype, str(device))
+    if key in cache:
+        return cache[key]
+    H = torch.tensor([[1.0]], dtype=torch.float32)
+    while H.size(0) < n:
+        H = torch.cat(
+            [torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)],
+            dim=0,
+        )
+    H = H.to(dtype=dtype, device=device).contiguous()
+    cache[key] = H
+    return H
+
+
+_build_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
+
+
+def _compute_c4_q_npu(
+    c4_indexer,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """NPU equivalent of ``C4Indexer.compute_q``.
+
+    ``compute_q`` does:
+        q, _ = wq_b(q_lora)
+        q = q.view(-1, n_local_heads, head_dim)
+        fused_rope(q[..., -rope_head_dim:], None, freqs_cis, positions=...)
+        q = rotate_activation(q)            # triton hadamard_transform
+
+    On NPU, ``fused_rope`` is a tvm_ffi CUDA kernel and ``rotate_activation``
+    is a triton hadamard. Replace with ``_v4_rope_inplace_npu`` and a torch
+    Walsh-Hadamard matmul. Note: Sylvester ordering may not match the triton
+    kernel's ordering — final consumer (``npu_quant_lightning_indexer``) is
+    insensitive to the basis since both q and k are rotated by the same H.
+    """
+    from sglang.srt.models.deepseek_v4 import _v4_rope_inplace_npu
+
+    q, _ = c4_indexer.wq_b(q_lora)
+    q = q.view(-1, c4_indexer.n_local_heads, c4_indexer.head_dim)
+    _v4_rope_inplace_npu(
+        q[..., -c4_indexer.rope_head_dim :],
+        None,
+        c4_indexer.freqs_cis,
+        positions,
+    )
+    H = _build_hadamard_matrix(c4_indexer.head_dim, torch.float32, q.device)
+    scale = c4_indexer.head_dim ** -0.5
+    q_f32 = q.to(torch.float32)
+    q_rotated = torch.matmul(q_f32, H) * scale
+    return q_rotated.to(torch.bfloat16)
+
+
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -455,6 +515,15 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
-            forward_batch
-        )
+        fm = self.forward_metadata
+        # Stage 2: NPU q computation via wq_b + _v4_rope_inplace_npu + torch
+        # hadamard. Stored on fm for the eventual indexer kernel call.
+        if c4_indexer is not None and forward_batch.positions is not None:
+            fm.c4_indexer_q = _compute_c4_q_npu(
+                c4_indexer,
+                q_lora,
+                forward_batch.positions,
+            )
+        # Stage 1 placeholder — real topk_indices land when the indexer
+        # kernel is wired (Stage 5).
+        fm.c4_topk_indices = self._seed_c4_topk_indices(forward_batch)
