@@ -100,6 +100,19 @@ class DeepseekV4AscendAttnBackend(
         # null in HF config); mirror iforgetmyname/dsv4_release which uses
         # self.config.head_dim verbatim for the metadata kernel arg.
         self._dsv4_head_dim = cfg.head_dim
+        hf = getattr(cfg, "hf_config", cfg)
+        self._dsv4_index_topk = getattr(hf, "index_topk", 512)
+        self._dsv4_index_n_heads = getattr(hf, "index_n_heads", 64)
+        self._dsv4_index_head_dim = getattr(hf, "index_head_dim", 128)
+        self._dsv4_compress_ratios = getattr(hf, "compress_ratios", None)
+        self._dsv4_has_c4 = (
+            self._dsv4_compress_ratios is not None
+            and 4 in self._dsv4_compress_ratios
+        )
+        self._dsv4_has_c128 = (
+            self._dsv4_compress_ratios is not None
+            and 128 in self._dsv4_compress_ratios
+        )
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size
             if cfg.sliding_window_size is not None
@@ -159,7 +172,7 @@ class DeepseekV4AscendAttnBackend(
         common = {
             "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
             "seqused_kv": fm.actual_seq_lengths_kv,
-            "cmp_ratio": 1,  # placeholder; per-meta call overrides
+            "cmp_ratio": 1,
             "ori_mask_mode": 4,  # sliding window
             "cmp_mask_mode": 3,  # causal
             "ori_win_left": self._dsv4_sliding_window_size - 1,
@@ -167,7 +180,7 @@ class DeepseekV4AscendAttnBackend(
             "layout_q": "TND",
             "layout_kv": "PA_ND",
         }
-        c1a_kwargs = {
+        base_kwargs = {
             "batch_size": forward_batch.batch_size,
             "num_heads_q": self._dsv4_q_head_num,
             "num_heads_kv": self._dsv4_kv_head_num,
@@ -175,9 +188,57 @@ class DeepseekV4AscendAttnBackend(
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
-        c1a_kwargs.update(common)
-        c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c1a_kwargs)
-        return {"c1a_metadata": c1a_metadata}
+        c1a_kwargs = base_kwargs | common
+        kernel_metadata = {
+            "c1a_metadata": torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                **c1a_kwargs
+            )
+        }
+
+        if self._dsv4_has_c4:
+            c4a_overrides = {
+                "cmp_ratio": 4,
+                "has_cmp_kv": True,
+                "cmp_topk": self._dsv4_index_topk,
+            }
+            c4a_kwargs = c1a_kwargs | c4a_overrides
+            kernel_metadata["c4a_metadata"] = (
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
+            )
+
+            # The lightning indexer is only attached to c4 layers.
+            # actual_seq_lengths_q (no leading 0, just B-element cumsum) is
+            # what npu_quant_lightning_indexer_metadata expects.
+            if fm.actual_seq_lengths_q_pa is not None:
+                actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
+            else:
+                actual_seq_lengths_q = fm.actual_seq_lengths_kv
+            kernel_metadata["li_quant_metadata"] = (
+                torch.ops.custom.npu_quant_lightning_indexer_metadata(
+                    device=str(actual_seq_lengths_q.device),
+                    actual_seq_lengths_query=actual_seq_lengths_q,
+                    actual_seq_lengths_key=fm.actual_seq_lengths_kv,
+                    layout_key="PA_BSND",
+                    sparse_count=self._dsv4_index_topk,
+                    sparse_mode=3,
+                    layout_query="TND",
+                    cmp_ratio=4,
+                    key_quant_mode=0,
+                    query_quant_mode=0,
+                    num_heads_q=self._dsv4_index_n_heads,
+                    num_heads_k=1,
+                    head_dim=self._dsv4_index_head_dim,
+                )
+            )
+
+        if self._dsv4_has_c128:
+            c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
+            c128a_kwargs = c1a_kwargs | c128a_overrides
+            kernel_metadata["c128a_metadata"] = (
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
+            )
+
+        return kernel_metadata
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # PHASE-0: no metadata for the indexer (we no-op forward_c4_indexer).
