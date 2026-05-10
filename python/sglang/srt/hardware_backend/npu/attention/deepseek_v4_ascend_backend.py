@@ -110,10 +110,14 @@ class DeepseekV4AscendAttnBackend(
         else:
             seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None:
+            if isinstance(seq_lens_cpu, list):
+                seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
+            else:
+                seq_lens_cpu = seq_lens_cpu.int()
             cumsum = torch.cat(
                 [
                     torch.zeros(1, dtype=torch.int32),
-                    torch.cumsum(seq_lens_cpu.int(), dim=0).int(),
+                    torch.cumsum(seq_lens_cpu, dim=0).int(),
                 ]
             ).to(forward_batch.seq_lens.device)
             fm.actual_seq_lengths_q_pa = cumsum
