@@ -580,8 +580,32 @@ class DeepseekV4AscendAttnBackend(
     def forward_compress(self, *args, **kwargs):  # type: ignore[override]
         return None
 
-    def forward_core_compressor(self, *args, **kwargs):  # type: ignore[override]
-        return None
+    def forward_core_compressor(  # type: ignore[override]
+        self,
+        x: torch.Tensor,
+        forward_batch: "ForwardBatch",
+        layer_id: int,
+        compressor,
+    ) -> None:
+        """Run the OUTER attention compressor on NPU.
+
+        On CUDA, ``CompressorBackendMixin.forward_core_compressor`` calls
+        ``compressor(x, forward_batch)`` (which produces compressed kv) and
+        then writes the result via ``token_to_kv_pool.set_extra_key_buffer*``.
+        On NPU, ``Compressor.forward_npu`` does the write inline (calls
+        ``set_compress_buffer`` and ``set_compress_state_buffer`` itself), so
+        we just trigger the compressor call and return — no separate set-
+        buffer step. Gated by SGLANG_DSV4_NPU_REAL_COMPRESSOR; flag off keeps
+        the previous stub (compressor never invoked, c4/c128 layers fall
+        back to dense SWA in forward()).
+        """
+        if forward_batch.forward_mode.is_idle():
+            return
+        from sglang.srt.environ import envs as _envs
+
+        if not _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
+            return
+        compressor(x, forward_batch)
 
     def forward_c4_indexer(  # type: ignore[override]
         self,
