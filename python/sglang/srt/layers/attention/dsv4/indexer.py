@@ -666,14 +666,17 @@ class C4Indexer(nn.Module):
         # compressor path — writes c4 indexer compress kv + state on NPU.
         self.compressor(x, forward_batch)
 
-        # If the backend hasn't built a c4_page_table yet (no req_to_token_c4
-        # equivalent on main — pending step-4-ish allocator work), the
-        # indexer can't read historical compressed kv. Fall back to the
-        # all-(-1) sentinel topk so downstream sparse attention treats every
-        # compressed slot as masked (= dense SWA fallback). The compressor
-        # write above still runs, exercising the real KV-pool write path.
-        fm = forward_batch.attn_backend.forward_metadata
-        if getattr(fm, "c4_page_table", None) is None:
+        # NPU short-circuit: until we land the int8 indexer KV pack writer
+        # (DeepSeekV4TokenToKVPool.set_compress_buffer with from_indexer=True
+        # is a no-op on NPU today) the indexer pool is all zeros and we
+        # cannot produce real top-k indices. Returning -1 sentinel makes
+        # _forward_compressed treat every compressed slot as masked, so
+        # attention math is equivalent to dense SWA (kernel still runs the
+        # has_cmp_kv=True path with cmp_kv populated by the OUTER compressor
+        # via step 4 — the topk just decides "no slots contribute"). Once
+        # the int8 packer + working npu_quant_lightning_indexer land, this
+        # branch goes away and forward_npu returns real topk indices.
+        if _is_npu:
             T = bs
             return torch.full(
                 (T, self.index_topk),

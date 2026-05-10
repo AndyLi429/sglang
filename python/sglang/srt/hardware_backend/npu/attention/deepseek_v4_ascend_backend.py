@@ -388,15 +388,23 @@ class DeepseekV4AscendAttnBackend(
             setattr(fm, attr_loc, compress_out_loc)
 
         # c4_page_table / c128_page_table — page tables over the c4 / c128
-        # compress KV pools. These are consumed by the int8 lightning indexer
-        # (c4_page_table) and by the bf16 indexer einsum fallback. main has
-        # no pre-built mapping; until we add one (next iteration), leave them
-        # None — the next AttributeError pinpoints which forward_npu branch
-        # actually uses them and we'll fill in just that case.
-        if not hasattr(fm, "c4_page_table"):
-            fm.c4_page_table = None
-        if not hasattr(fm, "c128_page_table"):
-            fm.c128_page_table = None
+        # compress KV pools, consumed by _forward_compressed's
+        # `cmp_block_table` and (eventually) by the int8/bf16 indexer paths.
+        #
+        # main's V4 KV pools use compressed_slot = raw_kv_slot // ratio with
+        # c{4,128}_page_size = page_size // ratio, which makes the per-ratio
+        # PAGE index identical to the raw kv pool's page index:
+        #   compressed_slot // c{N}_page_size
+        #     = (raw_slot // ratio) // (page_size // ratio)
+        #     = raw_slot // page_size
+        # So fm.block_tables (the standard ascend page table, already strided
+        # to per-page granularity in raw kv pool) is also a valid page table
+        # over c4_kv_pool / c128_kv_pool. iforgetmyname pre-allocates
+        # req_to_token_c{N} explicitly and lands at the same value after
+        # `[:, ::page_size] // page_size`; we sidestep the allocator surgery.
+        block_tables = getattr(fm, "block_tables", None)
+        fm.c4_page_table = block_tables
+        fm.c128_page_table = block_tables
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is computed inside _compute_kernel_metadata; nothing
@@ -438,17 +446,17 @@ class DeepseekV4AscendAttnBackend(
             )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
-        # ratio 4 / 128: compressed-KV sparse attention. The full kernel
-        # call (npu_sparse_attn_sharedkv with has_cmp_kv=True) requires:
-        #  - cmp_kv populated by the compressor write path (still stubbed)
-        #  - cmp_block_table sized for the c4 / c128 pool (we currently
-        #    only build swa_page_table; sizes don't match, the kernel
-        #    rejects the call with aclnnSparseAttnSharedkv failed)
-        #  - cmp_sparse_indices produced by the lightning indexer
-        # Until those land, fall back to dense SWA attention — produces a
-        # partial but well-defined result instead of zeros, and exercises
-        # the same kernel path as ratio 0/1 layers.
-        return self._forward_dense(q, layer, forward_batch, attn_sink)
+        # ratio 4 / 128: compressed-KV sparse attention via _forward_compressed.
+        # Gated by SGLANG_DSV4_NPU_REAL_COMPRESSOR — when off, fall back to
+        # dense SWA so the c4/c128 layers still produce a well-defined output
+        # (matching the pre-step-5 baseline).
+        from sglang.srt.environ import envs as _envs
+
+        if not _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
+            return self._forward_dense(q, layer, forward_batch, attn_sink)
+        return self._forward_compressed(
+            q, layer, forward_batch, attn_sink, compress_ratio
+        )
 
     def _forward_dense(
         self,
@@ -534,10 +542,9 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=compress_ratio,
             cmp_mask_mode=3,
             cmp_kv=cmp_kv,
-            # TODO: real c4/c128 page tables once compressor write path lands
-            # (iforgetmyname builds these per-ratio in init_forward_metadata).
-            # Reusing swa_page_table as placeholder.
-            cmp_block_table=fm.swa_page_table,
+            cmp_block_table=getattr(
+                fm, f"c{compress_ratio}_page_table", fm.swa_page_table
+            ),
         )
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
