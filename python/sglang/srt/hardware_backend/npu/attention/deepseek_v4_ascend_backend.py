@@ -515,9 +515,8 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2B debug: wq_b is OK in isolation (Stage 2A passed). Now add
-        # view + _v4_rope_inplace_npu to attribute the previously-seen crash
-        # to rope (vs the later hadamard step).
+        # Stage 2C debug: 2A (wq_b) + 2B (rope) both passed in isolation.
+        # Add the hadamard matmul to attribute the prior async crash to it.
         if c4_indexer is not None and forward_batch.positions is not None:
             from sglang.srt.models.deepseek_v4 import _v4_rope_inplace_npu
 
@@ -529,6 +528,11 @@ class DeepseekV4AscendAttnBackend(
                 c4_indexer.freqs_cis,
                 forward_batch.positions,
             )
+            H = _build_hadamard_matrix(
+                c4_indexer.head_dim, torch.float32, q.device
+            )
+            scale = c4_indexer.head_dim ** -0.5
+            _ = (q.to(torch.float32) @ H * scale).to(torch.bfloat16)
             torch.npu.synchronize()
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
