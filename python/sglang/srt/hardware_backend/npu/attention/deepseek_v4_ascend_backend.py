@@ -515,14 +515,16 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2 (NPU q compute via wq_b + _v4_rope_inplace_npu + torch
-        # hadamard) was reverted — calling c4_indexer.wq_b for the first
-        # time produced an async aicore exception that surfaced through
-        # the next NPU sync (aclnnNonzeroV2 in MoE topk masking during
-        # decode). _compute_c4_q_npu / _build_hadamard_matrix kept around
-        # for the eventual real path; needs further debugging (likely the
-        # W8A8 quantized wq_b dequant kernel + decode T=1 shape interaction
-        # or a freqs_cis indexing issue). Until then stay at Stage 1.
+        # Stage 2A debug: isolate whether c4_indexer.wq_b(q_lora) alone is the
+        # async-aicore-exception trigger. wq_b is a ReplicatedLinear; on V4
+        # main it inherits the model-wide quant_config (compressed-tensors
+        # W8A8). If the dequant kernel or weight init is broken, this single
+        # call surfaces the issue — without involving rope or hadamard.
+        if c4_indexer is not None:
+            _ = c4_indexer.wq_b(q_lora)
+            torch.npu.synchronize()  # force sync before returning so any
+                                     # async aicore exception surfaces here,
+                                     # not in MoE topk minutes later.
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
