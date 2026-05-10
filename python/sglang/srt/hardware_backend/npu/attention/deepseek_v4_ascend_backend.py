@@ -515,21 +515,27 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2E debug: store a fresh ZEROS tensor to fm.c4_indexer_q, no
-        # compute at all. If this fails too, the issue is *attribute
-        # persistence* on the AscendAttnBackend forward_metadata (something
-        # downstream is iterating attributes). If it passes, the crash is
-        # specifically about the q tensor produced by _compute_c4_q_npu.
+        # Stage 2F debug: compute q via _compute_c4_q_npu but check whether
+        # what we store has bad content (NaN/Inf from quant) vs storage
+        # aliasing. Store .detach().clone() to break any view chain, and
+        # log the value range pre-store to spot NaN/Inf.
         if c4_indexer is not None and forward_batch.positions is not None:
             fm = self.forward_metadata
-            T = forward_batch.input_ids.shape[0]
-            fm.c4_indexer_q = torch.zeros(
-                T,
-                c4_indexer.n_local_heads,
-                c4_indexer.head_dim,
-                dtype=torch.bfloat16,
-                device=q_lora.device,
+            q_indexer = _compute_c4_q_npu(
+                c4_indexer,
+                q_lora,
+                forward_batch.positions,
             )
+            torch.npu.synchronize()
+            # If q_indexer has NaN/Inf, raise a clear error here instead of
+            # letting it propagate into MoE topk minutes later.
+            if not torch.isfinite(q_indexer).all().item():
+                raise RuntimeError(
+                    f"_compute_c4_q_npu produced non-finite values for "
+                    f"layer {c4_indexer.layer_id}; q range = "
+                    f"[{q_indexer.min().item()}, {q_indexer.max().item()}]"
+                )
+            fm.c4_indexer_q = q_indexer.detach().clone()
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
