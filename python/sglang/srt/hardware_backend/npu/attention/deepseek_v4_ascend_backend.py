@@ -127,16 +127,20 @@ class DeepseekV4AscendAttnBackend(
         return q.new_zeros((T, n_heads, head_dim_v))
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
-        # TEMPORARY: no-op so forward can proceed past the first call site
-        # and surface the next NPU gap. The CUDA path packs swa_k as
-        # fp8 + bf16 + scales into a uint8 buffer (set_swa_key_buffer_radix
-        # via quant_to_nope_fp8_rope_bf16_pack_triton); NPU has no fp8
-        # dtype and no Triton on this image. Real impl will likely call
-        # iforgetmyname-style forward_batch.token_to_kv_pool.set_swa_buffer
-        # once we expose a bf16-store path on DeepSeekV4SingleKVPool. For
-        # now skip — attention forward will read empty cache for this
-        # layer (incorrect output, but unblocks the next failure).
-        return
+        """Write the SWA layer's K cache into the bf16 PA_ND buffer.
+
+        ``swa_k`` arrives shaped (T, num_kv_heads=1, dim) where dim packs
+        K_nope + K_rope in bf16 (same layout as get_swa_buffer returns).
+        We use forward_batch.out_cache_loc as the per-token write
+        positions — those map to flat (page * page_size + slot) indices
+        on the swa_kv_pool buffer.
+        """
+        loc = forward_batch.out_cache_loc
+        forward_batch.token_to_kv_pool.set_swa_buffer(
+            layer_id=layer_id,
+            loc=loc,
+            cache=swa_k,
+        )
 
     # PHASE-0 STUBS: all c4/c128 compressor / indexer paths are no-ops
     # while we surface the full forward chain. attention forward already

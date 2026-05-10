@@ -98,25 +98,36 @@ class DeepSeekV4SingleKVPool(KVCache):
         return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
+        # NPU bf16 mode: allocate the same PA_ND layout that
+        # iforgetmyname/dsv4_release uses for swa_kv_pool —
+        # (num_pages, page_size, num_kv_heads=1, dim) where dim packs
+        # K_nope (qk_nope_head_dim) and K_rope (qk_rope_head_dim) as bf16.
+        # That's the shape npu_sparse_attn_sharedkv expects with
+        # layout_kv="PA_ND". The CUDA fp8-packed-bytes layout is preserved
+        # for non-NPU paths.
+        is_npu_bf16 = self.store_dtype == torch.bfloat16
+        if is_npu_bf16:
+            kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.kv_cache_total_dim = kv_dim
+            return torch.zeros(
+                num_pages,
+                self.page_size,
+                1,
+                kv_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        # The CUDA path packs fp8 K_nope + bf16 K_rope + fp8 scales into a
-        # uint8 byte buffer because torch.float8_e4m3fn doesn't support
-        # index_put_. NPU has no fp8 dtype at all, so the kv_cache_dtype gate
-        # in apply_deepseek_v4_defaults forces bfloat16; in that mode we
-        # allocate the buffer as bf16 directly (no packing). The forward
-        # accessors will need a separate NPU code path — until that is
-        # wired the boot still progresses to memory pool init.
-        is_npu_bf16 = self.store_dtype == torch.bfloat16
-        if not is_npu_bf16:
-            assert bytes_per_token == 448 + 64 * 2 + 8, (
-                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
-            )
-            assert self.store_dtype == torch.uint8
+        assert bytes_per_token == 448 + 64 * 2 + 8, (
+            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+        )
+        assert self.store_dtype == torch.uint8
 
         return torch.zeros(
             num_pages,
@@ -718,6 +729,65 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.get_key_buffer(layer_id)
         return buf, buf
+
+    def get_swa_buffer(
+        self, layer_id: int, loc: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Mirrors iforgetmyname's SWAC4C128KVPool.get_swa_buffer.
+
+        Returns the SWA layer's KV cache in PA_ND layout
+        (num_pages, page_size, num_kv_heads=1, dim). When ``loc`` is given,
+        flatten across (num_pages, page_size) and gather the matching
+        tokens — shape becomes (num_tokens, 1, dim).
+        """
+        item = self.layer_mapping[layer_id]
+        kv = self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+        if loc is not None:
+            kv = kv.flatten(0, 1)[loc]
+        return kv
+
+    def get_compress_buffer(
+        self,
+        layer_id: int,
+        from_indexer: bool = False,
+        loc: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Mirrors iforgetmyname's SWAC4C128KVPool.get_compress_buffer.
+
+        Routes to c4 / c128 kv_pool by layer compression ratio. Returns
+        ``None`` for ratio in (0, 1) (no compress KV exists). With ``loc``
+        gathers tokens like get_swa_buffer.
+        """
+        item = self.layer_mapping[layer_id]
+        if item.compress_ratio == 4:
+            pool = self.c4_indexer_kv_pool if from_indexer else self.c4_kv_pool
+            kv = pool.kv_buffer[item.compress_layer_id]
+        elif item.compress_ratio == 128:
+            assert not from_indexer, "c128 has no indexer pool"
+            kv = self.c128_kv_pool.kv_buffer[item.compress_layer_id]
+        else:
+            return None
+        if loc is not None:
+            kv = kv.flatten(0, 1)[loc]
+        return kv
+
+    def set_swa_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache: torch.Tensor,
+    ) -> None:
+        """Write ``cache`` into the SWA pool at flat token positions ``loc``.
+
+        ``cache`` shape: (num_tokens, num_kv_heads=1, dim) — same layout the
+        attention kernel reads. The buffer view is (num_pages, page_size, 1,
+        dim) so we flatten the first two dims and index_put.
+        """
+        item = self.layer_mapping[layer_id]
+        buf = self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+        buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
+        # Match dtype just in case caller passed a different precision.
+        buf_flat[loc] = cache.to(buf_flat.dtype)
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
