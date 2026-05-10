@@ -515,13 +515,14 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2H debug: store wq_b output (no rope, no hadamard). If this
-        # crashes too → wq_b output buffer has memory-pool issue when held
-        # alive past forward_c4_indexer. If it passes → rope/hadamard step
-        # is what the held tensor depends on.
+        # Stage 2I debug: store wq_b output via .float() conversion. Going
+        # through fp32 forces a fresh allocation in the standard NPU memory
+        # pool, bypassing whatever quant-kernel-output pool block was the
+        # source tensor (Stage 2H failed when storing the raw bf16 wq_b
+        # output even after .detach().clone()).
         if c4_indexer is not None:
             q, _ = c4_indexer.wq_b(q_lora)
-            self.forward_metadata.c4_indexer_q = q.detach().clone()
+            self.forward_metadata.c4_indexer_q = q.float().detach().clone()
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
