@@ -515,13 +515,13 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2G debug: skip _compute_c4_q_npu entirely; just clone+store
-        # q_lora itself. If this still triggers the MoE topk crash, the
-        # issue is "storing any cloned device tensor to fm" (a forward_
-        # metadata GC / attribute-iteration pathology). If it passes, the
-        # crash specifically attaches to the wq_b/rope/hadamard chain.
+        # Stage 2H debug: store wq_b output (no rope, no hadamard). If this
+        # crashes too → wq_b output buffer has memory-pool issue when held
+        # alive past forward_c4_indexer. If it passes → rope/hadamard step
+        # is what the held tensor depends on.
         if c4_indexer is not None:
-            self.forward_metadata.c4_indexer_q = q_lora.detach().clone()
+            q, _ = c4_indexer.wq_b(q_lora)
+            self.forward_metadata.c4_indexer_q = q.detach().clone()
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
