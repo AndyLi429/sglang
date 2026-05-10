@@ -515,14 +515,17 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2I debug: store wq_b output via .float() conversion. Going
-        # through fp32 forces a fresh allocation in the standard NPU memory
-        # pool, bypassing whatever quant-kernel-output pool block was the
-        # source tensor (Stage 2H failed when storing the raw bf16 wq_b
-        # output even after .detach().clone()).
-        if c4_indexer is not None:
-            q, _ = c4_indexer.wq_b(q_lora)
-            self.forward_metadata.c4_indexer_q = q.float().detach().clone()
+        # Stage 1 baseline: just seed c4_topk_indices=-1 sentinel for
+        # _forward_compressed to read. Real path requires forking main's
+        # Compressor / C4Indexer modules with NPU-style self-contained
+        # impl (see ascend ref iforgetmyname/dsv4_release nsa_indexer.py
+        # Compressor.forward_ori @ L241 — wkv + wgate + ape weighted sum
+        # + norm + rope + write KV pool, all in-module, no backend
+        # delegation). Stage 2A-I exploration (wq_b call + various store
+        # patterns) showed the issue isn't the wq_b op itself but the
+        # architectural mismatch — main's forward_compress is a triton
+        # mixin path with no NPU equivalent; we must fork the model
+        # modules, not the backend mixin.
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
