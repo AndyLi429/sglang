@@ -281,12 +281,9 @@ class DeepseekV4AscendAttnBackend(
             )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
-        # 4 / 128 still stubbed — return zeros until compressor + indexer +
-        # sparse-attn-with-cmp-kv are wired up.
-        T = q.shape[0]
-        n_heads = q.shape[1] if q.ndim >= 2 else 1
-        head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
-        return q.new_zeros((T, n_heads, head_dim_v))
+        return self._forward_compressed(
+            q, layer, forward_batch, attn_sink, compress_ratio
+        )
 
     def _forward_dense(
         self,
@@ -316,6 +313,78 @@ class DeepseekV4AscendAttnBackend(
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
         )
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        return out
+
+    def _forward_compressed(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """ratio=4 / ratio=128 layers — sliding-window + compressed-KV
+        sparse attention via npu_sparse_attn_sharedkv with has_cmp_kv=True.
+
+        cmp_kv (compressed KV) is read from the c4 / c128 pool buffer,
+        which is currently zeros (compressor write path is still stubbed),
+        so the compressed contribution to the output is zero. cmp_sparse_
+        indices for c4 comes from forward_metadata.c4_topk_indices, which
+        forward_c4_indexer currently seeds with -1 (= no valid sparse
+        index) for the same reason. The point of this commit is to validate
+        the kernel-call shape/dtype contract end-to-end before we land the
+        compressor + indexer compute paths.
+        """
+        fm = self.forward_metadata
+        pool = forward_batch.token_to_kv_pool
+        metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
+        cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
+
+        if metadata is None or cmp_kv is None:
+            # No metadata or no compress pool for this layer — likely means
+            # the layer is dense (ratio 0/1) but the model dispatched here
+            # by mistake, or the model has fewer compressed layers than the
+            # config implies. Return zeros to avoid crashing the forward.
+            T = q.shape[0]
+            n_heads = q.shape[1] if q.ndim >= 2 else 1
+            head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
+            return q.new_zeros((T, n_heads, head_dim_v))
+
+        ori_kv = pool.get_swa_buffer(layer.layer_id)
+        attn_kwargs = dict(
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_kv=fm.actual_seq_lengths_kv,
+            ori_mask_mode=4,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q,
+            ori_kv=ori_kv,
+            ori_block_table=fm.swa_page_table,
+            sinks=attn_sink,
+            metadata=metadata,
+            softmax_scale=layer.scaling,
+            cmp_ratio=compress_ratio,
+            cmp_mask_mode=3,
+            cmp_kv=cmp_kv,
+            # TODO: real c4/c128 page tables once compressor write path lands
+            # (iforgetmyname builds these per-ratio in init_forward_metadata).
+            # Reusing swa_page_table as placeholder.
+            cmp_block_table=fm.swa_page_table,
+        )
+        if compress_ratio == 4:
+            topk = fm.c4_topk_indices
+            if topk is None:
+                topk = self._seed_c4_topk_indices(forward_batch)
+                fm.c4_topk_indices = topk
+            attn_kwargs["cmp_sparse_indices"] = topk.view(
+                -1, 1, topk.shape[-1]
+            )
+        else:
+            attn_kwargs["cmp_sparse_indices"] = None
+
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
