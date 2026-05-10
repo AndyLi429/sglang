@@ -38,6 +38,17 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+# custom_ops registers torch.ops.custom.npu_* via side-effect on import.
+# It's installed in the cann image at /usr/local/python*/site-packages/custom_ops.
+# Without this import the npu_sparse_attn_sharedkv_metadata op isn't visible
+# the first time we touch torch.ops.custom (lazy namespace population).
+try:
+    import custom_ops  # noqa: F401
+except ImportError:
+    logging.getLogger(__name__).warning(
+        "custom_ops package not importable — V4 ascend attention will fall back."
+    )
+
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
