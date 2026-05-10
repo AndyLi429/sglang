@@ -94,7 +94,8 @@ class DeepseekV4AscendAttnBackend(
         super().init_forward_metadata(forward_batch)
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
-        _stub("init_forward_metadata_indexer")
+        # PHASE-0: no metadata for the indexer (we no-op forward_c4_indexer).
+        return None
 
     def forward(
         self,
@@ -137,17 +138,19 @@ class DeepseekV4AscendAttnBackend(
         # layer (incorrect output, but unblocks the next failure).
         return
 
-    # ``forward_compress`` and ``forward_core_compressor`` come from
-    # CompressorBackendMixin and call CUDA JIT kernels (compress_forward,
-    # compress_fused_norm_rope_inplace, linear_bf16_fp32). Until we wire NPU
-    # equivalents we want a clear error rather than a confusing one from
-    # inside JIT compile.
+    # PHASE-0 STUBS: all c4/c128 compressor / indexer paths are no-ops
+    # while we surface the full forward chain. attention forward already
+    # returns zeros for compress_ratio in (4, 128) (see forward()), so
+    # whatever these compute would only feed a zero attention anyway.
+    # The real impl of these (porting iforgetmyname's compressor/indexer
+    # NPU kernels onto main's KV pool layout) is the bulk of the V4-NPU
+    # attention port and lives behind these stubs.
 
     def forward_compress(self, *args, **kwargs):  # type: ignore[override]
-        _stub("forward_compress")
+        return None
 
     def forward_core_compressor(self, *args, **kwargs):  # type: ignore[override]
-        _stub("forward_core_compressor")
+        return None
 
     def forward_c4_indexer(self, *args, **kwargs):  # type: ignore[override]
-        _stub("forward_c4_indexer")
+        return None
