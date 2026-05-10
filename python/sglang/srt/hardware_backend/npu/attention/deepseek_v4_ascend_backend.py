@@ -446,17 +446,22 @@ class DeepseekV4AscendAttnBackend(
             )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
-        # ratio 4 / 128: compressed-KV sparse attention via _forward_compressed.
-        # Gated by SGLANG_DSV4_NPU_REAL_COMPRESSOR — when off, fall back to
-        # dense SWA so the c4/c128 layers still produce a well-defined output
-        # (matching the pre-step-5 baseline).
+        # ratio 4 / 128 routing — TWO independent gates:
+        #   SGLANG_DSV4_NPU_REAL_COMPRESSOR=1 turns on the in-module
+        #     forward_npu (compressor writes real KV; output unchanged
+        #     because attention still falls back to dense here).
+        #   SGLANG_DSV4_NPU_SPARSE_ATTN=1 additionally routes attention
+        #     through _forward_compressed (has_cmp_kv=True kernel path).
+        # The second gate stays OFF by default until the kernel call's
+        # size / sparse-indices mismatch is resolved; with it OFF, output
+        # is bit-for-bit identical to the flag-OFF baseline.
         from sglang.srt.environ import envs as _envs
 
-        if not _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
-            return self._forward_dense(q, layer, forward_batch, attn_sink)
-        return self._forward_compressed(
-            q, layer, forward_batch, attn_sink, compress_ratio
-        )
+        if _envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get():
+            return self._forward_compressed(
+                q, layer, forward_batch, attn_sink, compress_ratio
+            )
+        return self._forward_dense(q, layer, forward_batch, attn_sink)
 
     def _forward_dense(
         self,

@@ -354,6 +354,13 @@ class Envs:
     # and DeepseekV4AscendAttnBackend.forward_metadata.{c4,c128}_{state_,}*
     # which arrive in roadmap steps 2-3.
     SGLANG_DSV4_NPU_REAL_COMPRESSOR = EnvBool(False)
+    # Sub-flag: route ratio-4/128 attention through _forward_compressed
+    # (has_cmp_kv=True kernel path) instead of the dense SWA fallback.
+    # Requires SGLANG_DSV4_NPU_REAL_COMPRESSOR=1 (so cmp_kv is populated).
+    # Currently aclnnSparseAttnSharedkv rejects the call — keep OFF until
+    # the size / sparse-indices mismatch is debugged. With it OFF, c4/c128
+    # layers stay on _forward_dense (matches the bit-for-bit baseline).
+    SGLANG_DSV4_NPU_SPARSE_ATTN = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
