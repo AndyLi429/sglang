@@ -361,6 +361,15 @@ class Envs:
     # the size / sparse-indices mismatch is debugged. With it OFF, c4/c128
     # layers stay on _forward_dense (matches the bit-for-bit baseline).
     SGLANG_DSV4_NPU_SPARSE_ATTN = EnvBool(False)
+    # Sub-flag: log shapes/ranges of cmp_kv / cmp_block_table /
+    # cmp_sparse_indices on every _forward_compressed call. Use to debug
+    # aclnnSparseAttnSharedkv kernel rejections. Spammy — disable in prod.
+    SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG = EnvBool(False)
+    # Sub-flag: when set, only ratio=128 is routed through _forward_compressed
+    # (c128 uses cmp_sparse_indices=None per iforgetmyname). c4 stays on
+    # dense fallback. Used to bisect kernel rejection: if c128 alone works,
+    # the issue is c4-specific (sparse indices format / -1 sentinel handling).
+    SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

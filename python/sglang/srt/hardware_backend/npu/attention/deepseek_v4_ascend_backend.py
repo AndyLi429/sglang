@@ -457,7 +457,12 @@ class DeepseekV4AscendAttnBackend(
         # is bit-for-bit identical to the flag-OFF baseline.
         from sglang.srt.environ import envs as _envs
 
-        if _envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get():
+        sparse_on = _envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get()
+        c128_only = _envs.SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY.get()
+        # Bisect mode: only c128 layers route to _forward_compressed.
+        if c128_only and compress_ratio != 128:
+            return self._forward_dense(q, layer, forward_batch, attn_sink)
+        if sparse_on or c128_only:
             return self._forward_compressed(
                 q, layer, forward_batch, attn_sink, compress_ratio
             )
@@ -562,6 +567,40 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
 
+        # Step-5b debug dump: log shapes/ranges for the FIRST call only,
+        # then unset the flag so we don't spam the log. Only fires when
+        # SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG=1 (separate from the routing
+        # flag), so we can disable noise once we know the layout.
+        from sglang.srt.environ import envs as _envs
+        if _envs.SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG.get():
+            cbt = attn_kwargs["cmp_block_table"]
+            sp = attn_kwargs["cmp_sparse_indices"]
+            obt = attn_kwargs["ori_block_table"]
+            ok = attn_kwargs["ori_kv"]
+            ck = attn_kwargs["cmp_kv"]
+            logger.warning(
+                "[V4-NPU-sparse-debug] layer=%d ratio=%d "
+                "q.shape=%s sinks=%s "
+                "ori_kv.shape=%s ori_block_table.shape=%s "
+                "  ori_block_table.range=[%s, %s] "
+                "cmp_kv.shape=%s cmp_block_table.shape=%s "
+                "  cmp_block_table.range=[%s, %s] "
+                "cmp_sparse_indices=%s "
+                "metadata=%s "
+                "cu_seqlens_q=%s seqused_kv=%s",
+                layer.layer_id, compress_ratio,
+                tuple(q.shape), None if attn_sink is None else tuple(attn_sink.shape),
+                tuple(ok.shape), tuple(obt.shape),
+                int(obt.min().item()) if obt.numel() else "(empty)",
+                int(obt.max().item()) if obt.numel() else "(empty)",
+                tuple(ck.shape), tuple(cbt.shape) if cbt is not None else None,
+                int(cbt.min().item()) if (cbt is not None and cbt.numel()) else "(empty)",
+                int(cbt.max().item()) if (cbt is not None and cbt.numel()) else "(empty)",
+                None if sp is None else (tuple(sp.shape), int(sp.min().item()), int(sp.max().item())),
+                metadata,
+                tuple(attn_kwargs["cu_seqlens_q"].shape),
+                tuple(attn_kwargs["seqused_kv"].shape),
+            )
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
