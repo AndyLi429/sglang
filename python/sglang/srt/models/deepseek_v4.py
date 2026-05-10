@@ -702,7 +702,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.rms_norm_eps,
                 hc_eps=self.hc_eps,
             )
-            return y, post, comb
+            # The fused kernel emits y in fp32 (the sinkhorn iterates in
+            # fp32). The downstream input_layernorm calls aclnnRmsNorm with
+            # bf16 gamma; ACL has no x=fp32 / gamma=bf16 overload, so we
+            # must cast back to the original dtype here. Mirrors the torch
+            # path's `y.to(dtype)` below.
+            return y.to(dtype), post, comb
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
