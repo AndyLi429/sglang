@@ -131,7 +131,16 @@ class DeepseekV4AscendAttnBackend(
         _stub(f"forward(compress_ratio={compress_ratio})")
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
-        _stub("store_cache")
+        # TEMPORARY: no-op so forward can proceed past the first call site
+        # and surface the next NPU gap. The CUDA path packs swa_k as
+        # fp8 + bf16 + scales into a uint8 buffer (set_swa_key_buffer_radix
+        # via quant_to_nope_fp8_rope_bf16_pack_triton); NPU has no fp8
+        # dtype and no Triton on this image. Real impl will likely call
+        # iforgetmyname-style forward_batch.token_to_kv_pool.set_swa_buffer
+        # once we expose a bf16-store path on DeepSeekV4SingleKVPool. For
+        # now skip — attention forward will read empty cache for this
+        # layer (incorrect output, but unblocks the next failure).
+        return
 
     # ``forward_compress`` and ``forward_core_compressor`` come from
     # CompressorBackendMixin and call CUDA JIT kernels (compress_forward,
