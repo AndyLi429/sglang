@@ -77,21 +77,81 @@ class DeepseekV4AscendAttnBackend(
         speculative_step_id: int = 0,
     ):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
-        # The CUDA backend hardcodes ``page_size == 256``; on NPU we run with
-        # page_size = 128 (matching the rest of the ascend backend), so we
-        # explicitly skip that assert.
+        # Pull the V4-specific config that compute_kernel_metadata needs.
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        cfg = model_runner.model_config
+        self._dsv4_config = cfg
+        tp_size = get_attention_tp_size()
+        self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
+        self._dsv4_kv_head_num = 1  # V4 MQA / latent
+        self._dsv4_head_dim = (
+            cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+        )  # 448 + 64 = 512
+        self._dsv4_sliding_window_size = (
+            cfg.sliding_window_size
+            if cfg.sliding_window_size is not None
+            else 128
+        )
 
     # ------------------------------------------------------------------
     # V4-specific metadata + dispatch — all stubbed pending real impls.
     # ------------------------------------------------------------------
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
-        # AscendAttnBackend computes core metadata. V4 needs the additional
-        # DSV4Metadata wrapper (DSV4AttnMetadata + indexer + compress
-        # metadata). For now delegate to the base; the moment V4 model code
-        # reads ``self.forward_metadata.core_metadata`` we'll have to layer
-        # the wrapper on top.
         super().init_forward_metadata(forward_batch)
+        fm = self.forward_metadata
+
+        # Build TND cu_seqlens_q (= cumulative seq lens, int32 device tensor).
+        # AscendAttnBackend already populates seq_lens_list_cumsum for the
+        # extend / prefill path; reuse where available.
+        if forward_batch.forward_mode.is_extend():
+            seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        else:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None:
+            cumsum = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(seq_lens_cpu.int(), dim=0).int(),
+                ]
+            ).to(forward_batch.seq_lens.device)
+            fm.actual_seq_lengths_q_pa = cumsum
+        else:
+            fm.actual_seq_lengths_q_pa = None
+
+        # SWA page table — already populated by AscendAttnBackend when the
+        # model is hybrid-SWA. Alias it under the name forward_sparse uses.
+        fm.swa_page_table = getattr(fm, "block_tables_swa", None) or fm.block_tables
+
+        # Build kernel_metadata dict. For V4-Flash we mainly need c1a (no
+        # compress KV) right now; c4a/c128a follow when we add those paths.
+        fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
+
+    def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
+        fm = self.forward_metadata
+        common = {
+            "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
+            "seqused_kv": fm.actual_seq_lengths_kv,
+            "cmp_ratio": 1,  # placeholder; per-meta call overrides
+            "ori_mask_mode": 4,  # sliding window
+            "cmp_mask_mode": 3,  # causal
+            "ori_win_left": self._dsv4_sliding_window_size - 1,
+            "ori_win_right": 0,
+            "layout_q": "TND",
+            "layout_kv": "PA_ND",
+        }
+        c1a_kwargs = {
+            "batch_size": forward_batch.batch_size,
+            "num_heads_q": self._dsv4_q_head_num,
+            "num_heads_kv": self._dsv4_kv_head_num,
+            "head_dim": self._dsv4_head_dim,
+            "has_ori_kv": True,
+            "has_cmp_kv": False,
+        }
+        c1a_kwargs.update(common)
+        c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c1a_kwargs)
+        return {"c1a_metadata": c1a_metadata}
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # PHASE-0: no metadata for the indexer (we no-op forward_c4_indexer).
@@ -113,18 +173,45 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
-        # PHASE-0 STUB: return zero-shaped attention output so the rest of
-        # V4 forward (MoE, hc_post, lm_head, sampling) can be exercised and
-        # surface its own NPU gaps without us doing a full sparse_attn port
-        # first. The output shape mirrors what V4's MQALayer.forward expects
-        # back from attn_backend.forward — same shape as q (T, n_heads,
-        # head_dim_v). Real sparse_attn port replaces this whole branch.
-        # NOT correct numerically; only validates the call chain past attn.
-        # NOTE: q dtype on NPU stays bf16; matching that here.
+        if compress_ratio in (0, 1):
+            return self._forward_dense(q, layer, forward_batch, attn_sink)
+        # 4 / 128 still stubbed — return zeros until compressor + indexer +
+        # sparse-attn-with-cmp-kv are wired up.
         T = q.shape[0]
         n_heads = q.shape[1] if q.ndim >= 2 else 1
         head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
         return q.new_zeros((T, n_heads, head_dim_v))
+
+    def _forward_dense(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """ratio=1 / ratio=0 dense layers — sliding-window attention via
+        npu_sparse_attn_sharedkv with has_cmp_kv=False."""
+        fm = self.forward_metadata
+        pool = forward_batch.token_to_kv_pool
+        ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
+
+        attn_kwargs = dict(
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_kv=fm.actual_seq_lengths_kv,
+            ori_mask_mode=4,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q,
+            ori_kv=ori_kv,
+            ori_block_table=fm.swa_page_table,
+            sinks=attn_sink,
+            metadata=fm.kernel_metadata["c1a_metadata"],
+            softmax_scale=layer.scaling,
+        )
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        return out
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         """Write the SWA layer's K cache into the bf16 PA_ND buffer.
