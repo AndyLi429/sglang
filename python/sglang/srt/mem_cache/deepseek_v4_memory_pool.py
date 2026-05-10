@@ -695,13 +695,29 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError()
+        # Route to the appropriate sub-pool based on the layer's compression
+        # ratio. The CUDA path uses set_swa_key_buffer_radix for c4/c128 +
+        # store_cache shenanigans; AscendAttnBackend.forward_extend reads
+        # KV through this generic accessor and would otherwise hit
+        # NotImplementedError. ratio in (0, 1) -> swa pool (the dense /
+        # uncompressed layers); ratio == 4 / 128 -> c4 / c128 pool.
+        item = self.layer_mapping[layer_id]
+        ratio = item.compress_ratio
+        if ratio in (0, 1):
+            return self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+        if ratio == 4:
+            return self.c4_kv_pool.kv_buffer[item.compress_layer_id]
+        if ratio == 128:
+            return self.c128_kv_pool.kv_buffer[item.compress_layer_id]
+        raise ValueError(f"unsupported compress_ratio={ratio} for get_key_buffer")
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError()
+        # V4 uses MQA / latent attention — the K buffer doubles as V.
+        return self.get_key_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError()
+        buf = self.get_key_buffer(layer_id)
+        return buf, buf
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
