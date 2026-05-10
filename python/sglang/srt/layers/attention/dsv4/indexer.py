@@ -499,6 +499,10 @@ class C4Indexer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
+        # main's V4 c4 indexer hardcodes top-512 elsewhere; mirror that on
+        # the module so forward_npu (NPU port of iforgetmyname forward_npu_dsv4)
+        # has access without piping a server arg through.
+        self.index_topk = getattr(config, "index_topk", 512)
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -661,6 +665,22 @@ class C4Indexer(nn.Module):
 
         # compressor path — writes c4 indexer compress kv + state on NPU.
         self.compressor(x, forward_batch)
+
+        # If the backend hasn't built a c4_page_table yet (no req_to_token_c4
+        # equivalent on main — pending step-4-ish allocator work), the
+        # indexer can't read historical compressed kv. Fall back to the
+        # all-(-1) sentinel topk so downstream sparse attention treats every
+        # compressed slot as masked (= dense SWA fallback). The compressor
+        # write above still runs, exercising the real KV-pool write path.
+        fm = forward_batch.attn_backend.forward_metadata
+        if getattr(fm, "c4_page_table", None) is None:
+            T = bs
+            return torch.full(
+                (T, self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
 
         # Prefer the fused int8 lightning indexer when the indexer KV is
         # quantized (matches iforgetmyname's li_kv_dtype == "int8" branch).

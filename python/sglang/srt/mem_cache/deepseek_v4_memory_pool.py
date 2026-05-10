@@ -919,17 +919,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         #   from_indexer=True               → c4_indexer_kv_pool (int8 + scale)
         #   from_indexer=False, ratio=4     → c4_kv_pool
         #   from_indexer=False, ratio=128   → c128_kv_pool
+        #
+        # On NPU we bypass the CUDA fused_store_cache (tvm_ffi-compiled) and
+        # do direct tensor writes against the bf16 buffer. The CUDA
+        # set_key_buffer_fused / set_index_fused chain stays the default for
+        # other devices.
         ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        device_type = kv.device.type
         if from_indexer:
             assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
+            # The c4 indexer KV pool stores packed int8+scale in a uint8
+            # buffer; the producer/consumer kernels are tvm_ffi/triton-only.
+            # On NPU, C4Indexer.forward_npu falls back to a -1 sentinel topk
+            # whenever c4_page_table is None (the current step-3 state), so
+            # the indexer never reads this buffer — swallowing the write is
+            # safe until we land NPU packing + a c4_page_table builder.
+            if device_type == "npu":
+                return
             if kv_scale is None:
-                # bf16 li_kv path — store into the index_k_with_scale buffer's
-                # value half (the indexer pool packs value || scale).
                 self.c4_indexer_kv_pool.set_index_fused(
                     compress_layer_id, loc, kv
                 )
                 return
-            # int8 li_kv path — separate value + scale.
             self.c4_indexer_kv_pool.set_index_k_scale_buffer(
                 compress_layer_id, loc, kv, kv_scale
             )
@@ -937,7 +948,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_pool = (
             self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         )
-        # set_key_buffer_fused expects a flat (T, dim) tensor.
+        if device_type == "npu":
+            # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
+            # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`
+            # (a flat token slot inside the compress kv pool).
+            buf = compress_pool.kv_buffer[compress_layer_id]
+            buf_flat = buf.flatten(0, 1)
+            kv_view = kv.to(buf_flat.dtype)
+            if kv_view.ndim == buf_flat.ndim - 1:
+                kv_view = kv_view.unsqueeze(1)
+            buf_flat[loc] = kv_view
+            return
         return compress_pool.set_key_buffer_fused(compress_layer_id, loc, kv)
 
     def translate_kv_loc_to_compress_state_loc(
