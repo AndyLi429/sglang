@@ -692,7 +692,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             import custom_ops  # noqa: F401  registers torch.ops.custom.*
 
-            post, comb, y = torch.ops.custom.npu_hc_pre(
+            # Note the return order: (y, post, comb) — y is the (T, hidden)
+            # mixed activation, post / comb are the hc_post inputs. The
+            # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+            # cast back to the input dtype before the downstream
+            # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+            y, post, comb = torch.ops.custom.npu_hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
@@ -702,11 +707,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.rms_norm_eps,
                 hc_eps=self.hc_eps,
             )
-            # The fused kernel emits y in fp32 (the sinkhorn iterates in
-            # fp32). The downstream input_layernorm calls aclnnRmsNorm with
-            # bf16 gamma; ACL has no x=fp32 / gamma=bf16 overload, so we
-            # must cast back to the original dtype here. Mirrors the torch
-            # path's `y.to(dtype)` below.
             return y.to(dtype), post, comb
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
