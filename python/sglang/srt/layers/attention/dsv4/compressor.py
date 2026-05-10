@@ -517,6 +517,13 @@ class Compressor(nn.Module):
         score_state_to_be_cached: list[torch.Tensor] = []
         state_loc_list: list[torch.Tensor] = []
         kv_out_positions: list[torch.Tensor] = []
+        # Step-5c per-token write loc bookkeeping. For each compressed token
+        # we will write, record (req_idx_in_batch, compressed_seq_pos_in_req)
+        # so we can compute the c{N}_kv_pool slot from the slab allocator
+        # rather than from out_cache_loc // ratio (which only happens to be
+        # right when the request's raw kv allocation aligns to ratio).
+        write_req_indices: list[torch.Tensor] = []
+        write_pos_in_req: list[torch.Tensor] = []
         seqlen_offset = 0
 
         for idx, seqlen in enumerate(seq_lens_cpu):
@@ -576,8 +583,24 @@ class Compressor(nn.Module):
                     kv_compressed = (kv * score.softmax(dim=1)).sum(
                         dim=1
                     )  # [n_chunks, d]
+                    n_compressed_this_req = kv_compressed.shape[0]
                     kv_out_list.append(kv_compressed)
                     kv_out_positions.append(pos_compressed)
+                    write_req_indices.append(
+                        torch.full(
+                            (n_compressed_this_req,),
+                            idx,
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                    )
+                    write_pos_in_req.append(
+                        torch.arange(
+                            n_compressed_this_req,
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                    )
                 seqlen_offset += seqlen
             else:
                 # Decode: one token per request. Append (kv, score+ape[pos%r])
@@ -638,6 +661,16 @@ class Compressor(nn.Module):
                         ).sum(dim=0, keepdim=True)
                     kv_out_list.append(kv_compressed)
                     kv_out_positions.append(pos_req)
+                    # Decode: 1 compressed token at compressed_seq_pos = seqlen//ratio - 1
+                    decode_pos = seqlen // ratio - 1
+                    write_req_indices.append(
+                        torch.tensor([idx], dtype=torch.int64, device=device)
+                    )
+                    write_pos_in_req.append(
+                        torch.tensor(
+                            [decode_pos], dtype=torch.int64, device=device
+                        )
+                    )
 
         # Flush the prefill state stash to the pool in one shot.
         if kv_state_to_be_cached:
@@ -654,7 +687,7 @@ class Compressor(nn.Module):
             )
 
         # Norm + rope + optional hadamard on the freshly compressed tokens,
-        # then write via _compressor_epilog_npu.
+        # then write via _compressor_epilog_npu with explicit slab-derived locs.
         if kv_out_list:
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
@@ -667,7 +700,21 @@ class Compressor(nn.Module):
             )
             if self.rotate:
                 kv_out = _apply_hadamard(kv_out, self.hadamard_matrix)
-            self._compressor_epilog_npu(kv_out, forward_batch)
+            # Slab → c{N}_kv_pool slot for each compressed token.
+            req_indices_flat = torch.cat(write_req_indices, dim=0)
+            pos_in_req_flat = torch.cat(write_pos_in_req, dim=0)
+            req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
+            kernel_page_size = forward_batch.attn_backend.page_size
+            page_seq = pos_in_req_flat // kernel_page_size
+            offset = pos_in_req_flat % kernel_page_size
+            pages_table = token_to_kv_pool.get_req_to_token_c_pages(ratio)
+            kernel_page = pages_table[req_pool_flat.to(torch.int64), page_seq]
+            write_locs = (
+                kernel_page.to(torch.int64) * kernel_page_size + offset
+            ).to(torch.int32)
+            self._compressor_epilog_npu(
+                kv_out, forward_batch, override_loc=write_locs
+            )
         return None
 
     def _overlap_transform(
@@ -686,7 +733,10 @@ class Compressor(nn.Module):
         return out
 
     def _compressor_epilog_npu(
-        self, kv: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        kv: torch.Tensor,
+        forward_batch: ForwardBatch,
+        override_loc: Optional[torch.Tensor] = None,
     ) -> None:
         # Quant + write — quant only when this is an indexer compressor with
         # int8 li_kv (matches iforgetmyname compressor_epilog L538). For the
@@ -699,8 +749,11 @@ class Compressor(nn.Module):
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
-        backend_fm = forward_batch.attn_backend.forward_metadata
-        loc = backend_fm.c4_loc if self.ratio == 4 else backend_fm.c128_loc
+        if override_loc is not None:
+            loc = override_loc
+        else:
+            backend_fm = forward_batch.attn_backend.forward_metadata
+            loc = backend_fm.c4_loc if self.ratio == 4 else backend_fm.c128_loc
         forward_batch.token_to_kv_pool.set_compress_buffer(
             self.layer_id,
             loc,

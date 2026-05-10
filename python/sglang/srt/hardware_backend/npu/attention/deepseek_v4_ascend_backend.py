@@ -367,14 +367,30 @@ class DeepseekV4AscendAttnBackend(
                 state_loc_decode = pool.translate_kv_loc_to_compress_state_loc(
                     forward_batch.out_cache_loc, ratio
                 )
-                # Compressor write loc — port of the triton init_compression_
-                # metadata kernel: raw_out_loc // ratio if seq_len % ratio == 0,
-                # else 0. Per-request, [bs] int32.
+                # Compressor write loc — step 5c slab allocator. For each
+                # request that just completed a ratio-aligned chunk, the new
+                # compressed token writes to slot
+                #   k_seq = seqlen_after // ratio - 1     (compressed seq pos)
+                #   slot  = req_to_token_c{N}_pages[req_pool_idx, k_seq // page_size]
+                #           * page_size + k_seq % page_size
+                # Replaces the old `raw_out_loc // ratio` formula which only
+                # worked when the request happened to land on a page-aligned
+                # raw kv slot (= almost never).
+                pages_table = pool.get_req_to_token_c_pages(ratio)
                 should_compress = (seq_lens % ratio) == 0
+                k_seq = (seq_lens.to(torch.int64) // ratio - 1).clamp(min=0)
+                page_seq = (k_seq // self.page_size).to(torch.int64)
+                offset = (k_seq % self.page_size).to(torch.int64)
+                kernel_page = pages_table[
+                    req_pool.to(torch.int64), page_seq
+                ].to(torch.int64)
+                compress_out_loc = (kernel_page * self.page_size + offset).to(
+                    torch.int32
+                )
                 compress_out_loc = torch.where(
                     should_compress,
-                    forward_batch.out_cache_loc.to(torch.int32) // ratio,
-                    torch.zeros_like(seq_lens),
+                    compress_out_loc,
+                    torch.zeros_like(compress_out_loc),
                 )
             else:
                 state_loc_decode = None
@@ -387,24 +403,18 @@ class DeepseekV4AscendAttnBackend(
             setattr(fm, attr_state_loc, state_loc_decode)
             setattr(fm, attr_loc, compress_out_loc)
 
-        # c4_page_table / c128_page_table — page tables over the c4 / c128
-        # compress KV pools, consumed by _forward_compressed's
-        # `cmp_block_table` and (eventually) by the int8/bf16 indexer paths.
-        #
-        # main's V4 KV pools use compressed_slot = raw_kv_slot // ratio with
-        # c{4,128}_page_size = page_size // ratio, which makes the per-ratio
-        # PAGE index identical to the raw kv pool's page index:
-        #   compressed_slot // c{N}_page_size
-        #     = (raw_slot // ratio) // (page_size // ratio)
-        #     = raw_slot // page_size
-        # So fm.block_tables (the standard ascend page table, already strided
-        # to per-page granularity in raw kv pool) is also a valid page table
-        # over c4_kv_pool / c128_kv_pool. iforgetmyname pre-allocates
-        # req_to_token_c{N} explicitly and lands at the same value after
-        # `[:, ::page_size] // page_size`; we sidestep the allocator surgery.
-        block_tables = getattr(fm, "block_tables", None)
-        fm.c4_page_table = block_tables
-        fm.c128_page_table = block_tables
+            # c{ratio}_page_table — kernel-view page table for c{N}_kv_pool.
+            # Step 5c: read directly from the slab — gives each request its
+            # own dedicated kernel pages so cmp_kv reads at compressed seq
+            # pos 0..N-1 land in the right physical slots regardless of how
+            # the raw_kv allocator scattered the request's full pages.
+            pages_table = pool.get_req_to_token_c_pages(ratio)
+            n_pages_c = (n_pages + ratio - 1) // ratio
+            n_pages_c = max(1, min(n_pages_c, pages_table.shape[1]))
+            c_page_table = pages_table[req_pool.to(torch.int64), :n_pages_c].to(
+                torch.int32
+            )
+            setattr(fm, f"c{ratio}_page_table", c_page_table)
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is computed inside _compute_kernel_metadata; nothing
@@ -582,7 +592,19 @@ class DeepseekV4AscendAttnBackend(
             cmp_kv=cmp_kv,
             cmp_block_table=cmp_block_table,
         )
-        if compress_ratio == 4:
+        # Step-5c diagnosis: route c4 with cmp_sparse_indices=None (= same
+        # treatment as c128) when SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK is set.
+        # This bypasses the -1 sentinel topk path that was used to "mask"
+        # all c4 history, and instead lets the kernel use the entire
+        # populated c4 history (up to seqused_kv // ratio compressed
+        # tokens). If output stabilizes after this, the divergence we see
+        # in step-5c is due to the kernel mis-handling -1 in the c4 sparse
+        # indices tensor, not due to slab/cmp_kv layout. If output still
+        # diverges from dense baseline, the issue is in compressor write
+        # values (ape/wkv split) or in lingering pool state.
+        from sglang.srt.environ import envs as _envs
+
+        if compress_ratio == 4 and not _envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get():
             topk = fm.c4_topk_indices
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)

@@ -370,6 +370,11 @@ class Envs:
     # dense fallback. Used to bisect kernel rejection: if c128 alone works,
     # the issue is c4-specific (sparse indices format / -1 sentinel handling).
     SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY = EnvBool(False)
+    # Diagnostic: route c4 _forward_compressed with cmp_sparse_indices=None
+    # (same as c128) instead of the -1 sentinel topk path. Used to test
+    # whether kernel mis-handles -1 in sparse indices. With this on, c4
+    # attention reads ALL committed c4 history (kernel-decided length).
+    SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

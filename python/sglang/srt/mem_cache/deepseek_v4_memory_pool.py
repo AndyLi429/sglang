@@ -488,6 +488,42 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
 
+        # Step-5c per-req c4/c128 slab allocator. Mirrors iforgetmyname's
+        # req_to_token_c4 / req_to_token_c128 (own allocator that gives each
+        # request its own contiguous slot range in c{N}_kv_pool, keyed by
+        # compressed-seq position not raw-kv position) — but stored INSIDE
+        # the V4 token-to-kv pool instead of the request pool to avoid
+        # scheduler-side surgery. Each req_pool_idx i gets a fixed slab of
+        # `max_pages_c{N}_per_req` pages starting at i * max_per_req.
+        # Per-page granularity uses the global page_size (matches our
+        # _forward_compressed cmp_kv reshape view).
+        c4_n_pages_kernel = c4_size // page_size  # kernel-view num pages
+        c128_n_pages_kernel = c128_size // page_size
+        # Cap per-req max pages so all max_num_reqs reqs fit; round down.
+        self.max_pages_c4_per_req = max(1, c4_n_pages_kernel // max_num_reqs)
+        self.max_pages_c128_per_req = max(1, c128_n_pages_kernel // max_num_reqs)
+        # req_to_token_c{N}_pages[req_idx, k] = kernel-view page index in
+        # c{N}_kv_pool for the k-th compressed-token-page of request `req_idx`.
+        self.req_to_token_c4_pages = (
+            torch.arange(max_num_reqs * self.max_pages_c4_per_req, dtype=torch.int32)
+            .view(max_num_reqs, self.max_pages_c4_per_req)
+            .to(device)
+        )
+        self.req_to_token_c128_pages = (
+            torch.arange(
+                max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32
+            )
+            .view(max_num_reqs, self.max_pages_c128_per_req)
+            .to(device)
+        )
+
+    def get_req_to_token_c_pages(self, compress_ratio: int) -> torch.Tensor:
+        if compress_ratio == 4:
+            return self.req_to_token_c4_pages
+        if compress_ratio == 128:
+            return self.req_to_token_c128_pages
+        raise ValueError(f"unsupported compress_ratio={compress_ratio}")
+
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
