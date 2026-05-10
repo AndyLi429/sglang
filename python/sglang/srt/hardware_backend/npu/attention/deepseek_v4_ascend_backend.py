@@ -515,27 +515,13 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2F debug: compute q via _compute_c4_q_npu but check whether
-        # what we store has bad content (NaN/Inf from quant) vs storage
-        # aliasing. Store .detach().clone() to break any view chain, and
-        # log the value range pre-store to spot NaN/Inf.
-        if c4_indexer is not None and forward_batch.positions is not None:
-            fm = self.forward_metadata
-            q_indexer = _compute_c4_q_npu(
-                c4_indexer,
-                q_lora,
-                forward_batch.positions,
-            )
-            torch.npu.synchronize()
-            # If q_indexer has NaN/Inf, raise a clear error here instead of
-            # letting it propagate into MoE topk minutes later.
-            if not torch.isfinite(q_indexer).all().item():
-                raise RuntimeError(
-                    f"_compute_c4_q_npu produced non-finite values for "
-                    f"layer {c4_indexer.layer_id}; q range = "
-                    f"[{q_indexer.min().item()}, {q_indexer.max().item()}]"
-                )
-            fm.c4_indexer_q = q_indexer.detach().clone()
+        # Stage 2G debug: skip _compute_c4_q_npu entirely; just clone+store
+        # q_lora itself. If this still triggers the MoE topk crash, the
+        # issue is "storing any cloned device tensor to fm" (a forward_
+        # metadata GC / attribute-iteration pathology). If it passes, the
+        # crash specifically attaches to the wq_b/rope/hadamard chain.
+        if c4_indexer is not None:
+            self.forward_metadata.c4_indexer_q = q_lora.detach().clone()
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
