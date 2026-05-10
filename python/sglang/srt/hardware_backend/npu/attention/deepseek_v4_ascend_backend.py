@@ -242,8 +242,26 @@ class DeepseekV4AscendAttnBackend(
         return kernel_metadata
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
-        # PHASE-0: no metadata for the indexer (we no-op forward_c4_indexer).
+        # li_quant_metadata is computed inside _compute_kernel_metadata; nothing
+        # extra to do here. Return None to satisfy the mixin contract.
         return None
+
+    def _seed_c4_topk_indices(self, forward_batch: "ForwardBatch") -> torch.Tensor:
+        """Allocate a [T, index_topk] int32 tensor on the compute device,
+        filled with -1 (= "no valid sparse index" sentinel that npu_sparse_
+        attn_sharedkv accepts). Real ``forward_c4_indexer`` will overwrite the
+        contents via ``npu_quant_lightning_indexer``; until then this lets the
+        c4 path of ``_forward_compressed`` consume a well-shaped tensor."""
+        if forward_batch.input_ids is not None:
+            T = forward_batch.input_ids.shape[0]
+        else:
+            T = int(forward_batch.seq_lens.sum().item())
+        return torch.full(
+            (T, self._dsv4_index_topk),
+            -1,
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
 
     def forward(
         self,
@@ -331,5 +349,35 @@ class DeepseekV4AscendAttnBackend(
     def forward_core_compressor(self, *args, **kwargs):  # type: ignore[override]
         return None
 
-    def forward_c4_indexer(self, *args, **kwargs):  # type: ignore[override]
-        return None
+    def forward_c4_indexer(  # type: ignore[override]
+        self,
+        *,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: "ForwardBatch",
+        c4_indexer=None,
+        alt_streams=None,
+        enable_multi_stream: bool = False,
+        q_lora_ready=None,
+    ) -> None:
+        """Wire up ``forward_metadata.c4_topk_indices`` for c4 sparse attention.
+
+        Stage 1 (this commit): seed ``c4_topk_indices`` with -1 sentinel so
+        downstream ``_forward_compressed`` (when implemented for ratio=4) can
+        read a well-shaped tensor. The real NPU compute path needs:
+          1. q from ``c4_indexer.wq_b(q_lora)`` + rope + hadamard rotation
+             (``compute_q`` in the model uses the tvm_ffi ``fused_rope``; on
+             NPU we need to inline ``_v4_rope_inplace_npu`` + a torch hadamard)
+          2. weights from ``c4_indexer.weights_proj(x)``
+          3. indexer-K cache (currently absent — comes from the c4 indexer
+             compressor write path which is also stubbed)
+          4. ``torch_npu.npu_dynamic_quant`` for q quantization
+          5. ``torch.ops.custom.npu_quant_lightning_indexer`` to produce the
+             real top-k indices
+        Each piece needs its own commit + 217 relaunch verification.
+        """
+        if forward_batch.forward_mode.is_idle():
+            return
+        self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
+            forward_batch
+        )
