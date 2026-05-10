@@ -843,3 +843,131 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+
+    # ------------------------------------------------------------------
+    # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu
+    # (gated by env SGLANG_DSV4_NPU_REAL_COMPRESSOR). Mirror the
+    # iforgetmyname/dsv4_release SWAC4C128KVPool API on top of main's
+    # CompressStatePool / DeepSeekV4SingleKVPool / DeepSeekV4IndexerPool.
+    #
+    # CompressStatePool stores a single fused [kv | score] tensor of shape
+    # (size, 2*coff*head_dim); split + cat is just a last-dim slice.
+    # ------------------------------------------------------------------
+
+    def set_compress_state_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        score: torch.Tensor,
+        scale: Optional[torch.Tensor],
+        from_indexer: bool,
+    ) -> None:
+        # iforgetmyname stores kv and score side-by-side in a fused buffer;
+        # main's KVAndScore.kv_score is [..., 2*coff*head_dim] = [kv | score]
+        # (kv first half, score second half). We accept (T, 1, coff*head_dim)
+        # tensors and write them into the matching half-slices.
+        _ = scale  # int8 scale not modelled — current state-pool layout is float32
+        pool = (
+            self.indexer_compress_state_pools[layer_id]
+            if from_indexer
+            else self.compress_state_pools[layer_id]
+        )
+        assert pool is not None, (
+            f"layer_id={layer_id} has no {'indexer' if from_indexer else 'attention'} "
+            f"compress state pool — only c4/c128 layers do"
+        )
+        kv_score = pool.kv_score_buffer.kv_score  # (size, 2*coff*head_dim)
+        last_dim = kv_score.shape[-1]
+        half = last_dim // 2
+        # Caller hands (T, 1, coff*head_dim); coff*head_dim equals half.
+        kv_view = kv.reshape(-1, half).to(kv_score.dtype)
+        score_view = score.reshape(-1, half).to(kv_score.dtype)
+        kv_score[loc, :half] = kv_view
+        kv_score[loc, half:] = score_view
+
+    def get_compress_state_buffer(
+        self,
+        layer_id: int,
+        from_indexer: bool,
+        kv_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pool = (
+            self.indexer_compress_state_pools[layer_id]
+            if from_indexer
+            else self.compress_state_pools[layer_id]
+        )
+        assert pool is not None
+        kv_score = pool.kv_score_buffer.kv_score
+        if kv_indices is not None:
+            kv_score = kv_score[kv_indices]
+        last_dim = kv_score.shape[-1]
+        half = last_dim // 2
+        kv = kv_score[..., :half].unsqueeze(-2)  # add num_kv_heads=1 axis
+        score = kv_score[..., half:].unsqueeze(-2)
+        return kv, score
+
+    def set_compress_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_scale: Optional[torch.Tensor],
+        from_indexer: bool,
+    ) -> None:
+        # Routes to:
+        #   from_indexer=True               → c4_indexer_kv_pool (int8 + scale)
+        #   from_indexer=False, ratio=4     → c4_kv_pool
+        #   from_indexer=False, ratio=128   → c128_kv_pool
+        ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        if from_indexer:
+            assert ratio == 4, f"indexer only on c4 layers, got ratio={ratio}"
+            if kv_scale is None:
+                # bf16 li_kv path — store into the index_k_with_scale buffer's
+                # value half (the indexer pool packs value || scale).
+                self.c4_indexer_kv_pool.set_index_fused(
+                    compress_layer_id, loc, kv
+                )
+                return
+            # int8 li_kv path — separate value + scale.
+            self.c4_indexer_kv_pool.set_index_k_scale_buffer(
+                compress_layer_id, loc, kv, kv_scale
+            )
+            return
+        compress_pool = (
+            self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
+        )
+        # set_key_buffer_fused expects a flat (T, dim) tensor.
+        return compress_pool.set_key_buffer_fused(compress_layer_id, loc, kv)
+
+    def translate_kv_loc_to_compress_state_loc(
+        self,
+        kv_loc: torch.Tensor,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        # Same arithmetic as compressor.get_paged_compress_metadata.get_raw_loc
+        # at compressor.py L226-233, but exposed as a callable so both the NPU
+        # forward_npu paths (Compressor / C4Indexer) and the V4 NPU backend's
+        # init_forward_metadata can compute a flat state-pool index from a
+        # full-kv-pool slot id.
+        swa_loc = self.translate_loc_from_full_to_swa(kv_loc)
+        ring_size = self.get_ring_size(compress_ratio)
+        swa_page = swa_loc // self.swa_page_size
+        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        return state_loc.to(torch.int32)
+
+    def get_compress_dequant_scale_buffer(
+        self,
+        layer_id: int,
+        from_indexer: bool,
+    ) -> torch.Tensor:
+        # Indexer pool stores k value + dequant scale side-by-side in a single
+        # buffer (head_dim_with_sf = 132 = 128 + 4 bytes of float scale per
+        # block on CUDA). On NPU we expose just the scale slice via the
+        # existing get_index_k_scale_buffer when caller has page indices.
+        # forward_npu.forward_npu_fused calls this without page indices, so
+        # for now return the raw scale storage tensor; fused path slices it.
+        assert from_indexer, "only indexer compress pool has dequant scale"
+        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(
+            self.layer_mapping[layer_id].compress_layer_id
+        )

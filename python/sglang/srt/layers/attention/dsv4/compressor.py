@@ -525,9 +525,19 @@ class Compressor(nn.Module):
                 continue
             if is_prefill:
                 pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
-                out_cache_loc = forward_batch.out_cache_loc[
+                # State writes index the compress STATE pool (flat ring buffer),
+                # not the full kv pool. Translate via the V4 token pool helper
+                # (matches the formula used by the CUDA compressor's get_raw_loc
+                # at compressor.py L226-233 and the NPU backend's
+                # _build_npu_compress_metadata).
+                raw_kv_loc = forward_batch.out_cache_loc[
                     seqlen_offset : seqlen_offset + seqlen
                 ]
+                out_cache_loc = (
+                    token_to_kv_pool.translate_kv_loc_to_compress_state_loc(
+                        raw_kv_loc, ratio
+                    )
+                )
                 remainder = seqlen % ratio
                 cutoff = seqlen - remainder
                 should_compress = cutoff >= ratio

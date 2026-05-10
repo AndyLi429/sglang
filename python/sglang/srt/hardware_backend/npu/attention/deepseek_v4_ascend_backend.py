@@ -228,6 +228,18 @@ class DeepseekV4AscendAttnBackend(
         # compress KV) right now; c4a/c128a follow when we add those paths.
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
+        # Step-3 NPU compress metadata: only built when forward_npu paths are
+        # active (env-gated). Each field is a per-request tensor consumed by
+        # dsv4/{compressor,indexer}.py forward_npu. See iforgetmyname/dsv4_
+        # release ascend_backend.init_forward_metadata @ ~L735-790 for the
+        # reference impl on top of pre-allocated req_to_token_c{N} tables;
+        # main has no req_to_token_c{N}, so we compute equivalents on the
+        # fly from req_to_token + the V4 KV pool's swa translation.
+        from sglang.srt.environ import envs as _envs
+
+        if _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
+            self._build_npu_compress_metadata(forward_batch)
+
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
         fm = self.forward_metadata
         common = {
@@ -300,6 +312,91 @@ class DeepseekV4AscendAttnBackend(
             )
 
         return kernel_metadata
+
+    def _build_npu_compress_metadata(self, forward_batch: "ForwardBatch") -> None:
+        """Populate c{4,128}_{page_table,state_page_table,state_loc,loc} on
+        forward_metadata for the NPU compressor / indexer forward_npu paths.
+
+        Reference: iforgetmyname/dsv4_release ascend_backend.init_forward_metadata
+        @ ~L735-790. iforgetmyname pre-allocates per-request mapping tables
+        (req_to_token_c4 / req_to_token_c4_state) when the request enters the
+        scheduler; main has no such tables, so we compute equivalents on the
+        fly from req_to_token + the V4 KV pool's swa translation. This is
+        slower but avoids cross-cutting allocator surgery on the request pool.
+        """
+        fm = self.forward_metadata
+        pool = forward_batch.token_to_kv_pool
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_pool = forward_batch.req_pool_indices
+        bs = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+        is_decode = forward_batch.forward_mode.is_decode()
+
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
+        n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
+
+        # State page tables — for each request, for each page, the state-buffer
+        # page index. Use the FIRST token of each page as the representative
+        # (tokens within the same SWA page produce contiguous state-buffer slots).
+        page_starts = torch.arange(
+            0, n_pages * self.page_size, self.page_size, device=device
+        )  # [n_pages]
+        # [bs, n_pages] flattened token positions; positions past seq_len are
+        # clamped to 0 (will be masked out by _get_kv_indices' kv_len).
+        page_starts_2d = page_starts.unsqueeze(0).expand(bs, n_pages)
+        # Index req_to_token: [bs, n_pages] of full-kv-pool slot ids.
+        raw_loc = req_to_token[
+            req_pool.unsqueeze(1).expand(-1, n_pages), page_starts_2d
+        ]
+
+        for ratio in self._dsv4_compress_ratios:
+            if ratio not in (4, 128):
+                continue
+            # State page table — translate each (bs, n_pages) raw kv slot to a
+            # state-buffer page id. translate_kv_loc_to_compress_state_loc gives
+            # the flat state slot; divide by page_size for the page id.
+            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(
+                raw_loc, ratio
+            )
+            state_page_2d = (state_loc_2d // self.page_size).to(torch.int32)
+
+            # State loc — single state-buffer slot for the new decode token.
+            # In decode, out_cache_loc has shape [bs] (one new token per req).
+            if is_decode:
+                state_loc_decode = pool.translate_kv_loc_to_compress_state_loc(
+                    forward_batch.out_cache_loc, ratio
+                )
+                # Compressor write loc — port of the triton init_compression_
+                # metadata kernel: raw_out_loc // ratio if seq_len % ratio == 0,
+                # else 0. Per-request, [bs] int32.
+                should_compress = (seq_lens % ratio) == 0
+                compress_out_loc = torch.where(
+                    should_compress,
+                    forward_batch.out_cache_loc.to(torch.int32) // ratio,
+                    torch.zeros_like(seq_lens),
+                )
+            else:
+                state_loc_decode = None
+                compress_out_loc = None
+
+            attr_state_pt = f"c{ratio}_state_page_table"
+            attr_state_loc = f"c{ratio}_state_loc"
+            attr_loc = f"c{ratio}_loc"
+            setattr(fm, attr_state_pt, state_page_2d)
+            setattr(fm, attr_state_loc, state_loc_decode)
+            setattr(fm, attr_loc, compress_out_loc)
+
+        # c4_page_table / c128_page_table — page tables over the c4 / c128
+        # compress KV pools. These are consumed by the int8 lightning indexer
+        # (c4_page_table) and by the bf16 indexer einsum fallback. main has
+        # no pre-built mapping; until we add one (next iteration), leave them
+        # None — the next AttributeError pinpoints which forward_npu branch
+        # actually uses them and we'll fill in just that case.
+        if not hasattr(fm, "c4_page_table"):
+            fm.c4_page_table = None
+        if not hasattr(fm, "c128_page_table"):
+            fm.c128_page_table = None
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is computed inside _compute_kernel_metadata; nothing
