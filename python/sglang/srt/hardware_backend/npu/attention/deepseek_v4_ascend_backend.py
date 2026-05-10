@@ -515,16 +515,21 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        # Stage 2A debug: isolate whether c4_indexer.wq_b(q_lora) alone is the
-        # async-aicore-exception trigger. wq_b is a ReplicatedLinear; on V4
-        # main it inherits the model-wide quant_config (compressed-tensors
-        # W8A8). If the dequant kernel or weight init is broken, this single
-        # call surfaces the issue — without involving rope or hadamard.
-        if c4_indexer is not None:
-            _ = c4_indexer.wq_b(q_lora)
-            torch.npu.synchronize()  # force sync before returning so any
-                                     # async aicore exception surfaces here,
-                                     # not in MoE topk minutes later.
+        # Stage 2B debug: wq_b is OK in isolation (Stage 2A passed). Now add
+        # view + _v4_rope_inplace_npu to attribute the previously-seen crash
+        # to rope (vs the later hadamard step).
+        if c4_indexer is not None and forward_batch.positions is not None:
+            from sglang.srt.models.deepseek_v4 import _v4_rope_inplace_npu
+
+            q, _ = c4_indexer.wq_b(q_lora)
+            q = q.view(-1, c4_indexer.n_local_heads, c4_indexer.head_dim)
+            _v4_rope_inplace_npu(
+                q[..., -c4_indexer.rope_head_dim :],
+                None,
+                c4_indexer.freqs_cis,
+                forward_batch.positions,
+            )
+            torch.npu.synchronize()
         self.forward_metadata.c4_topk_indices = self._seed_c4_topk_indices(
             forward_batch
         )
