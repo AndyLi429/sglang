@@ -535,6 +535,34 @@ class DeepseekV4AscendAttnBackend(
             return q.new_zeros((T, n_heads, head_dim_v))
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+
+        # Reshape cmp_kv to share page_size with ori_kv before the kernel call.
+        # main's V4 pool layout: c{N}_kv_pool buffer is (num_pages, page_size//
+        # ratio, 1, dim) so each native page holds page_size//ratio compressed
+        # tokens. iforgetmyname / the aclnn kernel expect cmp_kv to share its
+        # page_size with ori_kv (=global page_size). We slice the buffer to a
+        # ratio-aligned native-page count and view it as (N_kernel,
+        # global_page_size, 1, dim); the corresponding cmp_block_table is
+        # `block_tables // ratio` (one kernel page covers `ratio` global raw
+        # pages worth of compressed slots).
+        ori_page_size = ori_kv.shape[1]
+        cmp_native_page_size = cmp_kv.shape[1]
+        cmp_block_table = getattr(
+            fm, f"c{compress_ratio}_page_table", fm.swa_page_table
+        )
+        if cmp_native_page_size != ori_page_size:
+            page_ratio = ori_page_size // cmp_native_page_size
+            assert page_ratio == compress_ratio, (
+                f"page_ratio={page_ratio} != compress_ratio={compress_ratio}; "
+                "main's V4 pool keeps c{N}_native_page_size = global_page_size//ratio"
+            )
+            n_native = cmp_kv.shape[0]
+            n_kernel = n_native // page_ratio
+            cmp_kv = cmp_kv[: n_kernel * page_ratio].reshape(
+                n_kernel, ori_page_size, *cmp_kv.shape[2:]
+            )
+            cmp_block_table = (cmp_block_table // page_ratio).to(torch.int32)
+
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
@@ -552,9 +580,7 @@ class DeepseekV4AscendAttnBackend(
             cmp_ratio=compress_ratio,
             cmp_mask_mode=3,
             cmp_kv=cmp_kv,
-            cmp_block_table=getattr(
-                fm, f"c{compress_ratio}_page_table", fm.swa_page_table
-            ),
+            cmp_block_table=cmp_block_table,
         )
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
