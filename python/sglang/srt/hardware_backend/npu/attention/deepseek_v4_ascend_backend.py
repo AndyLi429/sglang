@@ -112,23 +112,18 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
-        if compress_ratio in (0, 1):
-            # Regular (uncompressed) MQA layer — delegate to ascend's forward.
-            # V4 ratio=0 and Flash ratio=1 (dense edge layers) both run
-            # standard attention here.  ``attn_sink`` is V4-only and not
-            # exposed on the ascend signature; we drop it for now (TODO:
-            # verify this is safe; the CUDA path passes attn_sink through
-            # whenever it isn't None).
-            return AscendAttnBackend.forward(
-                self,
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-            )
-        _stub(f"forward(compress_ratio={compress_ratio})")
+        # PHASE-0 STUB: return zero-shaped attention output so the rest of
+        # V4 forward (MoE, hc_post, lm_head, sampling) can be exercised and
+        # surface its own NPU gaps without us doing a full sparse_attn port
+        # first. The output shape mirrors what V4's MQALayer.forward expects
+        # back from attn_backend.forward — same shape as q (T, n_heads,
+        # head_dim_v). Real sparse_attn port replaces this whole branch.
+        # NOT correct numerically; only validates the call chain past attn.
+        # NOTE: q dtype on NPU stays bf16; matching that here.
+        T = q.shape[0]
+        n_heads = q.shape[1] if q.ndim >= 2 else 1
+        head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
+        return q.new_zeros((T, n_heads, head_dim_v))
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         # TEMPORARY: no-op so forward can proceed past the first call site
