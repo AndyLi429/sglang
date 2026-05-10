@@ -139,14 +139,15 @@ class DeepseekV4AscendAttnBackend(
                 seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
             else:
                 seq_lens_cpu = seq_lens_cpu.int()
-            cumsum = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32),
-                    torch.cumsum(seq_lens_cpu, dim=0).int(),
-                ]
-            ).to(forward_batch.seq_lens.device)
-            fm.actual_seq_lengths_q_pa = cumsum
+            device = forward_batch.seq_lens.device
+            actual_q = torch.cumsum(seq_lens_cpu, dim=0).int().to(device)
+            fm.actual_seq_lengths_q = actual_q
+            fm.actual_seq_lengths_q_pa = torch.cat(
+                [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
+                dim=0,
+            )
         else:
+            fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
 
         # SWA page table — already populated by AscendAttnBackend when the
@@ -207,16 +208,16 @@ class DeepseekV4AscendAttnBackend(
             )
 
             # The lightning indexer is only attached to c4 layers.
-            # actual_seq_lengths_q (no leading 0, just B-element cumsum) is
-            # what npu_quant_lightning_indexer_metadata expects.
-            if fm.actual_seq_lengths_q_pa is not None:
-                actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
-            else:
-                actual_seq_lengths_q = fm.actual_seq_lengths_kv
+            # Pass actual_seq_lengths_q (no leading 0, B-element cumsum)
+            # exactly as iforgetmyname/dsv4_release builds it — a fresh
+            # contiguous int32 device tensor, not a slice.
+            actual_q = fm.actual_seq_lengths_q
+            if actual_q is None:
+                actual_q = fm.actual_seq_lengths_kv
             kernel_metadata["li_quant_metadata"] = (
                 torch.ops.custom.npu_quant_lightning_indexer_metadata(
-                    device=str(actual_seq_lengths_q.device),
-                    actual_seq_lengths_query=actual_seq_lengths_q,
+                    device=str(actual_q.device),
+                    actual_seq_lengths_query=actual_q,
                     actual_seq_lengths_key=fm.actual_seq_lengths_kv,
                     layout_key="PA_BSND",
                     sparse_count=self._dsv4_index_topk,
