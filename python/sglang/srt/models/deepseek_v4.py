@@ -94,10 +94,13 @@ def _v4_rope_inplace_npu(
     Mutates ``q_rope`` and ``kv_rope`` through their views; the upstream q
     and kv tensors see the rotation.
     """
-    # (T, dim/2) complex -> (T, dim/2) cos / sin in q's dtype
-    f = freqs_cis[positions]
-    cos = f.real.to(q_rope.dtype)
-    sin = f.imag.to(q_rope.dtype)
+    # NPU's aclnnIndex doesn't support complex tensors, so split first
+    # (.real / .imag are pointer-level views on a complex storage and
+    # don't dispatch through aclnnIndex), then index the real-typed views.
+    cos_full = freqs_cis.real
+    sin_full = freqs_cis.imag
+    cos = cos_full[positions].to(q_rope.dtype)
+    sin = sin_full[positions].to(q_rope.dtype)
 
     def _apply(x: torch.Tensor) -> None:
         # x has shape (T, n_heads, dim) with consecutive pairs forming
