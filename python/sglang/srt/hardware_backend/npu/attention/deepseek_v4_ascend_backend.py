@@ -96,9 +96,10 @@ class DeepseekV4AscendAttnBackend(
         tp_size = get_attention_tp_size()
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
         self._dsv4_kv_head_num = 1  # V4 MQA / latent
-        self._dsv4_head_dim = (
-            cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
-        )  # 448 + 64 = 512
+        # V4-Flash config.json sets head_dim=512 directly (qk_nope_head_dim is
+        # null in HF config); mirror iforgetmyname/dsv4_release which uses
+        # self.config.head_dim verbatim for the metadata kernel arg.
+        self._dsv4_head_dim = cfg.head_dim
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size
             if cfg.sliding_window_size is not None
@@ -138,6 +139,16 @@ class DeepseekV4AscendAttnBackend(
         # SWA page table — already populated by AscendAttnBackend when the
         # model is hybrid-SWA. Alias it under the name forward_sparse uses.
         fm.swa_page_table = getattr(fm, "block_tables_swa", None) or fm.block_tables
+
+        # actual_seq_lengths_kv defaults to None on main; the V4 metadata
+        # kernel needs an int32 device tensor of per-request KV lengths.
+        if fm.actual_seq_lengths_kv is None:
+            if fm.seq_lens_cpu_int is not None:
+                fm.actual_seq_lengths_kv = fm.seq_lens_cpu_int.to(
+                    device=forward_batch.seq_lens.device, dtype=torch.int32
+                )
+            else:
+                fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
         # Build kernel_metadata dict. For V4-Flash we mainly need c1a (no
         # compress KV) right now; c4a/c128a follow when we add those paths.
