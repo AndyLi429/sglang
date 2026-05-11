@@ -660,14 +660,18 @@ class DeepseekV4AscendAttnBackend(
 
         ``swa_k`` arrives shaped (T, num_kv_heads=1, dim) where dim packs
         K_nope + K_rope in bf16 (same layout as get_swa_buffer returns).
-        We use forward_batch.out_cache_loc as the per-token write
-        positions — those map to flat (page * page_size + slot) indices
-        on the swa_kv_pool buffer.
+        ``forward_batch.out_cache_loc`` is in FULL-pool index space (size
+        = sum of all KV pools); the swa_kv_pool buffer is its own smaller
+        space. We must translate full→swa first — otherwise the
+        index_put hits the wrong slot (or wraps OOB), and decode reads
+        garbage K back. This mirrors what the CUDA radix path does at
+        set_swa_key_buffer_radix.
         """
-        loc = forward_batch.out_cache_loc
-        forward_batch.token_to_kv_pool.set_swa_buffer(
+        pool = forward_batch.token_to_kv_pool
+        swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        pool.set_swa_buffer(
             layer_id=layer_id,
-            loc=loc,
+            loc=swa_loc,
             cache=swa_k,
         )
 
