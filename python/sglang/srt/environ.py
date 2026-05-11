@@ -375,6 +375,15 @@ class Envs:
     # whether kernel mis-handles -1 in sparse indices. With this on, c4
     # attention reads ALL committed c4 history (kernel-decided length).
     SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK = EnvBool(False)
+    # Step-5d: drive the real npu_quant_lightning_indexer for c4 sparse
+    # selection. Requires the int8 K + float16 scale buffer pair on
+    # DeepSeekV4IndexerPool (allocated automatically on NPU) and the inner
+    # c4 indexer compressor's li_kv_dtype="int8" path (set in
+    # C4Indexer.__init__). When OFF, C4Indexer.forward_npu returns the -1
+    # sentinel (current dense-equivalent fallback). When ON, runs the
+    # lightning indexer and returns real top-k indices for
+    # _forward_compressed.cmp_sparse_indices.
+    SGLANG_DSV4_NPU_REAL_INDEXER = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

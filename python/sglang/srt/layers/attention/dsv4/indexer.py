@@ -538,6 +538,11 @@ class C4Indexer(nn.Module):
             # Mirror that here so forward_npu can do the q rotation via a
             # torch matmul (CUDA path uses triton hadamard via rotate_activation).
             self._npu_hadamard_built = False
+            # Tag the inner compressor as int8-li_kv so its epilog runs
+            # `torch_npu.npu_dynamic_quant` and writes through the NPU int8 +
+            # float16 scale buffer pair (set_compress_buffer NPU branch).
+            # Mirrors iforgetmyname compressor_epilog L538-554 behavior.
+            self.compressor.li_kv_dtype = "int8"
 
     def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         q, _ = self.wq_b(q_lora)
@@ -666,17 +671,12 @@ class C4Indexer(nn.Module):
         # compressor path — writes c4 indexer compress kv + state on NPU.
         self.compressor(x, forward_batch)
 
-        # NPU short-circuit: until we land the int8 indexer KV pack writer
-        # (DeepSeekV4TokenToKVPool.set_compress_buffer with from_indexer=True
-        # is a no-op on NPU today) the indexer pool is all zeros and we
-        # cannot produce real top-k indices. Returning -1 sentinel makes
-        # _forward_compressed treat every compressed slot as masked, so
-        # attention math is equivalent to dense SWA (kernel still runs the
-        # has_cmp_kv=True path with cmp_kv populated by the OUTER compressor
-        # via step 4 — the topk just decides "no slots contribute"). Once
-        # the int8 packer + working npu_quant_lightning_indexer land, this
-        # branch goes away and forward_npu returns real topk indices.
-        if _is_npu:
+        # Step-5d sentinel gate. Until SGLANG_DSV4_NPU_REAL_INDEXER=1, NPU
+        # short-circuits to -1 sentinel (kept available so callers can keep
+        # using the dense-equivalent path). With the flag on, fall through
+        # to `_forward_npu_fused` below which runs the real
+        # npu_quant_lightning_indexer.
+        if _is_npu and not envs.SGLANG_DSV4_NPU_REAL_INDEXER.get():
             T = bs
             return torch.full(
                 (T, self.index_topk),
