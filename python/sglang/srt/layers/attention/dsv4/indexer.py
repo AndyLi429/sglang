@@ -689,6 +689,22 @@ class C4Indexer(nn.Module):
         # quantized (matches iforgetmyname's li_kv_dtype == "int8" branch).
         li_kv_dtype = getattr(self.compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8":
+            # Step-5e: skip the indexer kernel call when this rank's batch
+            # is empty (no tokens to score). DP attention can leave some
+            # ranks with an empty batch in flight; calling
+            # npu_quant_lightning_indexer with T=0 / kv_len=0 deadlocks
+            # async (some internal collective never returns) — sync mode
+            # masked this. Return the sentinel topk so downstream
+            # _forward_compressed gets a well-shaped tensor on the empty
+            # rank without ever entering the indexer kernel.
+            kv_lens = forward_batch.seq_lens
+            if bs == 0 or (kv_lens.numel() > 0 and int(kv_lens.sum().item()) == 0):
+                return torch.full(
+                    (bs, self.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
             li_cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
                 self.layer_id, True
             )
