@@ -30,8 +30,16 @@ INT32 = "int32"
 
 
 @lru_cache(2)
+def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
+    # iforgetmyname/dsv4_release rotary_embedding/yarn.py:yarn_get_mscale
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
 def precompute_freqs_cis(
-    dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
+    dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow,
+    mscale: float = 1.0, mscale_all_dim: float = 0.0,
 ) -> torch.Tensor:
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
@@ -63,7 +71,22 @@ def precompute_freqs_cis(
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    # YARN magnitude-scale: V4-Flash trained with mscale-multiplied cos/sin.
+    # See iforgetmyname/dsv4_release rotary_embedding/rope_variant.py
+    # DeepseekScalingRotaryEmbedding._compute_cos_sin_cache (L414-415) — they
+    # do `cos = freqs.cos() * mscale`, `sin = freqs.sin() * mscale`. Main's
+    # CUDA fused_rope reads `freqs_cis.real / .imag` as cos/sin directly, so
+    # we bake mscale into the complex values here. For typical V4-Flash
+    # rope_scaling (factor=16, mscale=1, mscale_all_dim=0) this is ≈ 1.2773.
+    if factor > 1.0:
+        m_num = _yarn_get_mscale(factor, mscale)
+        m_den = _yarn_get_mscale(factor, mscale_all_dim)
+        m = m_num / m_den
+    else:
+        m = 1.0
+    cos = freqs.cos() * m
+    sin = freqs.sin() * m
+    freqs_cis = torch.complex(cos, sin)
     return freqs_cis
 
 

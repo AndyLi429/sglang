@@ -84,29 +84,25 @@ def _v4_rope_inplace_npu(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    """In-place rotary embedding for V4 — torch fallback used on NPU.
+    """In-place interleaved RoPE for V4 — torch fallback used on NPU.
 
-    Replaces the tvm_ffi-compiled CUDA `fused_rope` kernel. ``freqs_cis`` is
-    a complex tensor (max_positions, qk_rope_head_dim/2), where the real
-    part holds cos and imag holds sin. ``q_rope`` / ``kv_rope`` slices have
-    last dim = qk_rope_head_dim with consecutive (even, odd) entries
-    forming a complex pair (interleaved layout, mirroring fused_rope.cuh).
+    Mirrors main's CUDA `fused_rope` kernel: consecutive (even, odd) pairs
+    of x form complex pairs, with `freqs_cis` a complex tensor where
+    `freqs_cis.real[t, k]` = cos(theta_{t,k}), `freqs_cis.imag` = sin(...)
+    indexed by frequency pair k in [0, rope_dim/2).
 
-    Mutates input tensors through their views. If ``inverse=True``, applies
-    the conjugate rotation (used by MQALayer.forward post-attention for V4
-    latent inverse rope). ``kv_rope`` may be None — only ``q_rope`` rotates.
+    NOTE on V4-Flash YARN `mscale`: when the model was trained with the
+    YARN magnitude-scale `mscale` ≠ 1.0, the cos/sin values stored in
+    `freqs_cis` MUST already be pre-multiplied by `mscale` at precompute
+    time — see `deepseek_v4_rope.precompute_freqs_cis`. This function
+    just reads what's stored; it does NOT apply mscale here.
     """
-    # NPU's aclnnIndex doesn't support complex tensors, so split first
-    # (.real / .imag are pointer-level views on a complex storage and
-    # don't dispatch through aclnnIndex), then index the real-typed views.
     cos_full = freqs_cis.real
     sin_full = freqs_cis.imag
     cos = cos_full[positions].to(q_rope.dtype)
     sin = sin_full[positions].to(q_rope.dtype)
 
     def _apply(x: torch.Tensor) -> None:
-        # x has shape (T, n_heads, dim) with consecutive pairs forming
-        # complex pairs along the last dim. Broadcast cos/sin across heads.
         pair = x.view(*x.shape[:-1], -1, 2)
         re = pair[..., 0].clone()
         im = pair[..., 1].clone()
@@ -116,11 +112,9 @@ def _v4_rope_inplace_npu(
             c = c.unsqueeze(-2)
             s = s.unsqueeze(-2)
         if inverse:
-            # x * conj(f) = (re + i im)(c - i s) = (re*c + im*s) + i(im*c - re*s)
             pair[..., 0] = re * c + im * s
             pair[..., 1] = im * c - re * s
         else:
-            # x * f = (re + i im)(c + i s) = (re*c - im*s) + i(re*s + im*c)
             pair[..., 0] = re * c - im * s
             pair[..., 1] = re * s + im * c
 
@@ -267,6 +261,18 @@ class MQALayer(nn.Module):
             factor=rope_scaling["factor"],
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
+            # V4-Flash YARN magnitude-scale: V4-Flash config.json doesn't
+            # include mscale / mscale_all_dim fields, so iforgetmyname's
+            # DeepseekScalingRotaryEmbedding falls back to defaults
+            # (mscale=1, mscale_all_dim=0) which yield self.mscale ≈ 1.2773
+            # for factor=16. main's precompute_freqs_cis previously omitted
+            # this scale entirely, producing rope magnitudes ~22% smaller
+            # than what the model was trained for → semantically broken
+            # output (231 step 5+ test: tokens like `[19,16,19,16,343,...]`
+            # = "1.1. (C.dir," vs the correct `[54994,1060,...]` =
+            # "jumps over the lazy dog" for prompt "The quick brown fox").
+            mscale=float(rope_scaling.get("mscale", 1.0)),
+            mscale_all_dim=float(rope_scaling.get("mscale_all_dim", 0.0)),
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor

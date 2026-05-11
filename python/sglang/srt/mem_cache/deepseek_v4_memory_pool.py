@@ -326,9 +326,16 @@ class DeepSeekV4IndexerPool(KVCache):
         # lightning_indexer can read/write directly without unpacking the
         # CUDA-only uint8 packed layout. CUDA path keeps using
         # `index_k_with_scale_buffer` above; NPU path uses the buffers below.
+        # ONLY allocate when SGLANG_DSV4_NPU_REAL_COMPRESSOR is on — these
+        # buffers add ~570 MB total which would otherwise eat into the KV
+        # pool budget for Tier 1 baseline launches.
         from sglang.srt.utils import is_npu as _is_npu_check
+        from sglang.srt.environ import envs as _envs
 
-        self._npu_buffers_present = _is_npu_check()
+        self._npu_buffers_present = (
+            _is_npu_check()
+            and _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
+        )
         if self._npu_buffers_present:
             # NPU buffer uses GLOBAL kernel_page_size (= 256), not the
             # pool's per-ratio page_size (= 64 for c4 indexer pool). This
