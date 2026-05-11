@@ -549,12 +549,14 @@ class DeepseekV4AscendAttnBackend(
         # Reshape cmp_kv to share page_size with ori_kv before the kernel call.
         # main's V4 pool layout: c{N}_kv_pool buffer is (num_pages, page_size//
         # ratio, 1, dim) so each native page holds page_size//ratio compressed
-        # tokens. iforgetmyname / the aclnn kernel expect cmp_kv to share its
-        # page_size with ori_kv (=global page_size). We slice the buffer to a
-        # ratio-aligned native-page count and view it as (N_kernel,
-        # global_page_size, 1, dim); the corresponding cmp_block_table is
-        # `block_tables // ratio` (one kernel page covers `ratio` global raw
-        # pages worth of compressed slots).
+        # tokens. The aclnn kernel expects cmp_kv to share its page_size with
+        # ori_kv (=global page_size). We slice the buffer to a ratio-aligned
+        # native-page count and view it as (N_kernel, global_page_size, 1, dim).
+        #
+        # cmp_block_table values: step 5c slab (`req_to_token_c{N}_pages`)
+        # already gives kernel-view page indices in [0, N_kernel), so no
+        # further `// page_ratio` divide is needed — the divide was a leftover
+        # from step 5b when block_table came from raw kv pool page indices.
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(
@@ -571,7 +573,8 @@ class DeepseekV4AscendAttnBackend(
             cmp_kv = cmp_kv[: n_kernel * page_ratio].reshape(
                 n_kernel, ori_page_size, *cmp_kv.shape[2:]
             )
-            cmp_block_table = (cmp_block_table // page_ratio).to(torch.int32)
+            # Slab already in kernel-view page space — no divide.
+            cmp_block_table = cmp_block_table.to(torch.int32)
 
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,

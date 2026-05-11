@@ -274,6 +274,7 @@ class DeepSeekV4IndexerPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        kernel_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -286,6 +287,15 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
+        # Kernel-view page size — what npu_quant_lightning_indexer expects
+        # cmp_kv.shape[1] to equal (= global page_size, typically 256).
+        # main's V4 pool passes c4_page_size = page_size // 4 = 64 as
+        # `page_size` here for the CUDA layout; on NPU we need page_size=256
+        # to match ori_kv. If unset, default to self.page_size (CUDA backward
+        # compat).
+        self.kernel_page_size = (
+            kernel_page_size if kernel_page_size is not None else page_size
+        )
 
         self._create_buffer()
 
@@ -320,10 +330,16 @@ class DeepSeekV4IndexerPool(KVCache):
 
         self._npu_buffers_present = _is_npu_check()
         if self._npu_buffers_present:
+            # NPU buffer uses GLOBAL kernel_page_size (= 256), not the
+            # pool's per-ratio page_size (= 64 for c4 indexer pool). This
+            # makes cmp_kv.shape[1] match ori_kv.shape[1] = global page_size,
+            # which aclnnSparseAttnSharedkv / npu_quant_lightning_indexer
+            # require. num_pages is recomputed for the kernel page size.
+            npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
             self.npu_index_k_buffer = [
                 torch.zeros(
-                    num_pages,
-                    self.page_size,
+                    npu_num_pages,
+                    self.kernel_page_size,
                     1,
                     self.index_head_dim,
                     dtype=torch.int8,
@@ -333,8 +349,8 @@ class DeepSeekV4IndexerPool(KVCache):
             ]
             self.npu_index_scale_buffer = [
                 torch.zeros(
-                    num_pages,
-                    self.page_size,
+                    npu_num_pages,
+                    self.kernel_page_size,
                     1,
                     1,
                     dtype=torch.float16,
@@ -517,6 +533,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_layer_num,
             device,
             enable_memory_saver,
+            kernel_page_size=page_size,  # global; NPU buffers use this
         )
 
         self._init_compressed_layer_mapping()
