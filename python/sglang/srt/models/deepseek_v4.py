@@ -688,6 +688,18 @@ class MQALayer(nn.Module):
 
         o, _ = self.wo_b(o.flatten(1))
 
+        # DUMP layer-0 MQA final output to localize where mscale-on vs mscale-off diverge
+        import torch.distributed as _dist_mqa
+        if (self.layer_id == 0 and _dist_mqa.is_initialized() and _dist_mqa.get_rank() == 0
+                and not getattr(self, "_mqa_dumped", False)):
+            self._mqa_dumped = True
+            of = o.detach().float()
+            flat = of.view(-1)
+            print(f"[DUMP_MQA L0] o.shape={tuple(o.shape)} dtype={o.dtype}", flush=True)
+            print(f"[DUMP_MQA L0] o.flat[:8]={flat[:8].tolist()}", flush=True)
+            print(f"[DUMP_MQA L0] o.flat[-8:]={flat[-8:].tolist()}", flush=True)
+            print(f"[DUMP_MQA L0] abs_mean={of.abs().mean().item():.6e} abs_max={of.abs().max().item():.6e}", flush=True)
+
         return o
 
 
@@ -1172,6 +1184,23 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
+
+        # DUMP final hidden_states fed into LM head (only first forward, rank 0)
+        import torch.distributed as _dist_lm
+        if (_dist_lm.is_initialized() and _dist_lm.get_rank() == 0
+                and not getattr(self, "_lm_dumped", False)):
+            self._lm_dumped = True
+            try:
+                hf = hidden_states.detach().float()
+                # Take last token (=position 1 for "Four " 2-token prompt)
+                last = hf[-1] if hf.ndim == 2 else hf[-1, -1]
+                print(f"[DUMP_LM] hidden_states.shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype}", flush=True)
+                print(f"[DUMP_LM] last_token[:8]={last[:8].tolist()}", flush=True)
+                print(f"[DUMP_LM] last_token[-8:]={last[-8:].tolist()}", flush=True)
+                print(f"[DUMP_LM] last.abs_mean={last.abs().mean().item():.6e} last.abs_max={last.abs().max().item():.6e}", flush=True)
+            except Exception as _e:
+                print(f"[DUMP_LM ERROR] {_e!r}", flush=True)
+
         return self.logits_processor(
             input_ids,
             hidden_states,
