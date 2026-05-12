@@ -837,8 +837,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         flatten across (num_pages, page_size) and gather the matching
         tokens — shape becomes (num_tokens, 1, dim).
         """
-        item = self.layer_mapping[layer_id]
-        kv = self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+        # HOTFIX: index swa_kv_pool.kv_buffer by raw layer_id, not by
+        # item.compress_layer_id. compress_layer_id is a per-bucket counter
+        # (c1_cnt / c4_cnt / c128_cnt each starting at 0), so writes from
+        # different ratios COLLIDE on the same kv_buffer slot. Eg layer 0
+        # (c1_cnt=0), layer 2 (c4_cnt=0), and layer 3 (c128_cnt=0) all hit
+        # kv_buffer[0] and overwrite each other; decode then reads the last
+        # writer's K instead of the layer's own K. swa_kv_pool is sized with
+        # layer_num=total_layers so per-layer slots already exist; just
+        # index them directly. Verified bit-perfect with iforgetmyname for
+        # the first 5 generated tokens of `Four ` after this fix.
+        kv = self.swa_kv_pool.kv_buffer[layer_id]
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
@@ -892,8 +901,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         attention kernel reads. The buffer view is (num_pages, page_size, 1,
         dim) so we flatten the first two dims and index_put.
         """
-        item = self.layer_mapping[layer_id]
-        buf = self.swa_kv_pool.kv_buffer[item.compress_layer_id]
+        # HOTFIX: see get_swa_buffer comment — index by raw layer_id, not
+        # by item.compress_layer_id, otherwise c4/c128 bucket counters
+        # collide with the c1 bucket and writes from different ratios
+        # overwrite each other in swa_kv_pool.kv_buffer.
+        buf = self.swa_kv_pool.kv_buffer[layer_id]
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
         # Caller (V4 MQALayer) hands us cache shaped (T, dim) — the kv tensor
         # before it splits heads. The buffer has an explicit num_kv_heads=1
