@@ -96,7 +96,51 @@ def _v4_rope_inplace_npu(
     `freqs_cis` MUST already be pre-multiplied by `mscale` at precompute
     time — see `deepseek_v4_rope.precompute_freqs_cis`. This function
     just reads what's stored; it does NOT apply mscale here.
+
+    Prefer the NPU-native `torch.ops.custom.inplace_partial_rotary_mul`
+    (same kernel iforgetmyname/dsv4_release uses) — torch fallback differs
+    by ~1 ULP per element vs the kernel because torch does bf16*bf16 muls
+    with bf16 accumulation while the NPU kernel accumulates in fp32.
+    43 layers × (Q + K) = 86 rope calls compound the drift; with the torch
+    fallback some prompts (those with marginal argmax decisions) flip
+    tokens vs iforgetmyname.
     """
+    if _is_npu and hasattr(torch.ops, "custom") and hasattr(
+        torch.ops.custom, "inplace_partial_rotary_mul"
+    ):
+        # Build cos/sin caches in the layout the kernel expects:
+        # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
+        # the interleaved pairing convention.
+        cos_half = freqs_cis.real[positions]  # (T, rope_dim/2)
+        sin_half = freqs_cis.imag[positions]
+        if inverse:
+            sin_half = -sin_half
+        cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+        sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+        rope_dim = cos_full.shape[-1]
+        cos4 = cos_full.view(-1, 1, 1, rope_dim).contiguous()
+        sin4 = sin_full.view(-1, 1, 1, rope_dim).contiguous()
+        # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
+        # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
+        q_view = q_rope.unsqueeze(1)
+        torch.ops.custom.inplace_partial_rotary_mul(
+            q_view, cos4, sin4,
+            rotary_mode="interleave",
+            partial_slice=[0, rope_dim],
+        )
+        if kv_rope is not None:
+            if kv_rope.dim() == 3:
+                kv_view = kv_rope.unsqueeze(1)
+            else:
+                kv_view = kv_rope.view(-1, 1, 1, rope_dim)
+            torch.ops.custom.inplace_partial_rotary_mul(
+                kv_view, cos4, sin4,
+                rotary_mode="interleave",
+                partial_slice=[0, rope_dim],
+            )
+        return
+
+    # Torch fallback (CUDA tests, or NPU images without the custom op).
     cos_full = freqs_cis.real
     sin_full = freqs_cis.imag
     cos = cos_full[positions].to(q_rope.dtype)
