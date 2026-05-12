@@ -120,18 +120,9 @@ def _v4_rope_inplace_npu(
         rope_dim = cos_full.shape[-1]
         cos4 = cos_full.view(-1, 1, 1, rope_dim).contiguous()
         sin4 = sin_full.view(-1, 1, 1, rope_dim).contiguous()
-        # Match iforgetmyname/dsv4_release axis layout for the kernel:
-        # iforget passes q.unsqueeze(2) → (T, n_heads, 1, head_dim) with
-        # partial_slice=[qk_nope_head_dim, head_dim]. We were instead doing
-        # q_rope.unsqueeze(1) → (T, 1, n_heads, rope_dim) which swaps the
-        # n_heads axis position. inplace_partial_rotary_mul is layout-
-        # aware (cos/sin broadcast + interleave-pair traversal depend on
-        # which axis is heads), so wrong axis order produces wrong rope
-        # output for multi-head q.
-        #
-        # q_rope:  (T, n_heads, rope_dim) → (T, n_heads, 1, rope_dim) view
-        # kv_rope: (T, 1, rope_dim)       → (T, 1, 1, rope_dim) view
-        q_view = q_rope.unsqueeze(-2)
+        # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
+        # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
+        q_view = q_rope.unsqueeze(1)
         torch.ops.custom.inplace_partial_rotary_mul(
             q_view, cos4, sin4,
             rotary_mode="interleave",
@@ -139,7 +130,7 @@ def _v4_rope_inplace_npu(
         )
         if kv_rope is not None:
             if kv_rope.dim() == 3:
-                kv_view = kv_rope.unsqueeze(-2)
+                kv_view = kv_rope.unsqueeze(1)
             else:
                 kv_view = kv_rope.view(-1, 1, 1, rope_dim)
             torch.ops.custom.inplace_partial_rotary_mul(
