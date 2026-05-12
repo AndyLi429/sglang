@@ -71,15 +71,22 @@ def precompute_freqs_cis(
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
-    # No mscale magnitude scaling on cos/sin — matches iforgetmyname's
-    # ComplexExpRotaryEmbedding (factory.py L237 is_dsv4 path) which uses
-    # raw polar(1, freqs). The mscale=1.2773 multiplier we used earlier
-    # was a workaround for the cu_seqlens_q decode bug (kernel slicing q
-    # OOB produced garbage; adding mscale happened to shift logits enough
-    # to land token 0 on 20). With cu_seqlens_q fixed at the metadata
-    # layer, mscale is not needed and was likely a source of secondary
-    # token-5+ divergence vs iforgetmyname.
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    # YARN magnitude-scale: V4-Flash trained with mscale-multiplied cos/sin.
+    # See iforgetmyname/dsv4_release rotary_embedding/rope_variant.py
+    # DeepseekScalingRotaryEmbedding._compute_cos_sin_cache (L414-415) — they
+    # do `cos = freqs.cos() * mscale`, `sin = freqs.sin() * mscale`. Main's
+    # CUDA fused_rope reads `freqs_cis.real / .imag` as cos/sin directly, so
+    # we bake mscale into the complex values here. For typical V4-Flash
+    # rope_scaling (factor=16, mscale=1, mscale_all_dim=0) this is ≈ 1.2773.
+    if factor > 1.0:
+        m_num = _yarn_get_mscale(factor, mscale)
+        m_den = _yarn_get_mscale(factor, mscale_all_dim)
+        m = m_num / m_den
+    else:
+        m = 1.0
+    cos = freqs.cos() * m
+    sin = freqs.sin() * m
+    freqs_cis = torch.complex(cos, sin)
     return freqs_cis
 
 

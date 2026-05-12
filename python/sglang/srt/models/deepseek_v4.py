@@ -248,14 +248,17 @@ class MQALayer(nn.Module):
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        # YARN correction only for compressed (ratio=4/128) layers.
-        # iforgetmyname/dsv4_release's ComplexExpRotaryEmbedding gates this
-        # on `base == compress_rope_theta (160000)` inside precompute_freqs_cis.
-        # Dense layers (base=rope_theta=10000) use raw extrapolation freqs.
-        if self.compress_ratio in (4, 128):
-            original_seq_len = rope_scaling["original_max_position_embeddings"]
-        else:
-            original_seq_len = 0
+        # YARN correction applies to ALL layers regardless of compress_ratio.
+        # iforgetmyname/dsv4_release's get_rope_wrapper always passes
+        # `rope_scaling` to the rotary_emb constructor, so dense (ratio 0/1)
+        # layers get the same YARN-corrected inv_freq as compressed layers
+        # — only the rope base differs (rope_theta vs compress_rope_theta).
+        # Earlier this branched on compress_ratio and zeroed the YARN
+        # correction for dense layers; that left the 3 dense layers of
+        # V4-Flash (positions 0, 1, 43 in the 44-layer model) with raw
+        # extrapolation freqs while the model was trained with YARN —
+        # causing token-1+ divergence even after the mscale magnitude fix.
+        original_seq_len = rope_scaling["original_max_position_embeddings"]
 
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
