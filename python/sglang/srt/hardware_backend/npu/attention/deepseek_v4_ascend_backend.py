@@ -187,20 +187,53 @@ class DeepseekV4AscendAttnBackend(
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
-        # Build TND cu_seqlens_q (= cumulative seq lens, int32 device tensor).
-        # AscendAttnBackend already populates seq_lens_list_cumsum for the
-        # extend / prefill path; reuse where available.
+        # Build TND cu_seqlens_q (= cumulative QUERY seq lens, int32 device tensor).
+        # The kernel uses cu_seqlens_q to slice the q tensor by request, so
+        # the per-request length here must equal the per-request token count
+        # in q — NOT the KV/context length.
+        #
+        #   extend / prefill: q has extend_seq_lens_cpu tokens per request →
+        #                     cumsum(extend_seq_lens_cpu).
+        #   decode:           q has exactly 1 new token per request → [1, 1, ..., 1].
+        #   target_verify /
+        #   draft_extend:     q has speculative_num_draft_tokens per request.
+        #
+        # Earlier this branch fell back to `forward_batch.seq_lens_cpu` (the
+        # full KV length) on the non-extend path, which made the kernel slice
+        # q at offset = full_seq_len while q.shape[0] = batch_size for decode.
+        # That is the V4-NPU root cause of token-1+ divergence — kernel
+        # metadata says q has e.g. 257 tokens but q tensor only has 1.
+        device = forward_batch.seq_lens.device
         if forward_batch.forward_mode.is_extend():
             seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        else:
-            seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is not None:
             if isinstance(seq_lens_cpu, list):
                 seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
             else:
                 seq_lens_cpu = seq_lens_cpu.int()
-            device = forward_batch.seq_lens.device
             actual_q = torch.cumsum(seq_lens_cpu, dim=0).int().to(device)
+            fm.actual_seq_lengths_q = actual_q
+            fm.actual_seq_lengths_q_pa = torch.cat(
+                [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
+                dim=0,
+            )
+        elif forward_batch.forward_mode.is_decode():
+            B = forward_batch.batch_size
+            fm.actual_seq_lengths_q = torch.arange(
+                1, B + 1, dtype=torch.int32, device=device
+            )
+            fm.actual_seq_lengths_q_pa = torch.arange(
+                0, B + 1, dtype=torch.int32, device=device
+            )
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            B = forward_batch.batch_size
+            from sglang.srt.utils.common import get_global_server_args
+            n_draft = get_global_server_args().speculative_num_draft_tokens or 1
+            actual_q = torch.arange(
+                n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
+            )
             fm.actual_seq_lengths_q = actual_q
             fm.actual_seq_lengths_q_pa = torch.cat(
                 [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
@@ -454,9 +487,13 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
-        # NOTE: K cache write happens via MQALayer._forward_prepare line 576,
-        # gated on SGLANG_OPT_USE_OVERLAP_STORE_CACHE (default TRUE). With
-        # overlap=True, save_kv_cache=False is passed here so we don't dup-write.
+        # Honor save_kv_cache=True contract. With SGLANG_OPT_USE_OVERLAP_STORE_CACHE
+        # default TRUE, MQALayer._forward_prepare already writes K via store_cache
+        # and passes save_kv_cache=False here (no dup-write). With overlap=False,
+        # the previous code silently dropped the write — decode then read an
+        # unwritten swa_kv_pool and produced garbage. Always respect the flag.
+        if save_kv_cache:
+            self.store_cache(layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch)
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128 routing — TWO independent gates:
@@ -494,20 +531,33 @@ class DeepseekV4AscendAttnBackend(
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
 
-        # DUMP-KREAD-OURS: print K cache values at slots [0, 256, 257] + page table
-        import torch.distributed as _dist_kr
-        if (layer.layer_id == 0 and _dist_kr.is_initialized() and _dist_kr.get_rank() == 0):
-            try:
-                mode = "PFL" if forward_batch.forward_mode.is_prefill() else ("DEC" if forward_batch.forward_mode.is_decode() else "EXT")
-                kv_flat = ori_kv.flatten(0, 1).float()  # (num_pages*page_size, 1, dim)
-                pt = fm.swa_page_table.flatten().tolist()[:8] if hasattr(fm, "swa_page_table") and fm.swa_page_table is not None else "no_pt"
-                print(f"[DUMP_KREAD L0 {mode}] page_table[:8]={pt}", flush=True)
-                print(f"[DUMP_KREAD L0 {mode}] kv@slot0[0,:6]={kv_flat[0, 0, :6].tolist()}", flush=True)
-                print(f"[DUMP_KREAD L0 {mode}] kv@slot256[0,:6]={kv_flat[256, 0, :6].tolist()}", flush=True)
-                print(f"[DUMP_KREAD L0 {mode}] kv@slot257[0,:6]={kv_flat[257, 0, :6].tolist()}", flush=True)
-                print(f"[DUMP_KREAD L0 {mode}] q[0,0,:6]={q.detach().float()[0, 0, :6].tolist()}", flush=True)
-            except Exception as _kre:
-                print(f"[DUMP_KREAD L0 ERROR] {_kre!r}", flush=True)
+        # Debug guard: cu_seqlens_q[-1] must equal q.shape[0] (tokens in q).
+        # If this fails the kernel slices q out of bounds → garbage attention.
+        # The earlier decode bug (cu_seqlens_q built from KV lengths) would
+        # have surfaced immediately here. Gated by env so prod path is clean.
+        from sglang.srt.environ import envs as _envs_dbg
+        if _envs_dbg.SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG.get():
+            import torch.distributed as _dist_kr
+            if (layer.layer_id == 0 and _dist_kr.is_initialized()
+                    and _dist_kr.get_rank() == 0):
+                try:
+                    cusq = fm.actual_seq_lengths_q_pa
+                    if cusq is not None and int(cusq[-1].item()) != q.shape[0]:
+                        print(
+                            f"[V4_NPU_ASSERT] cu_seqlens_q[-1]={int(cusq[-1].item())} "
+                            f"!= q.shape[0]={q.shape[0]} — kernel will read OOB",
+                            flush=True,
+                        )
+                    mode = ("PFL" if forward_batch.forward_mode.is_prefill()
+                            else "DEC" if forward_batch.forward_mode.is_decode()
+                            else "EXT")
+                    print(
+                        f"[DUMP_KREAD L0 {mode}] q.shape={tuple(q.shape)} "
+                        f"cu_seqlens_q={cusq.tolist() if cusq is not None else None}",
+                        flush=True,
+                    )
+                except Exception as _kre:
+                    print(f"[DUMP_KREAD L0 ERROR] {_kre!r}", flush=True)
 
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
