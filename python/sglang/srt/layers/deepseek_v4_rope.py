@@ -78,14 +78,10 @@ def precompute_freqs_cis(
     # CUDA fused_rope reads `freqs_cis.real / .imag` as cos/sin directly, so
     # we bake mscale into the complex values here. For typical V4-Flash
     # rope_scaling (factor=16, mscale=1, mscale_all_dim=0) this is ≈ 1.2773.
-    if factor > 1.0:
-        m_num = _yarn_get_mscale(factor, mscale)
-        m_den = _yarn_get_mscale(factor, mscale_all_dim)
-        m = m_num / m_den
-    else:
-        m = 1.0
-    cos = freqs.cos() * m
-    sin = freqs.sin() * m
+    # TEMP for bisect: mscale=1.0 (no cos/sin boost) to compare internal values
+    # with the mscale=1.2773 baseline. Tracks where the 1.27x divergence lives.
+    cos = freqs.cos()
+    sin = freqs.sin()
     freqs_cis = torch.complex(cos, sin)
     return freqs_cis
 
