@@ -454,6 +454,9 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
+        # NOTE: K cache write happens via MQALayer._forward_prepare line 576,
+        # gated on SGLANG_OPT_USE_OVERLAP_STORE_CACHE (default TRUE). With
+        # overlap=True, save_kv_cache=False is passed here so we don't dup-write.
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128 routing — TWO independent gates:
@@ -490,6 +493,21 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
+
+        # DUMP-KREAD-OURS: print K cache values at slots [0, 256, 257] + page table
+        import torch.distributed as _dist_kr
+        if (layer.layer_id == 0 and _dist_kr.is_initialized() and _dist_kr.get_rank() == 0):
+            try:
+                mode = "PFL" if forward_batch.forward_mode.is_prefill() else ("DEC" if forward_batch.forward_mode.is_decode() else "EXT")
+                kv_flat = ori_kv.flatten(0, 1).float()  # (num_pages*page_size, 1, dim)
+                pt = fm.swa_page_table.flatten().tolist()[:8] if hasattr(fm, "swa_page_table") and fm.swa_page_table is not None else "no_pt"
+                print(f"[DUMP_KREAD L0 {mode}] page_table[:8]={pt}", flush=True)
+                print(f"[DUMP_KREAD L0 {mode}] kv@slot0[0,:6]={kv_flat[0, 0, :6].tolist()}", flush=True)
+                print(f"[DUMP_KREAD L0 {mode}] kv@slot256[0,:6]={kv_flat[256, 0, :6].tolist()}", flush=True)
+                print(f"[DUMP_KREAD L0 {mode}] kv@slot257[0,:6]={kv_flat[257, 0, :6].tolist()}", flush=True)
+                print(f"[DUMP_KREAD L0 {mode}] q[0,0,:6]={q.detach().float()[0, 0, :6].tolist()}", flush=True)
+            except Exception as _kre:
+                print(f"[DUMP_KREAD L0 ERROR] {_kre!r}", flush=True)
 
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
