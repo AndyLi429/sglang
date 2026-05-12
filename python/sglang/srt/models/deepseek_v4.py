@@ -413,7 +413,17 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
+        if _is_npu:
+            # iforgetmyname/dsv4_release uses torch_npu.npu_rms_norm with an
+            # all-ones dummy weight (q_b_norm_dummy_weight) for this second
+            # RMS post wq_b. Our triton rms_normalize_triton produces ULP-
+            # different bf16 results vs the NPU-native kernel; with 43
+            # layers of cascade, that 1-2% per-layer drift flips argmax in
+            # tokens 5+. Match exact iforgetmyname behavior here.
+            import torch_npu
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+        elif self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
             q = rms_normalize_triton(q, self.eps)
@@ -538,7 +548,17 @@ class MQALayer(nn.Module):
         q_lora = q
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
+        if _is_npu:
+            # iforgetmyname/dsv4_release uses torch_npu.npu_rms_norm with an
+            # all-ones dummy weight (q_b_norm_dummy_weight) for this second
+            # RMS post wq_b. Our triton rms_normalize_triton produces ULP-
+            # different bf16 results vs the NPU-native kernel; with 43
+            # layers of cascade, that 1-2% per-layer drift flips argmax in
+            # tokens 5+. Match exact iforgetmyname behavior here.
+            import torch_npu
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+        elif self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
             q = rms_normalize_triton(q, self.eps)
