@@ -243,9 +243,14 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
 
-        # SWA page table — already populated by AscendAttnBackend when the
-        # model is hybrid-SWA. Alias it under the name forward_sparse uses.
-        fm.swa_page_table = getattr(fm, "block_tables_swa", None) or fm.block_tables
+        # SWA page table -- populated by AscendAttnBackend when the model is
+        # hybrid-SWA, else None. Aliased under the name forward_sparse uses.
+        # Use explicit `is not None` check (not `or`) because
+        # `bool(multi-element tensor)` raises.
+        block_tables_swa = getattr(fm, "block_tables_swa", None)
+        fm.swa_page_table = (
+            block_tables_swa if block_tables_swa is not None else fm.block_tables
+        )
 
         # actual_seq_lengths_kv defaults to None on main; the V4 metadata
         # kernel needs an int32 device tensor of per-request KV lengths.
@@ -531,34 +536,6 @@ class DeepseekV4AscendAttnBackend(
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
 
-        # Debug guard: cu_seqlens_q[-1] must equal q.shape[0] (tokens in q).
-        # If this fails the kernel slices q out of bounds → garbage attention.
-        # The earlier decode bug (cu_seqlens_q built from KV lengths) would
-        # have surfaced immediately here. Gated by env so prod path is clean.
-        from sglang.srt.environ import envs as _envs_dbg
-        if _envs_dbg.SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG.get():
-            import torch.distributed as _dist_kr
-            if (layer.layer_id == 0 and _dist_kr.is_initialized()
-                    and _dist_kr.get_rank() == 0):
-                try:
-                    cusq = fm.actual_seq_lengths_q_pa
-                    if cusq is not None and int(cusq[-1].item()) != q.shape[0]:
-                        print(
-                            f"[V4_NPU_ASSERT] cu_seqlens_q[-1]={int(cusq[-1].item())} "
-                            f"!= q.shape[0]={q.shape[0]} — kernel will read OOB",
-                            flush=True,
-                        )
-                    mode = ("PFL" if forward_batch.forward_mode.is_prefill()
-                            else "DEC" if forward_batch.forward_mode.is_decode()
-                            else "EXT")
-                    print(
-                        f"[DUMP_KREAD L0 {mode}] q.shape={tuple(q.shape)} "
-                        f"cu_seqlens_q={cusq.tolist() if cusq is not None else None}",
-                        flush=True,
-                    )
-                except Exception as _kre:
-                    print(f"[DUMP_KREAD L0 ERROR] {_kre!r}", flush=True)
-
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
@@ -685,41 +662,6 @@ class DeepseekV4AscendAttnBackend(
             )
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-
-        # Step-5b debug dump: log shapes/ranges for the FIRST call only,
-        # then unset the flag so we don't spam the log. Only fires when
-        # SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG=1 (separate from the routing
-        # flag), so we can disable noise once we know the layout.
-        from sglang.srt.environ import envs as _envs
-        if _envs.SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG.get():
-            cbt = attn_kwargs["cmp_block_table"]
-            sp = attn_kwargs["cmp_sparse_indices"]
-            obt = attn_kwargs["ori_block_table"]
-            ok = attn_kwargs["ori_kv"]
-            ck = attn_kwargs["cmp_kv"]
-            logger.warning(
-                "[V4-NPU-sparse-debug] layer=%d ratio=%d "
-                "q.shape=%s sinks=%s "
-                "ori_kv.shape=%s ori_block_table.shape=%s "
-                "  ori_block_table.range=[%s, %s] "
-                "cmp_kv.shape=%s cmp_block_table.shape=%s "
-                "  cmp_block_table.range=[%s, %s] "
-                "cmp_sparse_indices=%s "
-                "metadata=%s "
-                "cu_seqlens_q=%s seqused_kv=%s",
-                layer.layer_id, compress_ratio,
-                tuple(q.shape), None if attn_sink is None else tuple(attn_sink.shape),
-                tuple(ok.shape), tuple(obt.shape),
-                int(obt.min().item()) if obt.numel() else "(empty)",
-                int(obt.max().item()) if obt.numel() else "(empty)",
-                tuple(ck.shape), tuple(cbt.shape) if cbt is not None else None,
-                int(cbt.min().item()) if (cbt is not None and cbt.numel()) else "(empty)",
-                int(cbt.max().item()) if (cbt is not None and cbt.numel()) else "(empty)",
-                None if sp is None else (tuple(sp.shape), int(sp.min().item()), int(sp.max().item())),
-                metadata,
-                tuple(attn_kwargs["cu_seqlens_q"].shape),
-                tuple(attn_kwargs["seqused_kv"].shape),
-            )
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
