@@ -38,16 +38,22 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-# custom_ops registers torch.ops.custom.npu_* via side-effect on import.
-# It's installed in the cann image at /usr/local/python*/site-packages/custom_ops.
-# Without this import the npu_sparse_attn_sharedkv_metadata op isn't visible
-# the first time we touch torch.ops.custom (lazy namespace population).
+# custom_ops registers torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
+# npu_sparse_attn_sharedkv, npu_quant_lightning_indexer and friends. The
+# V4 ascend backend has no pure-torch fallback for those ops, so if the
+# import fails we must fail fast with a clear message rather than crash
+# later with an opaque AttributeError on torch.ops.custom.<name>.
 try:
     import custom_ops  # noqa: F401
-except ImportError:
-    logging.getLogger(__name__).warning(
-        "custom_ops package not importable — V4 ascend attention will fall back."
-    )
+except ImportError as e:
+    raise ImportError(
+        "DeepSeek-V4 ascend attention backend requires the `custom_ops` "
+        "wheel that ships with the Ascend cann-8.5.0-a3 image (registers "
+        "torch.ops.custom.npu_sparse_attn_sharedkv_*, "
+        "npu_quant_lightning_indexer, npu_hc_pre/post, etc.). The package "
+        "is normally at /usr/local/python*/site-packages/custom_ops. "
+        f"Original ImportError: {e}"
+    ) from e
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
@@ -124,7 +130,7 @@ def _compute_c4_q_npu(
         positions,
     )
     H = _build_hadamard_matrix(c4_indexer.head_dim, torch.float32, q.device)
-    scale = c4_indexer.head_dim ** -0.5
+    scale = c4_indexer.head_dim**-0.5
     q_f32 = q.to(torch.float32)
     q_rotated = torch.matmul(q_f32, H) * scale
     return q_rotated.to(torch.bfloat16)
@@ -166,17 +172,13 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_index_head_dim = getattr(hf, "index_head_dim", 128)
         self._dsv4_compress_ratios = getattr(hf, "compress_ratios", None)
         self._dsv4_has_c4 = (
-            self._dsv4_compress_ratios is not None
-            and 4 in self._dsv4_compress_ratios
+            self._dsv4_compress_ratios is not None and 4 in self._dsv4_compress_ratios
         )
         self._dsv4_has_c128 = (
-            self._dsv4_compress_ratios is not None
-            and 128 in self._dsv4_compress_ratios
+            self._dsv4_compress_ratios is not None and 128 in self._dsv4_compress_ratios
         )
         self._dsv4_sliding_window_size = (
-            cfg.sliding_window_size
-            if cfg.sliding_window_size is not None
-            else 128
+            cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
 
     # ------------------------------------------------------------------
@@ -230,6 +232,7 @@ class DeepseekV4AscendAttnBackend(
         ):
             B = forward_batch.batch_size
             from sglang.srt.utils.common import get_global_server_args
+
             n_draft = get_global_server_args().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
@@ -394,9 +397,7 @@ class DeepseekV4AscendAttnBackend(
             # State page table — translate each (bs, n_pages) raw kv slot to a
             # state-buffer page id. translate_kv_loc_to_compress_state_loc gives
             # the flat state slot; divide by page_size for the page id.
-            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(
-                raw_loc, ratio
-            )
+            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(raw_loc, ratio)
             state_page_2d = (state_loc_2d // self.page_size).to(torch.int32)
 
             # State loc — single state-buffer slot for the new decode token.
@@ -419,9 +420,9 @@ class DeepseekV4AscendAttnBackend(
                 k_seq = (seq_lens.to(torch.int64) // ratio - 1).clamp(min=0)
                 page_seq = (k_seq // self.page_size).to(torch.int64)
                 offset = (k_seq % self.page_size).to(torch.int64)
-                kernel_page = pages_table[
-                    req_pool.to(torch.int64), page_seq
-                ].to(torch.int64)
+                kernel_page = pages_table[req_pool.to(torch.int64), page_seq].to(
+                    torch.int64
+                )
                 compress_out_loc = (kernel_page * self.page_size + offset).to(
                     torch.int32
                 )
@@ -498,7 +499,9 @@ class DeepseekV4AscendAttnBackend(
         # the previous code silently dropped the write — decode then read an
         # unwritten swa_kv_pool and produced garbage. Always respect the flag.
         if save_kv_cache:
-            self.store_cache(layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch)
+            self.store_cache(
+                layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
+            )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128 routing — TWO independent gates:
@@ -580,14 +583,16 @@ class DeepseekV4AscendAttnBackend(
         cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
 
         if metadata is None or cmp_kv is None:
-            # No metadata or no compress pool for this layer — likely means
-            # the layer is dense (ratio 0/1) but the model dispatched here
-            # by mistake, or the model has fewer compressed layers than the
-            # config implies. Return zeros to avoid crashing the forward.
-            T = q.shape[0]
-            n_heads = q.shape[1] if q.ndim >= 2 else 1
-            head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
-            return q.new_zeros((T, n_heads, head_dim_v))
+            raise RuntimeError(
+                "DeepseekV4AscendAttnBackend._forward_compressed: missing "
+                f"required state for layer_id={layer.layer_id} "
+                f"compress_ratio={compress_ratio}. "
+                f"metadata({'present' if metadata is not None else 'MISSING'}), "
+                f"cmp_kv({'present' if cmp_kv is not None else 'MISSING'}). "
+                f"Available kernel_metadata keys: {list(fm.kernel_metadata.keys())}. "
+                "This indicates a configuration / pool-init bug — silently "
+                "returning zeros would corrupt model output."
+            )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
@@ -657,9 +662,7 @@ class DeepseekV4AscendAttnBackend(
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
                 fm.c4_topk_indices = topk
-            attn_kwargs["cmp_sparse_indices"] = topk.view(
-                -1, 1, topk.shape[-1]
-            )
+            attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)

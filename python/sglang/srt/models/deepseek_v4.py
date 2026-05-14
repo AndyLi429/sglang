@@ -105,8 +105,10 @@ def _v4_rope_inplace_npu(
     fallback some prompts (those with marginal argmax decisions) flip
     tokens vs iforgetmyname.
     """
-    if _is_npu and hasattr(torch.ops, "custom") and hasattr(
-        torch.ops.custom, "inplace_partial_rotary_mul"
+    if (
+        _is_npu
+        and hasattr(torch.ops, "custom")
+        and hasattr(torch.ops.custom, "inplace_partial_rotary_mul")
     ):
         # Build cos/sin caches in the layout the kernel expects:
         # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
@@ -124,7 +126,9 @@ def _v4_rope_inplace_npu(
         # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
         q_view = q_rope.unsqueeze(1)
         torch.ops.custom.inplace_partial_rotary_mul(
-            q_view, cos4, sin4,
+            q_view,
+            cos4,
+            sin4,
             rotary_mode="interleave",
             partial_slice=[0, rope_dim],
         )
@@ -134,7 +138,9 @@ def _v4_rope_inplace_npu(
             else:
                 kv_view = kv_rope.view(-1, 1, 1, rope_dim)
             torch.ops.custom.inplace_partial_rotary_mul(
-                kv_view, cos4, sin4,
+                kv_view,
+                cos4,
+                sin4,
                 rotary_mode="interleave",
                 partial_slice=[0, rope_dim],
             )
@@ -272,9 +278,12 @@ class MQALayer(nn.Module):
         # addition to the {0, 4, 128} the original V4 model ships. Treat 0
         # and 1 the same throughout: neither has a Compressor/C4Indexer and
         # neither uses the compress_rope_theta / yarn original_seq_len.
-        assert compress_ratio in (0, 1, 4, 128), (
-            f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
-        )
+        assert compress_ratio in (
+            0,
+            1,
+            4,
+            128,
+        ), f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
         self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
@@ -465,6 +474,7 @@ class MQALayer(nn.Module):
             # layers of cascade, that 1-2% per-layer drift flips argmax in
             # tokens 5+. Match exact iforgetmyname behavior here.
             import torch_npu
+
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:
@@ -600,6 +610,7 @@ class MQALayer(nn.Module):
             # layers of cascade, that 1-2% per-layer drift flips argmax in
             # tokens 5+. Match exact iforgetmyname behavior here.
             import torch_npu
+
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:
@@ -814,7 +825,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: Optional[nn.Module] = None,
     ):
+        """If *norm* is given and the TileLang path is active, the returned
+        hidden_states are already post-norm (the norm is fused into the kernel)."""
+
         @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
@@ -832,7 +847,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             comb = torch.empty(
                 (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
             )
-            return y, post, comb
+            return y, post, comb, False
 
         # NPU fast path: the cann8.5.0-a3 image ships a `custom_ops` wheel
         # that registers torch.ops.custom.npu_hc_pre — a fused RMS-norm +
@@ -858,10 +873,18 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.rms_norm_eps,
                 hc_eps=self.hc_eps,
             )
-            return y.to(dtype), post, comb
+            # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
+            # not fold input_layernorm. Return norm_fused=False so the caller
+            # applies the layernorm itself, matching the deepgemm/torch paths.
+            return y.to(dtype), post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
+
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
 
             post, comb, y = mhc_pre(
                 residual=x,
@@ -873,8 +896,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_sinkhorn_eps=self.hc_eps,
                 hc_post_mult_value=2.0,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
             )
-            return y, post.squeeze(-1), comb
+            return y, post.squeeze(-1), comb, norm is not None
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
@@ -904,7 +928,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
         )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1)
+        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
         self,
@@ -954,10 +978,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
         )
-        hidden_states = self.input_layernorm(hidden_states)
+        if not norm_fused:
+            hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             x=hidden_states,
@@ -967,10 +996,15 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
-        hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if not norm_fused:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1079,6 +1113,17 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        if x.numel() > 0:
+            from sglang.srt.layers.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)

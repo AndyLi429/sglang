@@ -18,7 +18,9 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import ceil_div
+from sglang.srt.utils import ceil_div, is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         # That's the shape npu_sparse_attn_sharedkv expects with
         # layout_kv="PA_ND". The CUDA fp8-packed-bytes layout is preserved
         # for non-NPU paths.
-        is_npu_bf16 = self.store_dtype == torch.bfloat16
+        is_npu_bf16 = _is_npu and self.store_dtype == torch.bfloat16
         if is_npu_bf16:
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.kv_cache_total_dim = kv_dim
@@ -329,12 +331,11 @@ class DeepSeekV4IndexerPool(KVCache):
         # ONLY allocate when SGLANG_DSV4_NPU_REAL_COMPRESSOR is on — these
         # buffers add ~570 MB total which would otherwise eat into the KV
         # pool budget for Tier 1 baseline launches.
-        from sglang.srt.utils import is_npu as _is_npu_check
         from sglang.srt.environ import envs as _envs
+        from sglang.srt.utils import is_npu as _is_npu_check
 
         self._npu_buffers_present = (
-            _is_npu_check()
-            and _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
+            _is_npu_check() and _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
         )
         if self._npu_buffers_present:
             # NPU buffer uses GLOBAL kernel_page_size (= 256), not the
@@ -342,7 +343,9 @@ class DeepSeekV4IndexerPool(KVCache):
             # makes cmp_kv.shape[1] match ori_kv.shape[1] = global page_size,
             # which aclnnSparseAttnSharedkv / npu_quant_lightning_indexer
             # require. num_pages is recomputed for the kernel page size.
-            npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
+            npu_num_pages = (
+                self.size + self.kernel_page_size + 1
+            ) // self.kernel_page_size
             self.npu_index_k_buffer = [
                 torch.zeros(
                     npu_num_pages,
@@ -561,8 +564,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_n_pages_kernel = c4_size // page_size  # kernel-view num pages
         c128_n_pages_kernel = c128_size // page_size
         # Cap per-req max pages so all max_num_reqs reqs fit; round down.
+        # NOTE: this is an *average* slab size. A single request whose
+        # compressed token count exceeds max_pages_c{N}_per_req * page_size
+        # will overflow its slab and corrupt or OOB-read neighbour slabs.
+        # This is safe in the current sizing (c4_size / c128_size are
+        # provisioned so that even at max concurrency a max-context req
+        # fits), but low-concurrency long-context workloads (e.g.
+        # max_num_reqs=1 with context_length close to swa_size) need a
+        # real per-req allocator. Logged below + asserted at write time
+        # so the failure mode is loud rather than silent corruption.
         self.max_pages_c4_per_req = max(1, c4_n_pages_kernel // max_num_reqs)
         self.max_pages_c128_per_req = max(1, c128_n_pages_kernel // max_num_reqs)
+        logger.info(
+            "DeepSeekV4TokenToKVPool per-req compressed-slab caps: "
+            f"c4={self.max_pages_c4_per_req} pages "
+            f"(={self.max_pages_c4_per_req * page_size} c4 tokens, "
+            f"≈{self.max_pages_c4_per_req * page_size * 4} raw tokens), "
+            f"c128={self.max_pages_c128_per_req} pages "
+            f"(={self.max_pages_c128_per_req * page_size} c128 tokens, "
+            f"≈{self.max_pages_c128_per_req * page_size * 128} raw tokens). "
+            "A single request exceeding these limits will overflow its slab."
+        )
         # req_to_token_c{N}_pages[req_idx, k] = kernel-view page index in
         # c{N}_kv_pool for the k-th compressed-token-page of request `req_idx`.
         self.req_to_token_c4_pages = (
@@ -571,9 +593,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             .to(device)
         )
         self.req_to_token_c128_pages = (
-            torch.arange(
-                max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32
-            )
+            torch.arange(max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32)
             .view(max_num_reqs, self.max_pages_c128_per_req)
             .to(device)
         )
@@ -1058,12 +1078,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 # output (kv: int8 [T, dim], kv_scale: float16 [T, 1]).
                 import torch_npu  # local: NPU only
 
-                assert self.c4_indexer_kv_pool.npu_index_k_buffer is not None, (
-                    "NPU index buffers not allocated — pool was init'd on CUDA?"
-                )
-                k_buf = self.c4_indexer_kv_pool.npu_index_k_buffer[
-                    compress_layer_id
-                ]
+                assert (
+                    self.c4_indexer_kv_pool.npu_index_k_buffer is not None
+                ), "NPU index buffers not allocated — pool was init'd on CUDA?"
+                k_buf = self.c4_indexer_kv_pool.npu_index_k_buffer[compress_layer_id]
                 scale_buf = self.c4_indexer_kv_pool.npu_index_scale_buffer[
                     compress_layer_id
                 ]
@@ -1084,17 +1102,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     )
                 return
             if kv_scale is None:
-                self.c4_indexer_kv_pool.set_index_fused(
-                    compress_layer_id, loc, kv
-                )
+                self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, kv)
                 return
             self.c4_indexer_kv_pool.set_index_k_scale_buffer(
                 compress_layer_id, loc, kv, kv_scale
             )
             return
-        compress_pool = (
-            self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
-        )
+        compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         if device_type == "npu":
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`
@@ -1136,9 +1150,5 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert from_indexer, "only indexer compress pool has dequant scale"
         compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
         if self.c4_indexer_kv_pool.npu_index_scale_buffer is not None:
-            return self.c4_indexer_kv_pool.npu_index_scale_buffer[
-                compress_layer_id
-            ]
-        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(
-            compress_layer_id
-        )
+            return self.c4_indexer_kv_pool.npu_index_scale_buffer[compress_layer_id]
+        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
