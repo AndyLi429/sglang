@@ -53,9 +53,13 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnB
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_prefill_cp_round_robin_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
+    nsa_cp_round_robin_split_q_seqs,
     nsa_use_prefill_cp,
 )
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -204,18 +208,73 @@ class DeepseekV4AscendAttnBackend(
         # That is the V4-NPU root cause of token-1+ divergence — kernel
         # metadata says q has e.g. 257 tokens but q tensor only has 1.
         device = forward_batch.seq_lens.device
+        # round-robin CP rewrites each rank's per-request Q length to
+        # `ceil(extend_seq_len / cp_size)` (with the remainder distributed by
+        # cp_rank). After the rewrite, len(q) on this rank equals
+        # sum(round_robin_q_lens), so the kernel's cu_seqlens_q MUST be derived
+        # from the rewritten lengths — using the original extend_seq_lens_cpu
+        # here would point the kernel past the end of q. Mirrors what the
+        # generic NSA backend does at nsa_backend.py:550-566.
+        rr_active = (
+            forward_batch.forward_mode.is_extend()
+            and can_nsa_prefill_cp_round_robin_split(forward_batch)
+        )
         if forward_batch.forward_mode.is_extend():
-            seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            if isinstance(seq_lens_cpu, list):
-                seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
+            if rr_active:
+                extend_cpu_raw = forward_batch.extend_seq_lens_cpu
+                if isinstance(extend_cpu_raw, list):
+                    extend_cpu_t = torch.tensor(extend_cpu_raw, dtype=torch.int32)
+                else:
+                    extend_cpu_t = extend_cpu_raw.int()
+                extend_dev = (
+                    forward_batch.extend_seq_lens.to(torch.int32)
+                    if forward_batch.extend_seq_lens is not None
+                    else extend_cpu_t.to(device)
+                )
+                rr_q_lens_cpu, rr_q_lens, rr_bs_idx_cpu, rr_bs_idx = (
+                    nsa_cp_round_robin_split_q_seqs(extend_cpu_t.tolist(), extend_dev)
+                )
+                # Stash for downstream paths (forward_compressed / indexer) that
+                # need to know which batch indices survived this rank and what
+                # the post-split lengths are.
+                fm.rr_q_lens_cpu = rr_q_lens_cpu
+                fm.rr_q_lens = rr_q_lens
+                fm.rr_bs_idx_cpu = rr_bs_idx_cpu
+                fm.rr_bs_idx = rr_bs_idx
+                if len(rr_q_lens_cpu) == 0:
+                    # This rank owns zero queries (e.g. very short seq with
+                    # cp_size > seq_len). Build empty metadata; the model's
+                    # downstream all-gather is responsible for reconstructing.
+                    fm.actual_seq_lengths_q = torch.zeros(
+                        0, dtype=torch.int32, device=device
+                    )
+                    fm.actual_seq_lengths_q_pa = torch.zeros(
+                        1, dtype=torch.int32, device=device
+                    )
+                else:
+                    actual_q = (
+                        torch.tensor(rr_q_lens_cpu, dtype=torch.int32)
+                        .cumsum(dim=0)
+                        .int()
+                        .to(device)
+                    )
+                    fm.actual_seq_lengths_q = actual_q
+                    fm.actual_seq_lengths_q_pa = torch.cat(
+                        [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
+                        dim=0,
+                    )
             else:
-                seq_lens_cpu = seq_lens_cpu.int()
-            actual_q = torch.cumsum(seq_lens_cpu, dim=0).int().to(device)
-            fm.actual_seq_lengths_q = actual_q
-            fm.actual_seq_lengths_q_pa = torch.cat(
-                [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
-                dim=0,
-            )
+                seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if isinstance(seq_lens_cpu, list):
+                    seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
+                else:
+                    seq_lens_cpu = seq_lens_cpu.int()
+                actual_q = torch.cumsum(seq_lens_cpu, dim=0).int().to(device)
+                fm.actual_seq_lengths_q = actual_q
+                fm.actual_seq_lengths_q_pa = torch.cat(
+                    [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
+                    dim=0,
+                )
         elif forward_batch.forward_mode.is_decode():
             B = forward_batch.batch_size
             fm.actual_seq_lengths_q = torch.arange(
@@ -537,8 +596,22 @@ class DeepseekV4AscendAttnBackend(
             is_nsa_enable_prefill_cp()
             and nsa_use_prefill_cp(forward_batch)
             and forward_batch.attn_cp_metadata is not None
+            and forward_batch.attn_cp_metadata.actual_seq_q_prev >= 0
         ):
             return self._forward_dense_cp(q, layer, forward_batch, attn_sink)
+        # Round-robin CP dense path: rebuild a contiguous full-sequence KV
+        # buffer (prefix + cp-all-gathered extend) and call the kernel with a
+        # trivial temp page_table that just walks 0..num_pages-1. Each local
+        # round-robin query becomes its own 1-query "batch" so the kernel's
+        # per-batch seqused_kv encodes the correct global causal cutoff for
+        # that query — without this, the per-batch (single-value) kv_len
+        # would force every local query to see the same KV horizon.
+        if (
+            is_nsa_enable_prefill_cp()
+            and nsa_use_prefill_cp(forward_batch)
+            and is_nsa_prefill_cp_round_robin_split()
+        ):
+            return self._forward_dense_round_robin(q, layer, forward_batch, attn_sink)
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
@@ -660,6 +733,311 @@ class DeepseekV4AscendAttnBackend(
         out_next = _attn_half(q_next, cp_meta.actual_seq_q_next, kv_next)
         return torch.cat([out_prev, out_next], dim=0)
 
+    # ------------------------------------------------------------------
+    # Round-robin CP helpers — Plan A: in-place KV gather inside the
+    # backend. Each rank fetches its own extend KV from the local pool,
+    # all-gathers + reinterleaves into global token order, prepends the
+    # cached prefix (same on all ranks), and hands the kernel a fresh
+    # contiguous (num_pages, page_size, 1, dim) buffer plus a trivial
+    # page_table = [[0, 1, ..., num_pages-1]]. No KV pool surgery needed.
+    # ------------------------------------------------------------------
+
+    def _dsv4_npu_gather_full_kv_round_robin(
+        self,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+    ) -> tuple:
+        """Build a (num_pages, page_size, 1, dim) global-order KV buffer and
+        its trivial page_table for a round-robin-CP prefill step.
+
+        Returns (full_kv_paged, page_table, full_seq_len, num_pages).
+
+        Constraints (matches the rest of NSA CP):
+          - batch_size == 1
+          - prefix slots on every rank hold identical KV content (radix cache
+            hit, or zero prefix)
+          - this rank wrote its round-robin-local extend KV at
+            forward_batch.out_cache_loc in pool.get_swa_buffer(layer_id)
+        """
+        from sglang.srt.layers.dp_attention import get_attention_cp_size
+        from sglang.srt.utils.common import get_current_device_stream_fast
+
+        pool = forward_batch.token_to_kv_pool
+        cp_size = get_attention_cp_size()
+
+        # Rank-local extend KV — flat-indexed by out_cache_loc.
+        local_extend_kv = pool.get_swa_buffer(
+            layer.layer_id, forward_batch.out_cache_loc
+        )  # (T_local, 1, dim)
+
+        # All-gather + reinterleave to global token order.
+        gathered_extend_kv = cp_all_gather_rerange_kv_cache(
+            local_extend_kv,
+            cp_size,
+            forward_batch,
+            get_current_device_stream_fast(),
+        )  # (extend_total, 1, dim) — global order
+
+        # Prefix is identical on every rank (radix cache hit); fetch locally.
+        extend_total_cpu = forward_batch.extend_seq_lens_cpu
+        extend_total = (
+            sum(extend_total_cpu)
+            if isinstance(extend_total_cpu, list)
+            else int(extend_total_cpu.sum().item())
+        )
+        full_seq_len = int(forward_batch.seq_lens_cpu[0].item())
+        prefix_len = full_seq_len - extend_total
+
+        if prefix_len > 0:
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
+            req_idx = forward_batch.req_pool_indices[0]
+            prefix_slots = req_to_token[req_idx, :prefix_len]
+            prefix_kv = pool.get_swa_buffer(layer.layer_id, prefix_slots)
+            full_kv = torch.cat([prefix_kv, gathered_extend_kv], dim=0)
+        else:
+            full_kv = gathered_extend_kv
+
+        # Pad to page-aligned and reshape to PA_ND.
+        page_size = pool.page_size
+        num_pages = (full_seq_len + page_size - 1) // page_size
+        padded = num_pages * page_size
+        pad_n = padded - full_kv.shape[0]
+        if pad_n > 0:
+            pad_tail = full_kv.new_zeros(pad_n, *full_kv.shape[1:])
+            full_kv = torch.cat([full_kv, pad_tail], dim=0)
+        full_kv_paged = full_kv.view(num_pages, page_size, *full_kv.shape[1:])
+
+        # Trivial page_table.
+        page_table = torch.arange(
+            num_pages, dtype=torch.int32, device=full_kv.device
+        ).unsqueeze(0)
+        return full_kv_paged, page_table, full_seq_len, num_pages
+
+    def _forward_dense_round_robin(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Dense (ratio=1) forward under round-robin CP.
+
+        Treats each rank-local query as its own 1-query "batch" so the
+        per-batch seqused_kv encodes the correct global causal cutoff:
+        local query at rank-local index i corresponds to global position
+        prefix_len + cp_rank + i*cp_size, and its valid KV horizon is
+        prefix_len + cp_rank + i*cp_size + 1 tokens.
+        """
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_rank,
+            get_attention_cp_size,
+        )
+
+        fm = self.forward_metadata
+        device = q.device
+        cp_size = get_attention_cp_size()
+        cp_rank = get_attention_cp_rank()
+
+        full_kv_paged, page_table, full_seq_len, _ = (
+            self._dsv4_npu_gather_full_kv_round_robin(layer, forward_batch)
+        )
+
+        # If this rank owns zero queries (very short seqs), short-circuit.
+        T_local = q.shape[0]
+        if T_local == 0:
+            n_heads = q.shape[1] if q.ndim >= 2 else 1
+            head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
+            return q.new_zeros((0, n_heads, head_dim_v))
+
+        extend_total_cpu = forward_batch.extend_seq_lens_cpu
+        extend_total = (
+            sum(extend_total_cpu)
+            if isinstance(extend_total_cpu, list)
+            else int(extend_total_cpu.sum().item())
+        )
+        prefix_len = full_seq_len - extend_total
+
+        # Per-query KV horizons (causal): each local idx i → global pos
+        #   gp(i) = prefix_len + cp_rank + i * cp_size
+        # KV horizon = gp(i) + 1 tokens.
+        local_idx = torch.arange(T_local, dtype=torch.int64, device=device)
+        global_pos = prefix_len + cp_rank + local_idx * cp_size
+        per_q_kv_len = (global_pos + 1).to(torch.int32)
+
+        # cu_seqlens_q for T_local 1-query batches: [0, 1, 2, ..., T_local].
+        cu_q = torch.arange(0, T_local + 1, dtype=torch.int32, device=device)
+
+        # Per-call kernel metadata — bs = T_local, num_heads/head_dim
+        # mirror the regular c1a metadata. Cache by T_local so we don't
+        # rebuild across layers within the same forward step.
+        if not hasattr(fm, "_cp_rr_c1a_cache"):
+            fm._cp_rr_c1a_cache = {}
+        meta_key = (T_local, full_seq_len)
+        if meta_key not in fm._cp_rr_c1a_cache:
+            fm._cp_rr_c1a_cache[meta_key] = (
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                    cu_seqlens_q=cu_q,
+                    seqused_kv=per_q_kv_len,
+                    cmp_ratio=1,
+                    ori_mask_mode=4,
+                    cmp_mask_mode=3,
+                    ori_win_left=self._dsv4_sliding_window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    batch_size=T_local,
+                    num_heads_q=self._dsv4_q_head_num,
+                    num_heads_kv=self._dsv4_kv_head_num,
+                    head_dim=self._dsv4_head_dim,
+                    has_ori_kv=True,
+                    has_cmp_kv=False,
+                )
+            )
+        kernel_meta = fm._cp_rr_c1a_cache[meta_key]
+
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
+            cu_seqlens_q=cu_q,
+            seqused_kv=per_q_kv_len,
+            ori_mask_mode=4,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q,
+            ori_kv=full_kv_paged,
+            ori_block_table=page_table.expand(T_local, -1).contiguous(),
+            sinks=attn_sink,
+            metadata=kernel_meta,
+            softmax_scale=layer.scaling,
+        )
+        return out
+
+    def _forward_compressed_round_robin(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """Compressed (ratio=4 / ratio=128) forward under round-robin CP.
+
+        Scope note: cmp_kv is currently produced by a stubbed compressor
+        write path (see _forward_compressed docstring), so its contribution
+        to the output is zero in the current implementation. This
+        round-robin variant therefore wires the ori_kv (SWA) full-gather
+        identically to _forward_dense_round_robin and passes a zero cmp_kv
+        with cmp_sparse_indices=None, matching the non-CP compressed
+        kernel call shape contract. Indexer-side all-gather for proper
+        sparse top-k under CP is a follow-up — for now this returns the
+        same value as the rank-replicated compressed path because cmp_kv
+        is zero on every rank.
+        """
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_rank,
+            get_attention_cp_size,
+        )
+
+        fm = self.forward_metadata
+        pool = forward_batch.token_to_kv_pool
+        device = q.device
+        cp_size = get_attention_cp_size()
+        cp_rank = get_attention_cp_rank()
+
+        # Compressed buffer for this layer — used only for its dtype / dim
+        # info to construct a matching zero buffer for the kernel. The
+        # real values are zero anyway under the current compressor stub.
+        cmp_kv_real = pool.get_compress_buffer(layer.layer_id, False)
+        if cmp_kv_real is None:
+            # Dense layer dispatched here by mistake; mirror the regular
+            # _forward_compressed fallback.
+            T = q.shape[0]
+            n_heads = q.shape[1] if q.ndim >= 2 else 1
+            head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
+            return q.new_zeros((T, n_heads, head_dim_v))
+
+        full_kv_paged, page_table, full_seq_len, _ = (
+            self._dsv4_npu_gather_full_kv_round_robin(layer, forward_batch)
+        )
+
+        T_local = q.shape[0]
+        if T_local == 0:
+            n_heads = q.shape[1] if q.ndim >= 2 else 1
+            head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
+            return q.new_zeros((0, n_heads, head_dim_v))
+
+        extend_total_cpu = forward_batch.extend_seq_lens_cpu
+        extend_total = (
+            sum(extend_total_cpu)
+            if isinstance(extend_total_cpu, list)
+            else int(extend_total_cpu.sum().item())
+        )
+        prefix_len = full_seq_len - extend_total
+
+        local_idx = torch.arange(T_local, dtype=torch.int64, device=device)
+        global_pos = prefix_len + cp_rank + local_idx * cp_size
+        per_q_kv_len = (global_pos + 1).to(torch.int32)
+        cu_q = torch.arange(0, T_local + 1, dtype=torch.int32, device=device)
+
+        # cmp_kv: build a zero buffer that shares page_size with ori_kv
+        # (the kernel requires this). Shape (num_pages, page_size, 1, dim).
+        ori_page_size = full_kv_paged.shape[1]
+        num_pages = full_kv_paged.shape[0]
+        cmp_dim = cmp_kv_real.shape[-1] if cmp_kv_real.ndim >= 1 else 1
+        cmp_kv_zero = q.new_zeros(
+            num_pages, ori_page_size, 1, cmp_dim, dtype=cmp_kv_real.dtype
+        )
+
+        # Per-call kernel metadata (cached by T_local + full_seq_len).
+        if not hasattr(fm, "_cp_rr_compressed_meta_cache"):
+            fm._cp_rr_compressed_meta_cache = {}
+        meta_key = (compress_ratio, T_local, full_seq_len)
+        if meta_key not in fm._cp_rr_compressed_meta_cache:
+            fm._cp_rr_compressed_meta_cache[meta_key] = (
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                    cu_seqlens_q=cu_q,
+                    seqused_kv=per_q_kv_len,
+                    cmp_ratio=compress_ratio,
+                    ori_mask_mode=4,
+                    cmp_mask_mode=3,
+                    ori_win_left=self._dsv4_sliding_window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    batch_size=T_local,
+                    num_heads_q=self._dsv4_q_head_num,
+                    num_heads_kv=self._dsv4_kv_head_num,
+                    head_dim=self._dsv4_head_dim,
+                    has_ori_kv=True,
+                    has_cmp_kv=True,
+                    cmp_topk=(self._dsv4_index_topk if compress_ratio == 4 else None),
+                )
+            )
+        kernel_meta = fm._cp_rr_compressed_meta_cache[meta_key]
+
+        attn_kwargs = dict(
+            cu_seqlens_q=cu_q,
+            seqused_kv=per_q_kv_len,
+            ori_mask_mode=4,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q,
+            ori_kv=full_kv_paged,
+            ori_block_table=page_table.expand(T_local, -1).contiguous(),
+            sinks=attn_sink,
+            metadata=kernel_meta,
+            softmax_scale=layer.scaling,
+            cmp_ratio=compress_ratio,
+            cmp_mask_mode=3,
+            cmp_kv=cmp_kv_zero,
+            cmp_block_table=page_table.expand(T_local, -1).contiguous(),
+            cmp_sparse_indices=None,
+        )
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        return out
+
     def _forward_compressed(
         self,
         q: torch.Tensor,
@@ -680,6 +1058,15 @@ class DeepseekV4AscendAttnBackend(
         the kernel-call shape/dtype contract end-to-end before we land the
         compressor + indexer compute paths.
         """
+        if (
+            is_nsa_enable_prefill_cp()
+            and nsa_use_prefill_cp(forward_batch)
+            and is_nsa_prefill_cp_round_robin_split()
+        ):
+            return self._forward_compressed_round_robin(
+                q, layer, forward_batch, attn_sink, compress_ratio
+            )
+
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")

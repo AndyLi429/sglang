@@ -887,7 +887,8 @@ def _mask_topk_ids_padded_region(
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        mask = indices[:, None] < num_token_non_padded
+        topk_ids.copy_(torch.where(mask, topk_ids, topk_ids.new_full((), -1)))
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

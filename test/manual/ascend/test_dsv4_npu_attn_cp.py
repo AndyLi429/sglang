@@ -117,7 +117,9 @@ _SERVER_ENV = {
 _SERVER_ARGS = [
     "--page-size", "128",
     "--tp-size", "8",
-    "--enable_nsa_prefill_context_parallel",
+    "--enable-nsa-prefill-context-parallel",
+    "--nsa-prefill-cp-mode",
+    "--round-robin-split",
     "--attn-cp-size", "2",
     "--trust-remote-code",
     "--attention-backend", "ascend",

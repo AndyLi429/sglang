@@ -5,8 +5,13 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
-from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    _mask_topk_ids_padded_region,
+    select_experts,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -82,6 +87,19 @@ def fused_topk_npu(
 
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+
+    if get_bool_env_var("SGLANG_DEBUG_NPU_CP_TOPK"):
+        topk_ids_cpu = topk_ids.detach().cpu()
+        print(
+            f"[NPU_TOPK_DEBUG] layer={layer_id} shape={tuple(topk_ids.shape)} "
+            f"num_token_non_padded={None if num_token_non_padded is None else int(num_token_non_padded.item())} "
+            f"min={int(topk_ids_cpu.min().item()) if topk_ids_cpu.numel() else None} "
+            f"max={int(topk_ids_cpu.max().item()) if topk_ids_cpu.numel() else None}",
+            flush=True,
+        )
+
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     if (cap := get_global_experts_capturer()) is not None:
         cap.capture(

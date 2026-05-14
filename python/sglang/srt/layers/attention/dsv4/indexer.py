@@ -729,10 +729,8 @@ class C4Indexer(nn.Module):
             kv_indices = _get_kv_indices(
                 forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
             )
-            kv_cache_value = (
-                forward_batch.token_to_kv_pool.get_compress_buffer(
-                    self.layer_id, True, kv_indices
-                )
+            kv_cache_value = forward_batch.token_to_kv_pool.get_compress_buffer(
+                self.layer_id, True, kv_indices
             )
             if is_prefill:
                 start = 0 if i == 0 else int(end_pos[i - 1])
@@ -769,9 +767,9 @@ class C4Indexer(nn.Module):
                     q[i : i + 1, ...],
                     kv_cache_value.squeeze(1),
                 )
-                index_score = (
-                    index_score.relu_() * weights.unsqueeze(-1)[i]
-                ).sum(dim=1)
+                index_score = (index_score.relu_() * weights.unsqueeze(-1)[i]).sum(
+                    dim=1
+                )
                 topk_idx = index_score.topk(
                     min(self.index_topk, seq_i // ratio), dim=-1
                 )[1]
@@ -822,6 +820,7 @@ class C4Indexer(nn.Module):
         )
         if envs.SGLANG_DSV4_NPU_SPARSE_ATTN_DEBUG.get():
             import logging as _logging
+
             _lg = _logging.getLogger("v4-indexer-dbg")
             asq = kwargs["actual_seq_lengths_query"]
             ask = kwargs["actual_seq_lengths_key"]
@@ -838,14 +837,20 @@ class C4Indexer(nn.Module):
                 "block_table.shape=%s bt.dtype=%s bt.range=[%s,%s] "
                 "index_topk=%d",
                 self.layer_id,
-                tuple(kwargs["query"].shape), kwargs["query"].dtype,
-                tuple(kwargs["key"].shape), kwargs["key"].dtype,
-                tuple(kwargs["key_dequant_scale"].shape), kwargs["key_dequant_scale"].dtype,
+                tuple(kwargs["query"].shape),
+                kwargs["query"].dtype,
+                tuple(kwargs["key"].shape),
+                kwargs["key"].dtype,
+                tuple(kwargs["key_dequant_scale"].shape),
+                kwargs["key_dequant_scale"].dtype,
                 tuple(kwargs["weights"].shape),
                 tuple(kwargs["query_dequant_scale"].shape),
-                asq.tolist() if asq.numel() < 32 else "(too long)", asq.dtype,
-                ask.tolist() if ask.numel() < 32 else "(too long)", ask.dtype,
-                tuple(bt.shape), bt.dtype,
+                asq.tolist() if asq.numel() < 32 else "(too long)",
+                asq.dtype,
+                ask.tolist() if ask.numel() < 32 else "(too long)",
+                ask.dtype,
+                tuple(bt.shape),
+                bt.dtype,
                 int(bt.min().item()) if bt.numel() else "(empty)",
                 int(bt.max().item()) if bt.numel() else "(empty)",
                 self.index_topk,

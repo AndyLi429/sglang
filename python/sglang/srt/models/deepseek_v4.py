@@ -105,8 +105,10 @@ def _v4_rope_inplace_npu(
     fallback some prompts (those with marginal argmax decisions) flip
     tokens vs iforgetmyname.
     """
-    if _is_npu and hasattr(torch.ops, "custom") and hasattr(
-        torch.ops.custom, "inplace_partial_rotary_mul"
+    if (
+        _is_npu
+        and hasattr(torch.ops, "custom")
+        and hasattr(torch.ops.custom, "inplace_partial_rotary_mul")
     ):
         # Build cos/sin caches in the layout the kernel expects:
         # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
@@ -115,8 +117,18 @@ def _v4_rope_inplace_npu(
         sin_half = freqs_cis.imag[positions]
         if inverse:
             sin_half = -sin_half
-        cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-        sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+        cos_full = (
+            cos_half.unsqueeze(-1)
+            .expand(*cos_half.shape, 2)
+            .reshape(cos_half.shape[0], -1)
+            .to(q_rope.dtype)
+        )
+        sin_full = (
+            sin_half.unsqueeze(-1)
+            .expand(*sin_half.shape, 2)
+            .reshape(sin_half.shape[0], -1)
+            .to(q_rope.dtype)
+        )
         rope_dim = cos_full.shape[-1]
         cos4 = cos_full.view(-1, 1, 1, rope_dim).contiguous()
         sin4 = sin_full.view(-1, 1, 1, rope_dim).contiguous()
@@ -124,7 +136,9 @@ def _v4_rope_inplace_npu(
         # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
         q_view = q_rope.unsqueeze(1)
         torch.ops.custom.inplace_partial_rotary_mul(
-            q_view, cos4, sin4,
+            q_view,
+            cos4,
+            sin4,
             rotary_mode="interleave",
             partial_slice=[0, rope_dim],
         )
@@ -134,7 +148,9 @@ def _v4_rope_inplace_npu(
             else:
                 kv_view = kv_rope.view(-1, 1, 1, rope_dim)
             torch.ops.custom.inplace_partial_rotary_mul(
-                kv_view, cos4, sin4,
+                kv_view,
+                cos4,
+                sin4,
                 rotary_mode="interleave",
                 partial_slice=[0, rope_dim],
             )
@@ -272,9 +288,12 @@ class MQALayer(nn.Module):
         # addition to the {0, 4, 128} the original V4 model ships. Treat 0
         # and 1 the same throughout: neither has a Compressor/C4Indexer and
         # neither uses the compress_rope_theta / yarn original_seq_len.
-        assert compress_ratio in (0, 1, 4, 128), (
-            f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
-        )
+        assert compress_ratio in (
+            0,
+            1,
+            4,
+            128,
+        ), f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
         self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
@@ -465,6 +484,7 @@ class MQALayer(nn.Module):
             # layers of cascade, that 1-2% per-layer drift flips argmax in
             # tokens 5+. Match exact iforgetmyname behavior here.
             import torch_npu
+
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:
@@ -600,6 +620,7 @@ class MQALayer(nn.Module):
             # layers of cascade, that 1-2% per-layer drift flips argmax in
             # tokens 5+. Match exact iforgetmyname behavior here.
             import torch_npu
+
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:
@@ -862,7 +883,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.rms_norm_eps,
                 hc_eps=self.hc_eps,
             )
-            return y.to(dtype), post, comb
+            return y.to(dtype), post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
@@ -1249,15 +1270,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
                 if is_nsa_prefill_cp_round_robin_split():
                     metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None:
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related()
+                        if metadata.indexer_metadata is not None:
+                            metadata.indexer_metadata = forward_batch.attn_backend.init_forward_metadata_indexer(
                                 core_meta
                             )
-                        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(

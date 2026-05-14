@@ -300,7 +300,41 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     |   +--------------result-------------------+
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
+
+    # for round-robin-split
+    | dp_atten_tp0: token0, token4, token8, ... |
+    | dp_atten_tp1: token1, token5, token9, ... |
+    |   +--------------result-------------------+
+    | token0, token1, token2, token3, token4, ...
     """
+    from sglang.srt.layers.attention.nsa.utils import (
+        is_nsa_prefill_cp_round_robin_split,
+    )
+
+    if is_nsa_prefill_cp_round_robin_split():
+        # Local layout per rank: [T_local, *trailing]. All-gather produces
+        # [cp_size, T_local, *trailing] in rank-major order. Round-robin
+        # global order = interleave-by-rank: token i (global) lives on
+        # rank (i % cp_size) at local position (i // cp_size). To restore
+        # global order, transpose rank/T_local then flatten — mirrors the
+        # same view+transpose+reshape pattern used by cp_all_gather_rerange_output.
+        with use_symmetric_memory(
+            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        ):
+            output_tensor = input_tensor.new_empty(
+                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:])
+            )
+        get_attention_cp_group().cp_all_gather_into_tensor_async(
+            output_tensor, input_tensor, stream
+        )
+        out_shape = output_tensor.shape
+        output_tensor = (
+            output_tensor.view(cp_size, -1, *out_shape[1:])
+            .transpose(0, 1)
+            .reshape(out_shape)
+        )
+        return output_tensor
+
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         forward_batch.attn_cp_metadata.total_seq_lens,
