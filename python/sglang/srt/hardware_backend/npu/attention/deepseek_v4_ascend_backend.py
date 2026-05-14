@@ -52,6 +52,10 @@ except ImportError:
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -124,7 +128,7 @@ def _compute_c4_q_npu(
         positions,
     )
     H = _build_hadamard_matrix(c4_indexer.head_dim, torch.float32, q.device)
-    scale = c4_indexer.head_dim ** -0.5
+    scale = c4_indexer.head_dim**-0.5
     q_f32 = q.to(torch.float32)
     q_rotated = torch.matmul(q_f32, H) * scale
     return q_rotated.to(torch.bfloat16)
@@ -166,17 +170,13 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_index_head_dim = getattr(hf, "index_head_dim", 128)
         self._dsv4_compress_ratios = getattr(hf, "compress_ratios", None)
         self._dsv4_has_c4 = (
-            self._dsv4_compress_ratios is not None
-            and 4 in self._dsv4_compress_ratios
+            self._dsv4_compress_ratios is not None and 4 in self._dsv4_compress_ratios
         )
         self._dsv4_has_c128 = (
-            self._dsv4_compress_ratios is not None
-            and 128 in self._dsv4_compress_ratios
+            self._dsv4_compress_ratios is not None and 128 in self._dsv4_compress_ratios
         )
         self._dsv4_sliding_window_size = (
-            cfg.sliding_window_size
-            if cfg.sliding_window_size is not None
-            else 128
+            cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
 
     # ------------------------------------------------------------------
@@ -230,6 +230,7 @@ class DeepseekV4AscendAttnBackend(
         ):
             B = forward_batch.batch_size
             from sglang.srt.utils.common import get_global_server_args
+
             n_draft = get_global_server_args().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
@@ -394,9 +395,7 @@ class DeepseekV4AscendAttnBackend(
             # State page table — translate each (bs, n_pages) raw kv slot to a
             # state-buffer page id. translate_kv_loc_to_compress_state_loc gives
             # the flat state slot; divide by page_size for the page id.
-            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(
-                raw_loc, ratio
-            )
+            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(raw_loc, ratio)
             state_page_2d = (state_loc_2d // self.page_size).to(torch.int32)
 
             # State loc — single state-buffer slot for the new decode token.
@@ -419,9 +418,9 @@ class DeepseekV4AscendAttnBackend(
                 k_seq = (seq_lens.to(torch.int64) // ratio - 1).clamp(min=0)
                 page_seq = (k_seq // self.page_size).to(torch.int64)
                 offset = (k_seq % self.page_size).to(torch.int64)
-                kernel_page = pages_table[
-                    req_pool.to(torch.int64), page_seq
-                ].to(torch.int64)
+                kernel_page = pages_table[req_pool.to(torch.int64), page_seq].to(
+                    torch.int64
+                )
                 compress_out_loc = (kernel_page * self.page_size + offset).to(
                     torch.int32
                 )
@@ -498,7 +497,9 @@ class DeepseekV4AscendAttnBackend(
         # the previous code silently dropped the write — decode then read an
         # unwritten swa_kv_pool and produced garbage. Always respect the flag.
         if save_kv_cache:
-            self.store_cache(layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch)
+            self.store_cache(
+                layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
+            )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128 routing — TWO independent gates:
@@ -532,6 +533,12 @@ class DeepseekV4AscendAttnBackend(
     ) -> torch.Tensor:
         """ratio=1 / ratio=0 dense layers — sliding-window attention via
         npu_sparse_attn_sharedkv with has_cmp_kv=False."""
+        if (
+            is_nsa_enable_prefill_cp()
+            and nsa_use_prefill_cp(forward_batch)
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            return self._forward_dense_cp(q, layer, forward_batch, attn_sink)
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
@@ -553,6 +560,105 @@ class DeepseekV4AscendAttnBackend(
         )
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
+
+    def _forward_dense_cp(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """CP-aware dense forward for zigzag-split prefill on Ascend NPU.
+
+        Mirrors do_cp_balance_attn() from AscendAttnBackend but uses
+        npu_sparse_attn_sharedkv (SWA paged kernel) instead of
+        npu_fused_infer_attention_score (standard MLA kernel).
+
+        Key difference from do_cp_balance_attn: the SWA buffer includes
+        prefix tokens, so seqused_kv for each half must add prefix_len to
+        kv_len_{prev,next} from attn_cp_metadata (which carries only the
+        extend-token portion in NSA CP mode).
+        """
+        fm = self.forward_metadata
+        cp_meta = forward_batch.attn_cp_metadata
+        pool = forward_batch.token_to_kv_pool
+        ori_kv = pool.get_swa_buffer(layer.layer_id)
+        device = q.device
+
+        # prefix_len = total KV in pool - extend tokens written this step.
+        # actual_seq_lengths_kv[0] = prefix + extend (full seq len for batch=1).
+        extend_cpu = forward_batch.extend_seq_lens_cpu
+        extend_total = (
+            sum(extend_cpu)
+            if isinstance(extend_cpu, list)
+            else int(extend_cpu.sum().item())
+        )
+        prefix_len = int(fm.actual_seq_lengths_kv[0].item()) - extend_total
+
+        # In NSA CP mode, kv_len_{prev,next} counts only extend tokens visible
+        # to each zigzag half (no prefix). Add prefix_len for SWA seqused_kv.
+        kv_prev = prefix_len + cp_meta.kv_len_prev
+        kv_next = prefix_len + cp_meta.kv_len_next
+
+        # Split q into zigzag prev / next halves (same as do_cp_balance_attn).
+        # torch.chunk gives ceil / floor halves matching actual_seq_q_prev/next.
+        q_prev, q_next = torch.chunk(q, 2, dim=0)
+
+        # Build or reuse cached per-half kernel metadata.
+        # npu_sparse_attn_sharedkv requires a precomputed metadata struct;
+        # we cache keyed by (T_q, kv_len) so it is only built once per fwd pass.
+        if not hasattr(fm, "_cp_c1a_cache"):
+            fm._cp_c1a_cache = {}
+
+        def _get_meta(T_q: int, kv_len: int):
+            key = (T_q, kv_len)
+            if key not in fm._cp_c1a_cache:
+                cu_q = torch.tensor([0, T_q], dtype=torch.int32, device=device)
+                kv_t = torch.tensor([kv_len], dtype=torch.int32, device=device)
+                fm._cp_c1a_cache[key] = (
+                    torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                        cu_seqlens_q=cu_q,
+                        seqused_kv=kv_t,
+                        cmp_ratio=1,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self._dsv4_sliding_window_size - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        batch_size=1,
+                        num_heads_q=self._dsv4_q_head_num,
+                        num_heads_kv=self._dsv4_kv_head_num,
+                        head_dim=self._dsv4_head_dim,
+                        has_ori_kv=True,
+                        has_cmp_kv=False,
+                    )
+                )
+            return fm._cp_c1a_cache[key]
+
+        def _attn_half(q_half: torch.Tensor, T_q: int, kv_len: int) -> torch.Tensor:
+            cu_q_pa = torch.tensor([0, T_q], dtype=torch.int32, device=device)
+            kv_t = torch.tensor([kv_len], dtype=torch.int32, device=device)
+            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
+                cu_seqlens_q=cu_q_pa,
+                seqused_kv=kv_t,
+                ori_mask_mode=4,
+                ori_win_left=self._dsv4_sliding_window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                q=q_half,
+                ori_kv=ori_kv,
+                ori_block_table=fm.swa_page_table,
+                sinks=attn_sink,
+                metadata=_get_meta(T_q, kv_len),
+                softmax_scale=layer.scaling,
+            )
+            return out
+
+        out_prev = _attn_half(q_prev, cp_meta.actual_seq_q_prev, kv_prev)
+        out_next = _attn_half(q_next, cp_meta.actual_seq_q_next, kv_next)
+        return torch.cat([out_prev, out_next], dim=0)
 
     def _forward_compressed(
         self,
@@ -657,9 +763,7 @@ class DeepseekV4AscendAttnBackend(
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
                 fm.c4_topk_indices = topk
-            attn_kwargs["cmp_sparse_indices"] = topk.view(
-                -1, 1, topk.shape[-1]
-            )
+            attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
