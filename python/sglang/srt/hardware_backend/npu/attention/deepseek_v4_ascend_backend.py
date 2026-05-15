@@ -283,9 +283,10 @@ class DeepseekV4AscendAttnBackend(
 
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
         fm = self.forward_metadata
+        seqused_kv_safe = fm.actual_seq_lengths_kv.clamp(min=1)
         common = {
             "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
-            "seqused_kv": fm.actual_seq_lengths_kv,
+            "seqused_kv": seqused_kv_safe,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,  # sliding window
             "cmp_mask_mode": 3,  # causal
@@ -374,6 +375,7 @@ class DeepseekV4AscendAttnBackend(
         is_decode = forward_batch.forward_mode.is_decode()
 
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        print(f"[DEBUG] bs={bs}, seq_lens={seq_lens}, seq_lens.shape={seq_lens.shape}")
         seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
 

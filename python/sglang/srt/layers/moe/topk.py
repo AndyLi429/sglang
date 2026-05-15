@@ -887,8 +887,8 @@ def _mask_topk_ids_padded_region(
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
-
+        mask = (indices >= num_token_non_padded).unsqueeze(-1)
+        topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
