@@ -1266,14 +1266,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
                 if is_nsa_prefill_cp_round_robin_split():
                     metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                    # The CUDA DSV4 backend exposes a `core_attn_metadata` field
+                    # with apply_cp_reindex() / init_flashmla_related(). The
+                    # Ascend DeepseekV4AscendAttnBackend does its rank-local
+                    # reindex inside init_forward_metadata (see
+                    # deepseek_v4_ascend_backend.py CP sanity block), so the
+                    # CUDA-specific reindex calls do not apply on NPU. Guard
+                    # by feature-detection on the metadata object to keep both
+                    # paths in one branch.
+                    core_meta = getattr(metadata, "core_attn_metadata", None)
+                    if core_meta is not None and hasattr(core_meta, "apply_cp_reindex"):
+                        core_meta.apply_cp_reindex()
+                        core_meta.init_flashmla_related()
+                        if metadata.indexer_metadata is not None:
+                            metadata.indexer_metadata = forward_batch.attn_backend.init_forward_metadata_indexer(
                                 core_meta
                             )
+                    else:
+                        # NPU path: rank-local reindex is handled by the V4
+                        # Ascend backend's init_forward_metadata. Nothing to do
+                        # here. Asserting the backend opted in to avoid silent
+                        # divergence if a new MLA backend lands without CP
+                        # wiring.
+                        assert getattr(
+                            forward_batch.attn_backend, "supports_v4_cp", False
+                        ), (
+                            "DSV4 NSA prefill CP active but attn_backend "
+                            f"{type(forward_batch.attn_backend).__name__} has "
+                            "neither core_attn_metadata.apply_cp_reindex nor "
+                            "supports_v4_cp. CP cannot run safely."
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
