@@ -181,6 +181,13 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
+        # Opt-in flag read by the generic AscendAttnBackend MLA gate (see
+        # ascend_backend.py forward path). When True, the generic CP all-gather
+        # path is bypassed and V4 provides its own gather via
+        # _cp_allgather_and_save_kv_v4_npu (added in a later task). Keeping the
+        # flag on the V4 subclass (not on AscendAttnBackend.__init__) ensures
+        # DSV3 / DSV3.2 paths stay gated out.
+        self.supports_v4_cp = True
 
     # ------------------------------------------------------------------
     # V4-specific metadata + dispatch — all stubbed pending real impls.
