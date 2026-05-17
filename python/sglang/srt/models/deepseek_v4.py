@@ -1316,11 +1316,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 core_meta
                             )
                     else:
-                        # NPU path: rank-local reindex is handled by the V4
-                        # Ascend backend's init_forward_metadata. Nothing to do
-                        # here. Asserting the backend opted in to avoid silent
-                        # divergence if a new MLA backend lands without CP
-                        # wiring.
+                        # NPU path: rank-local Q metadata is pre-computed in
+                        # init_forward_metadata (deepseek_v4_ascend_backend.py)
+                        # by dividing extend_seq_lens_cpu by cp_size before
+                        # building actual_seq_lengths_q / kernel_metadata.
+                        # Nothing extra to do here; assert the backend opted in.
                         assert getattr(
                             forward_batch.attn_backend, "supports_v4_cp", False
                         ), (
