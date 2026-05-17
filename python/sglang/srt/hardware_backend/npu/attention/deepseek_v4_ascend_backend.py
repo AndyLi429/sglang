@@ -673,6 +673,96 @@ class DeepseekV4AscendAttnBackend(
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
+    def _cp_allgather_and_save_kv_v4_npu(
+        self,
+        forward_batch,
+        layer,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cp_size: int,
+    ) -> None:
+        """All-gather rank-local KV latent across CP ranks and write the full
+        sequence to KV pool at global token indices.
+
+        Approach A from spec §4: pool ends up with full KV after gather, so the
+        downstream npu_sparse_attn_sharedkv kernel reads from pool with no
+        kernel-level CP awareness.
+
+        Input shapes (rank-local):
+          k: [S_local, num_kv_heads=1, kv_lora_rank + qk_rope_head_dim]
+          v: same shape as k for MLA latent (V is derived from same latent).
+
+        After gather:
+          full K/V at [S_global = S_local * cp_size, ...]
+          scattered into token_to_kv_pool via set_kv_buffer at the global
+          cache locations.
+
+        Round-robin reorder note: the round-robin branch of
+        cp_all_gather_rerange_kv_cache (cp_utils.py) returns tokens already in
+        global order, so this helper does not need an additional rerange.
+        """
+        from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+
+        # Import locally to keep the module-level import surface unchanged.
+        try:
+            from sglang.srt.utils.npu_utils import get_current_device_stream_fast
+        except ImportError:
+            # Fallback to the stream helper used by the generic Ascend gather.
+            from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                get_current_device_stream_fast,
+            )
+
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+
+        # V4 MLA latent: same trailing shape for K and V; merge along feature
+        # dim for a single all_gather (halves comm latency, mirrors the GQA
+        # pattern in _cp_allgather_and_save_kv_npu).
+        assert k.shape == v.shape, (
+            f"_cp_allgather_and_save_kv_v4_npu: expected k.shape == v.shape "
+            f"for MLA latent, got k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
+        k_tail = k.shape[1:]
+        v_tail = v.shape[1:]
+
+        k_flat = k.contiguous().reshape(k.shape[0], -1)
+        v_flat = v.contiguous().reshape(v.shape[0], -1)
+        k_feat_size = k_flat.shape[-1]
+        kv_flat = torch.cat([k_flat, v_flat], dim=-1)
+
+        kv_full = cp_all_gather_rerange_kv_cache(
+            kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+        )
+
+        # Post-gather sanity guard against silent layout drift (see spec §10
+        # risk row 1). The shape check is cheap, the cost is one .shape access.
+        expected_total = k_flat.shape[0] * cp_size
+        assert kv_full.shape[0] == expected_total, (
+            f"_cp_allgather_and_save_kv_v4_npu: gathered token count "
+            f"{kv_full.shape[0]} != expected {expected_total} "
+            f"(S_local={k_flat.shape[0]} * cp_size={cp_size}). "
+            f"Likely cp_all_gather_rerange_kv_cache returned wrong shape."
+        )
+        assert cache_loc.shape[0] == expected_total, (
+            f"_cp_allgather_and_save_kv_v4_npu: cache_loc length "
+            f"{cache_loc.shape[0]} != expected_total={expected_total}. "
+            f"This means forward_batch.out_cache_loc is still rank-local; "
+            f"upstream CP token rebuild must produce a global cache_loc."
+        )
+
+        key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
+        value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
+
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            layer,
+            cache_loc,
+            key_cache_full,
+            value_cache_full,
+        )
+
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         """Write the SWA layer's K cache into the bf16 PA_ND buffer.
 
