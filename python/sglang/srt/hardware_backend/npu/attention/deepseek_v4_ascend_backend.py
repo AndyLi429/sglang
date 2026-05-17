@@ -702,15 +702,7 @@ class DeepseekV4AscendAttnBackend(
         global order, so this helper does not need an additional rerange.
         """
         from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
-
-        # Import locally to keep the module-level import surface unchanged.
-        try:
-            from sglang.srt.utils.npu_utils import get_current_device_stream_fast
-        except ImportError:
-            # Fallback to the stream helper used by the generic Ascend gather.
-            from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-                get_current_device_stream_fast,
-            )
+        from sglang.srt.utils import get_current_device_stream_fast
 
         cache_loc = (
             forward_batch.out_cache_loc
