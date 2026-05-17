@@ -288,6 +288,59 @@ class DeepseekV4AscendAttnBackend(
         if envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
+        # CP round-robin reindex hook. When CP is active, the upstream
+        # cp_split_and_rebuild_data has already sliced input_ids / positions to
+        # rank-local; forward_batch.extend_seq_lens_cpu is also rank-local at
+        # this point. But forward_batch.seq_lens still reflects the GLOBAL KV
+        # length (which is what we want for actual_seq_lengths_kv, since the
+        # pool will hold full KV after _cp_allgather_and_save_kv_v4_npu).
+        #
+        # Concretely, what changes vs CP=1:
+        #   actual_seq_lengths_q     : rank-local Q cumsum (already from
+        #                              extend_seq_lens_cpu, no change needed)
+        #   actual_seq_lengths_q_pa  : derived from above, no change needed
+        #   actual_seq_lengths_kv    : MUST be global KV length per request
+        #                              (= forward_batch.seq_lens, unchanged)
+        #   swa_page_table           : MUST index full KV pool (unchanged —
+        #                              pool is global after gather)
+        #
+        # The only invariant we must enforce here is sanity-check the CP active
+        # case so silent shape mismatches do not reach the kernel.
+        if (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and getattr(forward_batch, "attn_cp_metadata", None) is not None
+            and self.attn_cp_size > 1
+        ):
+            from sglang.srt.layers.dp_attention import (
+                get_attention_cp_rank,
+                get_attention_cp_size,
+            )
+
+            cp_rank = get_attention_cp_rank()
+            cp_size = get_attention_cp_size()
+            global_tokens = int(forward_batch.seq_lens_cpu.sum().item())
+            assert global_tokens % cp_size == 0, (
+                f"V4 Ascend CP: global token count {global_tokens} not divisible "
+                f"by cp_size={cp_size}. Round-robin requires padding upstream."
+            )
+            # Defensive: q-length must be local, kv-length must be global.
+            local_q = (
+                int(fm.actual_seq_lengths_q[-1].item())
+                if fm.actual_seq_lengths_q is not None
+                else -1
+            )
+            global_kv = int(fm.actual_seq_lengths_kv.sum().item())
+            expected_local_q = global_tokens // cp_size
+            assert local_q == expected_local_q, (
+                f"V4 Ascend CP rank={cp_rank}/{cp_size}: actual_seq_lengths_q "
+                f"trail={local_q} != expected rank-local {expected_local_q}. "
+                f"Upstream cp_split_and_rebuild_data did not slice extend_seq_lens correctly."
+            )
+            assert global_kv == global_tokens, (
+                f"V4 Ascend CP: actual_seq_lengths_kv sum={global_kv} != "
+                f"global_tokens={global_tokens}. KV metadata must remain global."
+            )
+
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
         fm = self.forward_metadata
         common = {
