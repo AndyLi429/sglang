@@ -1028,23 +1028,41 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
             )
 
-        if not self.use_mla:
-            # Detect CP mode for prefill (context parallel)
+        # MLA models normally write KV via mla_preprocess elsewhere. We enter
+        # this block ONLY if:
+        #   (a) non-MLA (original behavior, unchanged), OR
+        #   (b) V4 MLA + CP actually active (so we need to gather + write here)
+        # For V4 MLA with CP=1, is_v4_cp_active is False → block is skipped →
+        # original mla_preprocess KV-write path runs, no double-write.
+        is_v4_cp_active = (
+            self.use_mla
+            and getattr(self, "supports_v4_cp", False)
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and getattr(forward_batch, "attn_cp_metadata", None) is not None
+            and self.attn_cp_size > 1
+        )
+        if (not self.use_mla) or is_v4_cp_active:
             is_cp_mode = (
                 forward_batch.forward_mode.is_context_parallel_extend()
                 and forward_batch.attn_cp_metadata is not None
                 and self.attn_cp_size > 1
             )
 
-            # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
-                    # All-gather K/V from all CP ranks and write full sequence to KV pool
-                    _cp_allgather_and_save_kv_npu(
-                        forward_batch, layer, k, v, self.attn_cp_size
-                    )
+                    if is_v4_cp_active:
+                        # V4 latent KV layout differs from dense MHA; route to
+                        # the V4-specific gather helper which knows how to
+                        # scatter latent KV into the pool via set_kv_buffer.
+                        self._cp_allgather_and_save_kv_v4_npu(
+                            forward_batch, layer, k, v, self.attn_cp_size
+                        )
+                    else:
+                        _cp_allgather_and_save_kv_npu(
+                            forward_batch, layer, k, v, self.attn_cp_size
+                        )
                 else:
-                    # support cross attention
+                    # Original non-CP path — preserved verbatim.
                     cache_loc = (
                         forward_batch.out_cache_loc
                         if not layer.is_cross_attention
