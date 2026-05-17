@@ -294,7 +294,7 @@ class DeepseekV4AscendAttnBackend(
         if envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
-        # CP round-robin reindex hook. When CP is active, the upstream
+        # CP reindex + sanity hook. When CP is active, the upstream
         # cp_split_and_rebuild_data has already sliced input_ids / positions to
         # rank-local; forward_batch.extend_seq_lens_cpu is also rank-local at
         # this point. But forward_batch.seq_lens still reflects the GLOBAL KV
@@ -302,22 +302,32 @@ class DeepseekV4AscendAttnBackend(
         # pool will hold full KV after the V4 model's CP gather, see
         # MQALayer._forward_prepare in models/deepseek_v4.py).
         #
-        # Concretely, what changes vs CP=1:
+        # Round-robin mode (uniform-split):
         #   actual_seq_lengths_q     : rank-local Q cumsum (already from
         #                              extend_seq_lens_cpu, no change needed)
-        #   actual_seq_lengths_q_pa  : derived from above, no change needed
-        #   actual_seq_lengths_kv    : MUST be global KV length per request
+        #   actual_seq_lengths_kv    : global KV length per request
         #                              (= forward_batch.seq_lens, unchanged)
-        #   swa_page_table           : MUST index full KV pool (unchanged —
-        #                              pool is global after gather)
+        #   swa_page_table           : index full KV pool (unchanged — pool is
+        #                              global after gather)
+        #   kernel_metadata          : single set, kernel called once
         #
-        # The only invariant we must enforce here is sanity-check the CP active
-        # case so silent shape mismatches do not reach the kernel.
+        # In-seq-split mode (zigzag halves):
+        #   actual_seq_lengths_q     : rank-local Q cumsum = q_prev + q_next
+        #   actual_seq_lengths_kv    : still global per request — set to
+        #                              GLOBAL value here. The per-half kernel
+        #                              calls use cp_meta.kv_len_{prev,next}_tensor
+        #                              via kernel_metadata_{prev,next}.
+        #   swa_page_table           : index full KV pool (unchanged)
+        #   kernel_metadata_prev/next: two extra sets built here, dispatched
+        #                              in forward() via _run_*_call helpers.
         if (
             forward_batch.forward_mode.is_context_parallel_extend()
             and getattr(forward_batch, "attn_cp_metadata", None) is not None
             and self.attn_cp_size > 1
         ):
+            from sglang.srt.layers.attention.nsa.utils import (
+                is_nsa_prefill_cp_in_seq_split,
+            )
             from sglang.srt.layers.dp_attention import (
                 get_attention_cp_rank,
                 get_attention_cp_size,
@@ -325,50 +335,173 @@ class DeepseekV4AscendAttnBackend(
 
             cp_rank = get_attention_cp_rank()
             cp_size = get_attention_cp_size()
+            cp_meta = forward_batch.attn_cp_metadata
             global_tokens = int(forward_batch.seq_lens_cpu.sum().item())
             local_q = (
                 int(fm.actual_seq_lengths_q[-1].item())
                 if fm.actual_seq_lengths_q is not None
                 else -1
             )
-            global_kv = int(fm.actual_seq_lengths_kv.sum().item())
-            expected_local_q = global_tokens // cp_size
 
-            # Single-line observability log — easy to grep on first NPU run.
-            # Logs every CP-active init_forward_metadata call (= once per
-            # forward pass per rank). If asserts fire below, this line shows
-            # exactly which invariant tripped.
-            logger.info(
-                "[V4-CP] sanity: rank=%d/%d global_tokens=%d local_q=%d "
-                "expected_local_q=%d global_kv=%d",
-                cp_rank,
-                cp_size,
-                global_tokens,
-                local_q,
-                expected_local_q,
-                global_kv,
-            )
+            if is_nsa_prefill_cp_in_seq_split():
+                # Zigzag invariants: rank-local Q = q_prev + q_next; per-half
+                # KV lengths live on attn_cp_metadata (set by
+                # prepare_context_parallel_metadata in cp_utils.py).
+                q_prev = int(cp_meta.actual_seq_q_prev)
+                q_next = int(cp_meta.actual_seq_q_next)
+                kv_prev = int(cp_meta.kv_len_prev)
+                kv_next = int(cp_meta.kv_len_next)
+                expected_local_q = q_prev + q_next
+                logger.info(
+                    "[V4-CP] in-seq sanity: rank=%d/%d global_tokens=%d "
+                    "local_q=%d expected_local_q=%d (q_prev=%d + q_next=%d) "
+                    "kv_prev=%d kv_next=%d",
+                    cp_rank,
+                    cp_size,
+                    global_tokens,
+                    local_q,
+                    expected_local_q,
+                    q_prev,
+                    q_next,
+                    kv_prev,
+                    kv_next,
+                )
+                assert local_q == expected_local_q, (
+                    f"V4 Ascend CP in-seq rank={cp_rank}/{cp_size}: "
+                    f"actual_seq_lengths_q trail={local_q} != "
+                    f"q_prev({q_prev}) + q_next({q_next}). Upstream "
+                    f"cp_split_and_rebuild_data did not produce the expected "
+                    f"zigzag layout."
+                )
+                assert kv_prev <= global_tokens and kv_next <= global_tokens, (
+                    f"V4 Ascend CP in-seq rank={cp_rank}/{cp_size}: per-half "
+                    f"kv_len exceeds global_tokens={global_tokens} "
+                    f"(kv_prev={kv_prev}, kv_next={kv_next})."
+                )
 
-            assert global_tokens % cp_size == 0, (
-                f"V4 Ascend CP: global token count {global_tokens} not divisible "
-                f"by cp_size={cp_size}. Round-robin requires padding upstream."
-            )
-            # Defensive: q-length must be local, kv-length must be global.
-            assert local_q == expected_local_q, (
-                f"V4 Ascend CP rank={cp_rank}/{cp_size}: actual_seq_lengths_q "
-                f"trail={local_q} != expected rank-local {expected_local_q}. "
-                f"Upstream cp_split_and_rebuild_data did not slice extend_seq_lens correctly."
-            )
-            assert global_kv == global_tokens, (
-                f"V4 Ascend CP: actual_seq_lengths_kv sum={global_kv} != "
-                f"global_tokens={global_tokens}. KV metadata must remain global."
-            )
+                # Build per-half kernel_metadata. These are dispatched in
+                # forward() by _run_dense_call / _run_compressed_call.
+                device_q = forward_batch.seq_lens.device
+                fm.cp_in_seq_cu_q_prev = torch.tensor(
+                    [0, q_prev], device=device_q, dtype=torch.int32
+                )
+                fm.cp_in_seq_cu_q_next = torch.tensor(
+                    [0, q_next], device=device_q, dtype=torch.int32
+                )
+                actual_q_prev = torch.tensor(
+                    [q_prev], device=device_q, dtype=torch.int32
+                )
+                actual_q_next = torch.tensor(
+                    [q_next], device=device_q, dtype=torch.int32
+                )
+                fm.kernel_metadata_prev = self._compute_kernel_metadata(
+                    forward_batch,
+                    cu_seqlens_q_override=fm.cp_in_seq_cu_q_prev,
+                    seqused_kv_override=cp_meta.kv_len_prev_tensor,
+                    actual_seq_q_override=actual_q_prev,
+                    batch_size_override=1,
+                )
+                fm.kernel_metadata_next = self._compute_kernel_metadata(
+                    forward_batch,
+                    cu_seqlens_q_override=fm.cp_in_seq_cu_q_next,
+                    seqused_kv_override=cp_meta.kv_len_next_tensor,
+                    actual_seq_q_override=actual_q_next,
+                    batch_size_override=1,
+                )
+            else:
+                # Round-robin: uniform-split invariants.
+                global_kv = int(fm.actual_seq_lengths_kv.sum().item())
+                expected_local_q = global_tokens // cp_size
 
-    def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
+                # Single-line observability log — easy to grep on first NPU run.
+                # Logs every CP-active init_forward_metadata call (= once per
+                # forward pass per rank). If asserts fire below, this line shows
+                # exactly which invariant tripped.
+                logger.info(
+                    "[V4-CP] round-robin sanity: rank=%d/%d global_tokens=%d "
+                    "local_q=%d expected_local_q=%d global_kv=%d",
+                    cp_rank,
+                    cp_size,
+                    global_tokens,
+                    local_q,
+                    expected_local_q,
+                    global_kv,
+                )
+
+                assert global_tokens % cp_size == 0, (
+                    f"V4 Ascend CP: global token count {global_tokens} not "
+                    f"divisible by cp_size={cp_size}. Round-robin requires "
+                    f"padding upstream."
+                )
+                # Defensive: q-length must be local, kv-length must be global.
+                assert local_q == expected_local_q, (
+                    f"V4 Ascend CP rank={cp_rank}/{cp_size}: actual_seq_lengths_q "
+                    f"trail={local_q} != expected rank-local {expected_local_q}. "
+                    f"Upstream cp_split_and_rebuild_data did not slice "
+                    f"extend_seq_lens correctly."
+                )
+                assert global_kv == global_tokens, (
+                    f"V4 Ascend CP: actual_seq_lengths_kv sum={global_kv} != "
+                    f"global_tokens={global_tokens}. KV metadata must remain global."
+                )
+
+            # Mark that round-robin is intentionally falling through to the
+            # non-in-seq attribute defaults; the round-robin path consumes the
+            # single fm.kernel_metadata dict in forward().
+            if not is_nsa_prefill_cp_in_seq_split():
+                fm.kernel_metadata_prev = None
+                fm.kernel_metadata_next = None
+                fm.cp_in_seq_cu_q_prev = None
+                fm.cp_in_seq_cu_q_next = None
+
+    def _compute_kernel_metadata(
+        self,
+        forward_batch: "ForwardBatch",
+        *,
+        cu_seqlens_q_override: Optional[torch.Tensor] = None,
+        seqused_kv_override: Optional[torch.Tensor] = None,
+        actual_seq_q_override: Optional[torch.Tensor] = None,
+        batch_size_override: Optional[int] = None,
+    ) -> dict:
+        """Build the kernel_metadata dict for one attention call.
+
+        On the non-CP and CP-round-robin paths this is invoked once with the
+        whole-batch tensors (`fm.actual_seq_lengths_q_pa`, `fm.actual_seq_lengths_kv`)
+        — same behavior as before.
+
+        On the CP in-seq-split path (`is_nsa_prefill_cp_in_seq_split()` true)
+        we invoke this twice — once for the zigzag "prev" half and once for
+        the "next" half — by passing per-half overrides:
+
+          cu_seqlens_q_override  : (2,) int32 device tensor = [0, q_half_len]
+          seqused_kv_override    : (1,) int32 device tensor = kv_len_{prev,next}
+          actual_seq_q_override  : (1,) int32 device tensor = [q_half_len]
+                                   (passed to npu_quant_lightning_indexer_metadata
+                                    as actual_seq_lengths_query, which is a
+                                    B-element cumsum-end-positions tensor without
+                                    leading zero)
+          batch_size_override    : int = 1 (CP in-seq is batch=1 only)
+        """
         fm = self.forward_metadata
+        cu_seqlens_q = (
+            cu_seqlens_q_override
+            if cu_seqlens_q_override is not None
+            else fm.actual_seq_lengths_q_pa
+        )
+        seqused_kv = (
+            seqused_kv_override
+            if seqused_kv_override is not None
+            else fm.actual_seq_lengths_kv
+        )
+        batch_size = (
+            batch_size_override
+            if batch_size_override is not None
+            else forward_batch.batch_size
+        )
+
         common = {
-            "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
-            "seqused_kv": fm.actual_seq_lengths_kv,
+            "cu_seqlens_q": cu_seqlens_q,
+            "seqused_kv": seqused_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,  # sliding window
             "cmp_mask_mode": 3,  # causal
@@ -378,7 +511,7 @@ class DeepseekV4AscendAttnBackend(
             "layout_kv": "PA_ND",
         }
         base_kwargs = {
-            "batch_size": forward_batch.batch_size,
+            "batch_size": batch_size,
             "num_heads_q": self._dsv4_q_head_num,
             "num_heads_kv": self._dsv4_kv_head_num,
             "head_dim": self._dsv4_head_dim,
@@ -407,14 +540,21 @@ class DeepseekV4AscendAttnBackend(
             # Pass actual_seq_lengths_q (no leading 0, B-element cumsum)
             # exactly as iforgetmyname/dsv4_release builds it — a fresh
             # contiguous int32 device tensor, not a slice.
-            actual_q = fm.actual_seq_lengths_q
-            if actual_q is None:
-                actual_q = fm.actual_seq_lengths_kv
+            #
+            # For CP in-seq half-call mode the caller passes
+            # `actual_seq_q_override` (shape (1,)) so the indexer sees the
+            # per-half query length, not the rank-local sum.
+            if actual_seq_q_override is not None:
+                actual_q = actual_seq_q_override
+            else:
+                actual_q = fm.actual_seq_lengths_q
+                if actual_q is None:
+                    actual_q = fm.actual_seq_lengths_kv
             kernel_metadata["li_quant_metadata"] = (
                 torch.ops.custom.npu_quant_lightning_indexer_metadata(
                     device=str(actual_q.device),
                     actual_seq_lengths_query=actual_q,
-                    actual_seq_lengths_key=fm.actual_seq_lengths_kv,
+                    actual_seq_lengths_key=seqused_kv,
                     layout_key="PA_BSND",
                     sparse_count=self._dsv4_index_topk,
                     sparse_mode=3,
@@ -608,22 +748,45 @@ class DeepseekV4AscendAttnBackend(
             )
         return self._forward_dense(q, layer, forward_batch, attn_sink)
 
-    def _forward_dense(
+    def _cp_in_seq_active(self, forward_batch: "ForwardBatch") -> bool:
+        """True when this forward should dispatch attention as two zigzag
+        half-calls (CP in-seq-split). False for non-CP and CP round-robin
+        (which both go through a single full-batch kernel call).
+        """
+        from sglang.srt.layers.attention.nsa.utils import (
+            is_nsa_prefill_cp_in_seq_split,
+        )
+
+        return (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and getattr(forward_batch, "attn_cp_metadata", None) is not None
+            and self.attn_cp_size > 1
+            and is_nsa_prefill_cp_in_seq_split()
+        )
+
+    def _run_dense_call(
         self,
         q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        metadata,
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """ratio=1 / ratio=0 dense layers — sliding-window attention via
-        npu_sparse_attn_sharedkv with has_cmp_kv=False."""
+        """Single npu_sparse_attn_sharedkv (has_cmp_kv=False) invocation.
+
+        Factored out so both the non-CP / round-robin path (one call with
+        whole-batch tensors) and the CP in-seq path (two calls with per-half
+        tensors) share kernel-arg construction.
+        """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
 
         attn_kwargs = dict(
-            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
-            seqused_kv=fm.actual_seq_lengths_kv,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
             ori_mask_mode=4,
             ori_win_left=self._dsv4_sliding_window_size - 1,
             ori_win_right=0,
@@ -633,45 +796,97 @@ class DeepseekV4AscendAttnBackend(
             ori_kv=ori_kv,
             ori_block_table=fm.swa_page_table,
             sinks=attn_sink,
-            metadata=fm.kernel_metadata["c1a_metadata"],
+            metadata=metadata,
             softmax_scale=layer.scaling,
         )
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
-    def _forward_compressed(
+    def _forward_dense(
         self,
         q: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
-        compress_ratio: int,
     ) -> torch.Tensor:
-        """ratio=4 / ratio=128 layers — sliding-window + compressed-KV
-        sparse attention via npu_sparse_attn_sharedkv with has_cmp_kv=True.
+        """ratio=1 / ratio=0 dense layers — sliding-window attention via
+        npu_sparse_attn_sharedkv with has_cmp_kv=False.
 
-        cmp_kv (compressed KV) is read from the c4 / c128 pool buffer,
-        which is currently zeros (compressor write path is still stubbed),
-        so the compressed contribution to the output is zero. cmp_sparse_
-        indices for c4 comes from forward_metadata.c4_topk_indices, which
-        forward_c4_indexer currently seeds with -1 (= no valid sparse
-        index) for the same reason. The point of this commit is to validate
-        the kernel-call shape/dtype contract end-to-end before we land the
-        compressor + indexer compute paths.
+        Dispatches one kernel call on the non-CP / round-robin path, two
+        kernel calls (zigzag prev half + next half) on CP in-seq-split.
+        """
+        fm = self.forward_metadata
+        if self._cp_in_seq_active(forward_batch):
+            cp_meta = forward_batch.attn_cp_metadata
+            q_prev, q_next = torch.chunk(q, 2, dim=0)
+            result_prev = self._run_dense_call(
+                q_prev,
+                fm.cp_in_seq_cu_q_prev,
+                cp_meta.kv_len_prev_tensor,
+                fm.kernel_metadata_prev["c1a_metadata"],
+                layer,
+                forward_batch,
+                attn_sink,
+            )
+            result_next = self._run_dense_call(
+                q_next,
+                fm.cp_in_seq_cu_q_next,
+                cp_meta.kv_len_next_tensor,
+                fm.kernel_metadata_next["c1a_metadata"],
+                layer,
+                forward_batch,
+                attn_sink,
+            )
+            return torch.concat([result_prev, result_next], dim=0)
+        return self._run_dense_call(
+            q,
+            fm.actual_seq_lengths_q_pa,
+            fm.actual_seq_lengths_kv,
+            fm.kernel_metadata["c1a_metadata"],
+            layer,
+            forward_batch,
+            attn_sink,
+        )
+
+    def _run_compressed_call(
+        self,
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        metadata,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+        c4_topk_half: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Single npu_sparse_attn_sharedkv (has_cmp_kv=True) invocation for
+        the c4/c128 compressed path. Mirrors _run_dense_call but adds cmp_kv,
+        cmp_block_table and the c4 topk sparse-indices arg.
+
+        c4_topk_half: when CP in-seq dispatches two calls, the caller slices
+        fm.c4_topk_indices into prev/next halves along dim=0 and passes the
+        matching half. None falls back to the un-sliced fm.c4_topk_indices.
         """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
-        metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
-        cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
 
-        if metadata is None or cmp_kv is None:
+        if metadata is None:
             raise RuntimeError(
-                "DeepseekV4AscendAttnBackend._forward_compressed: missing "
-                f"required state for layer_id={layer.layer_id} "
+                "DeepseekV4AscendAttnBackend._run_compressed_call: missing "
+                f"metadata for layer_id={layer.layer_id} "
                 f"compress_ratio={compress_ratio}. "
-                f"metadata({'present' if metadata is not None else 'MISSING'}), "
-                f"cmp_kv({'present' if cmp_kv is not None else 'MISSING'}). "
                 f"Available kernel_metadata keys: {list(fm.kernel_metadata.keys())}. "
+                "This indicates a configuration / pool-init bug — silently "
+                "returning zeros would corrupt model output."
+            )
+
+        cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
+        if cmp_kv is None:
+            raise RuntimeError(
+                "DeepseekV4AscendAttnBackend._run_compressed_call: missing "
+                f"cmp_kv for layer_id={layer.layer_id} "
+                f"compress_ratio={compress_ratio}. "
                 "This indicates a configuration / pool-init bug — silently "
                 "returning zeros would corrupt model output."
             )
@@ -709,8 +924,8 @@ class DeepseekV4AscendAttnBackend(
             cmp_block_table = cmp_block_table.to(torch.int32)
 
         attn_kwargs = dict(
-            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
-            seqused_kv=fm.actual_seq_lengths_kv,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
             ori_mask_mode=4,
             ori_win_left=self._dsv4_sliding_window_size - 1,
             ori_win_right=0,
@@ -737,9 +952,8 @@ class DeepseekV4AscendAttnBackend(
         # indices tensor, not due to slab/cmp_kv layout. If output still
         # diverges from dense baseline, the issue is in compressor write
         # values (ape/wkv split) or in lingering pool state.
-
         if compress_ratio == 4 and not envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get():
-            topk = fm.c4_topk_indices
+            topk = c4_topk_half if c4_topk_half is not None else fm.c4_topk_indices
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
                 fm.c4_topk_indices = topk
@@ -748,6 +962,81 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
+
+    def _forward_compressed(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """ratio=4 / ratio=128 layers — sliding-window + compressed-KV
+        sparse attention via npu_sparse_attn_sharedkv with has_cmp_kv=True.
+
+        cmp_kv (compressed KV) is read from the c4 / c128 pool buffer,
+        which is currently zeros (compressor write path is still stubbed),
+        so the compressed contribution to the output is zero. cmp_sparse_
+        indices for c4 comes from forward_metadata.c4_topk_indices, which
+        forward_c4_indexer currently seeds with -1 (= no valid sparse
+        index) for the same reason. The point of this commit is to validate
+        the kernel-call shape/dtype contract end-to-end before we land the
+        compressor + indexer compute paths.
+
+        Dispatches one kernel call on the non-CP / round-robin path, two
+        kernel calls (zigzag prev + next halves) on CP in-seq-split. On the
+        in-seq path, c4_topk_indices (if populated) is chunked along dim=0
+        to give each half its rank-local token-range slice; cmp_kv and
+        cmp_block_table stay global because the pool is full after the V4
+        model-side CP gather.
+        """
+        fm = self.forward_metadata
+        if self._cp_in_seq_active(forward_batch):
+            cp_meta = forward_batch.attn_cp_metadata
+            q_prev, q_next = torch.chunk(q, 2, dim=0)
+            meta_prev = fm.kernel_metadata_prev.get(f"c{compress_ratio}a_metadata")
+            meta_next = fm.kernel_metadata_next.get(f"c{compress_ratio}a_metadata")
+            topk_prev: Optional[torch.Tensor] = None
+            topk_next: Optional[torch.Tensor] = None
+            if (
+                compress_ratio == 4
+                and not envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get()
+                and fm.c4_topk_indices is not None
+            ):
+                topk_prev, topk_next = torch.chunk(fm.c4_topk_indices, 2, dim=0)
+            result_prev = self._run_compressed_call(
+                q_prev,
+                fm.cp_in_seq_cu_q_prev,
+                cp_meta.kv_len_prev_tensor,
+                meta_prev,
+                layer,
+                forward_batch,
+                attn_sink,
+                compress_ratio,
+                c4_topk_half=topk_prev,
+            )
+            result_next = self._run_compressed_call(
+                q_next,
+                fm.cp_in_seq_cu_q_next,
+                cp_meta.kv_len_next_tensor,
+                meta_next,
+                layer,
+                forward_batch,
+                attn_sink,
+                compress_ratio,
+                c4_topk_half=topk_next,
+            )
+            return torch.concat([result_prev, result_next], dim=0)
+        return self._run_compressed_call(
+            q,
+            fm.actual_seq_lengths_q_pa,
+            fm.actual_seq_lengths_kv,
+            fm.kernel_metadata.get(f"c{compress_ratio}a_metadata"),
+            layer,
+            forward_batch,
+            attn_sink,
+            compress_ratio,
+        )
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         """Write the SWA layer's K cache into the bf16 PA_ND buffer.

@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_in_seq_split,
     is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
 )
@@ -1292,18 +1293,30 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-                if is_nsa_prefill_cp_round_robin_split():
+                if (
+                    is_nsa_prefill_cp_round_robin_split()
+                    or is_nsa_prefill_cp_in_seq_split()
+                ):
                     metadata = forward_batch.attn_backend.forward_metadata
                     # The CUDA DSV4 backend exposes a `core_attn_metadata` field
-                    # with apply_cp_reindex() / init_flashmla_related(). The
-                    # Ascend DeepseekV4AscendAttnBackend does its rank-local
-                    # reindex inside init_forward_metadata (see
-                    # deepseek_v4_ascend_backend.py CP sanity block), so the
-                    # CUDA-specific reindex calls do not apply on NPU. Guard
-                    # by feature-detection on the metadata object to keep both
-                    # paths in one branch.
+                    # with apply_cp_reindex() / init_flashmla_related(). That
+                    # CUDA reindex is round-robin specific (uniform-split
+                    # remap); in-seq-split has its own per-half metadata path
+                    # built in the backend's init_forward_metadata, so we only
+                    # invoke the CUDA reindex for round-robin.
+                    #
+                    # The Ascend DeepseekV4AscendAttnBackend handles both
+                    # round-robin (uniform-split sanity) and in-seq-split
+                    # (zigzag halves + prev/next kernel_metadata) inside its
+                    # own init_forward_metadata. Guard by feature-detection on
+                    # the metadata object to keep CUDA + NPU paths in one
+                    # branch.
                     core_meta = getattr(metadata, "core_attn_metadata", None)
-                    if core_meta is not None and hasattr(core_meta, "apply_cp_reindex"):
+                    if (
+                        is_nsa_prefill_cp_round_robin_split()
+                        and core_meta is not None
+                        and hasattr(core_meta, "apply_cp_reindex")
+                    ):
                         log_info_on_rank0(
                             logger,
                             f"[V4-CP] CUDA reindex path: cp_size={self.cp_size}, "
@@ -1316,11 +1329,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 core_meta
                             )
                     else:
-                        # NPU path: rank-local reindex is handled by the V4
-                        # Ascend backend's init_forward_metadata. Nothing to do
-                        # here. Asserting the backend opted in to avoid silent
-                        # divergence if a new MLA backend lands without CP
-                        # wiring.
+                        # NPU path (round-robin or in-seq) — and CUDA in-seq
+                        # (no apply_cp_reindex on core_attn_metadata for that
+                        # path yet). Rank-local Q + KV metadata is handled by
+                        # the V4 Ascend backend's init_forward_metadata. Assert
+                        # the backend opted in to avoid silent divergence if a
+                        # new MLA backend lands without CP wiring.
                         assert getattr(
                             forward_batch.attn_backend, "supports_v4_cp", False
                         ), (
@@ -1329,11 +1343,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                             "neither core_attn_metadata.apply_cp_reindex nor "
                             "supports_v4_cp. CP cannot run safely."
                         )
+                        cp_mode = (
+                            "round-robin"
+                            if is_nsa_prefill_cp_round_robin_split()
+                            else "in-seq"
+                        )
                         log_info_on_rank0(
                             logger,
-                            f"[V4-CP] NPU path (supports_v4_cp): cp_size={self.cp_size}, "
-                            f"rank={self.cp_rank}, backend={type(forward_batch.attn_backend).__name__}. "
-                            f"Rank-local Q / global KV reindex handled in backend "
+                            f"[V4-CP] NPU path (supports_v4_cp, mode={cp_mode}): "
+                            f"cp_size={self.cp_size}, rank={self.cp_rank}, "
+                            f"backend={type(forward_batch.attn_backend).__name__}. "
+                            f"Rank-local Q / KV metadata handled in backend "
                             f"init_forward_metadata sanity hook.",
                         )
 
