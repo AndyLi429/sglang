@@ -326,11 +326,6 @@ class DeepseekV4AscendAttnBackend(
             cp_rank = get_attention_cp_rank()
             cp_size = get_attention_cp_size()
             global_tokens = int(forward_batch.seq_lens_cpu.sum().item())
-            assert global_tokens % cp_size == 0, (
-                f"V4 Ascend CP: global token count {global_tokens} not divisible "
-                f"by cp_size={cp_size}. Round-robin requires padding upstream."
-            )
-            # Defensive: q-length must be local, kv-length must be global.
             local_q = (
                 int(fm.actual_seq_lengths_q[-1].item())
                 if fm.actual_seq_lengths_q is not None
@@ -338,6 +333,27 @@ class DeepseekV4AscendAttnBackend(
             )
             global_kv = int(fm.actual_seq_lengths_kv.sum().item())
             expected_local_q = global_tokens // cp_size
+
+            # Single-line observability log — easy to grep on first NPU run.
+            # Logs every CP-active init_forward_metadata call (= once per
+            # forward pass per rank). If asserts fire below, this line shows
+            # exactly which invariant tripped.
+            logger.info(
+                "[V4-CP] sanity: rank=%d/%d global_tokens=%d local_q=%d "
+                "expected_local_q=%d global_kv=%d",
+                cp_rank,
+                cp_size,
+                global_tokens,
+                local_q,
+                expected_local_q,
+                global_kv,
+            )
+
+            assert global_tokens % cp_size == 0, (
+                f"V4 Ascend CP: global token count {global_tokens} not divisible "
+                f"by cp_size={cp_size}. Round-robin requires padding upstream."
+            )
+            # Defensive: q-length must be local, kv-length must be global.
             assert local_q == expected_local_q, (
                 f"V4 Ascend CP rank={cp_rank}/{cp_size}: actual_seq_lengths_q "
                 f"trail={local_q} != expected rank-local {expected_local_q}. "

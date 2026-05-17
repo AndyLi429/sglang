@@ -653,12 +653,24 @@ class MQALayer(nn.Module):
             # not callable on Ascend NPU. get_current_device_stream_fast()
             # routes via torch.get_device_module() to npu.current_stream on
             # NPU and cuda.current_stream on CUDA.
+            if self.layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    f"[V4-CP] gather kv before store_cache: cp_size={self.cp_size}, "
+                    f"kv_local.shape={tuple(kv.shape)}, dtype={kv.dtype}, device={kv.device}",
+                )
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
                 get_current_device_stream_fast(),
             )
+            if self.layer_id == 0:
+                log_info_on_rank0(
+                    logger,
+                    f"[V4-CP] gather kv after: kv_full.shape={tuple(kv.shape)} "
+                    f"(expected first dim = cp_size * local = {self.cp_size} * <local>)",
+                )
 
         if self.overlap_store_cache:
             attn_backend.store_cache(
@@ -1178,11 +1190,20 @@ class DeepseekV4Model(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             # Device-agnostic stream selector — see comment in MQALayer
             # _forward_prepare on the matching cp_all_gather call.
+            log_info_on_rank0(
+                logger,
+                f"[V4-CP] gather hidden_states pre-hc_head: cp_size={self.cp_size}, "
+                f"local.shape={tuple(hidden_states.shape)}",
+            )
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 get_current_device_stream_fast(),
+            )
+            log_info_on_rank0(
+                logger,
+                f"[V4-CP] gather hidden_states after: full.shape={tuple(hidden_states.shape)}",
             )
 
         pre_hc_head = hidden_states.flatten(1)
@@ -1283,6 +1304,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                     # paths in one branch.
                     core_meta = getattr(metadata, "core_attn_metadata", None)
                     if core_meta is not None and hasattr(core_meta, "apply_cp_reindex"):
+                        log_info_on_rank0(
+                            logger,
+                            f"[V4-CP] CUDA reindex path: cp_size={self.cp_size}, "
+                            f"rank={self.cp_rank}, backend={type(forward_batch.attn_backend).__name__}",
+                        )
                         core_meta.apply_cp_reindex()
                         core_meta.init_flashmla_related()
                         if metadata.indexer_metadata is not None:
@@ -1302,6 +1328,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                             f"{type(forward_batch.attn_backend).__name__} has "
                             "neither core_attn_metadata.apply_cp_reindex nor "
                             "supports_v4_cp. CP cannot run safely."
+                        )
+                        log_info_on_rank0(
+                            logger,
+                            f"[V4-CP] NPU path (supports_v4_cp): cp_size={self.cp_size}, "
+                            f"rank={self.cp_rank}, backend={type(forward_batch.attn_backend).__name__}. "
+                            f"Rank-local Q / global KV reindex handled in backend "
+                            f"init_forward_metadata sanity hook.",
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
