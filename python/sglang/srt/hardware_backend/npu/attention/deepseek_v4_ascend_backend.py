@@ -181,12 +181,18 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
-        # Opt-in flag read by the generic AscendAttnBackend MLA gate (see
-        # ascend_backend.py forward path). When True, the generic CP all-gather
-        # path is bypassed and V4 provides its own gather via
-        # _cp_allgather_and_save_kv_v4_npu (added in a later task). Keeping the
-        # flag on the V4 subclass (not on AscendAttnBackend.__init__) ensures
-        # DSV3 / DSV3.2 paths stay gated out.
+        # Capability flag for V4 NSA prefill CP on Ascend.
+        #
+        # The actual CP all-gather happens in the V4 MODEL layer
+        # (MQALayer._forward_prepare in models/deepseek_v4.py) via
+        # cp_all_gather_rerange_output BEFORE store_cache writes to the KV
+        # pool — i.e., the pool ends up holding full KV and the downstream
+        # npu_sparse_attn_sharedkv kernel is CP-transparent.
+        #
+        # This flag is read by the V4 model's CP-wire branch
+        # (deepseek_v4.py NSA-prefill-CP block) so it can assert the active
+        # attention backend opted in to V4 CP — DSV3 / DSV3.2 backends do
+        # not set it.
         self.supports_v4_cp = True
 
     # ------------------------------------------------------------------
@@ -293,7 +299,8 @@ class DeepseekV4AscendAttnBackend(
         # rank-local; forward_batch.extend_seq_lens_cpu is also rank-local at
         # this point. But forward_batch.seq_lens still reflects the GLOBAL KV
         # length (which is what we want for actual_seq_lengths_kv, since the
-        # pool will hold full KV after _cp_allgather_and_save_kv_v4_npu).
+        # pool will hold full KV after the V4 model's CP gather, see
+        # MQALayer._forward_prepare in models/deepseek_v4.py).
         #
         # Concretely, what changes vs CP=1:
         #   actual_seq_lengths_q     : rank-local Q cumsum (already from
@@ -725,88 +732,6 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
-
-    def _cp_allgather_and_save_kv_v4_npu(
-        self,
-        forward_batch,
-        layer,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cp_size: int,
-    ) -> None:
-        """All-gather rank-local KV latent across CP ranks and write the full
-        sequence to KV pool at global token indices.
-
-        Approach A from spec §4: pool ends up with full KV after gather, so the
-        downstream npu_sparse_attn_sharedkv kernel reads from pool with no
-        kernel-level CP awareness.
-
-        Input shapes (rank-local):
-          k: [S_local, num_kv_heads=1, kv_lora_rank + qk_rope_head_dim]
-          v: same shape as k for MLA latent (V is derived from same latent).
-
-        After gather:
-          full K/V at [S_global = S_local * cp_size, ...]
-          scattered into token_to_kv_pool via set_kv_buffer at the global
-          cache locations.
-
-        Round-robin reorder note: the round-robin branch of
-        cp_all_gather_rerange_kv_cache (cp_utils.py) returns tokens already in
-        global order, so this helper does not need an additional rerange.
-        """
-        from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
-        from sglang.srt.utils import get_current_device_stream_fast
-
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
-
-        # V4 MLA latent: same trailing shape for K and V; merge along feature
-        # dim for a single all_gather (halves comm latency, mirrors the GQA
-        # pattern in _cp_allgather_and_save_kv_npu).
-        assert k.shape == v.shape, (
-            f"_cp_allgather_and_save_kv_v4_npu: expected k.shape == v.shape "
-            f"for MLA latent, got k={tuple(k.shape)} v={tuple(v.shape)}"
-        )
-        k_tail = k.shape[1:]
-        v_tail = v.shape[1:]
-
-        k_flat = k.contiguous().reshape(k.shape[0], -1)
-        v_flat = v.contiguous().reshape(v.shape[0], -1)
-        k_feat_size = k_flat.shape[-1]
-        kv_flat = torch.cat([k_flat, v_flat], dim=-1)
-
-        kv_full = cp_all_gather_rerange_kv_cache(
-            kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
-        )
-
-        # Post-gather sanity guard against silent layout drift (see spec §10
-        # risk row 1). The shape check is cheap, the cost is one .shape access.
-        expected_total = k_flat.shape[0] * cp_size
-        assert kv_full.shape[0] == expected_total, (
-            f"_cp_allgather_and_save_kv_v4_npu: gathered token count "
-            f"{kv_full.shape[0]} != expected {expected_total} "
-            f"(S_local={k_flat.shape[0]} * cp_size={cp_size}). "
-            f"Likely cp_all_gather_rerange_kv_cache returned wrong shape."
-        )
-        assert cache_loc.shape[0] == expected_total, (
-            f"_cp_allgather_and_save_kv_v4_npu: cache_loc length "
-            f"{cache_loc.shape[0]} != expected_total={expected_total}. "
-            f"This means forward_batch.out_cache_loc is still rank-local; "
-            f"upstream CP token rebuild must produce a global cache_loc."
-        )
-
-        key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
-        value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
-
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer,
-            cache_loc,
-            key_cache_full,
-            value_cache_full,
-        )
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         """Write the SWA layer's K cache into the bf16 PA_ND buffer.
