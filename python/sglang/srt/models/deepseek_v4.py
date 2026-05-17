@@ -67,6 +67,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_current_device_stream_fast,
     log_info_on_rank0,
     make_layers,
 )
@@ -648,11 +649,15 @@ class MQALayer(nn.Module):
             )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+            # Device-agnostic stream selector: torch.cuda.current_stream() is
+            # not callable on Ascend NPU. get_current_device_stream_fast()
+            # routes via torch.get_device_module() to npu.current_stream on
+            # NPU and cuda.current_stream on CUDA.
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
             )
 
         if self.overlap_store_cache:
@@ -1171,11 +1176,13 @@ class DeepseekV4Model(nn.Module):
             )
 
         if nsa_use_prefill_cp(forward_batch):
+            # Device-agnostic stream selector — see comment in MQALayer
+            # _forward_prepare on the matching cp_all_gather call.
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
             )
 
         pre_hc_head = hidden_states.flatten(1)
