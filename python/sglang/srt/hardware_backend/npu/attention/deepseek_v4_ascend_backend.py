@@ -33,11 +33,10 @@ except ImportError as e:
         f"Original ImportError: {e}"
     ) from e
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -147,6 +146,19 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
+        # Capability flag for V4 NSA prefill CP on Ascend.
+        #
+        # The actual CP all-gather happens in the V4 MODEL layer
+        # (MQALayer._forward_prepare in models/deepseek_v4.py) via
+        # cp_all_gather_rerange_output BEFORE store_cache writes to the KV
+        # pool — i.e., the pool ends up holding full KV and the downstream
+        # npu_sparse_attn_sharedkv kernel is CP-transparent.
+        #
+        # This flag is read by the V4 model's CP-wire branch
+        # (deepseek_v4.py NSA-prefill-CP block) so it can assert the active
+        # attention backend opted in to V4 CP — DSV3 / DSV3.2 backends do
+        # not set it.
+        self.supports_v4_cp = True
 
     # ------------------------------------------------------------------
     # V4-specific metadata + dispatch.
@@ -163,6 +175,11 @@ class DeepseekV4AscendAttnBackend(
         #
         #   extend / prefill: q has extend_seq_lens_cpu tokens per request →
         #                     cumsum(extend_seq_lens_cpu).
+        #   CP round-robin extend: cp_split_and_rebuild_data runs inside
+        #                     model.forward() AFTER this method, making
+        #                     q.shape[0] = total_tokens / cp_size.  We must
+        #                     pre-divide here or cu_seqlens_q will exceed
+        #                     q.shape[0], causing OOB reads / wrong attention.
         #   decode:           q has exactly 1 new token per request → [1, 1, ..., 1].
         #   target_verify /
         #   draft_extend:     q has speculative_num_draft_tokens per request.
@@ -172,13 +189,70 @@ class DeepseekV4AscendAttnBackend(
         # q at offset = full_seq_len while q.shape[0] = batch_size for decode.
         # That is the V4-NPU root cause of token-1+ divergence — kernel
         # metadata says q has e.g. 257 tokens but q tensor only has 1.
+        from sglang.srt.layers.attention.nsa.utils import (
+            can_nsa_prefill_cp_round_robin_split,
+        )
+
+        # Is this forward going through CP split? Use the same env-flag-based
+        # predicate as the model layer's nsa_use_prefill_cp so backend and
+        # model stay aligned.
+        #
+        # Historical note: an earlier version of this file silently degraded
+        # cp_active to False when seq_len % cp_size != 0, on the theory that
+        # cp_all_gather_rerange_output cannot handle non-divisible inputs.
+        # That was wrong — batch-prep (cal_padded_tokens in nsa/utils.py)
+        # already ceil_aligns input_ids to a multiple of cp_size, so every
+        # rank's local shape IS uniform. The degrade just made backend
+        # metadata (which assumed full unsplit seq_lens) disagree with the
+        # model's CP-split q tensor, producing OOB reads.
+        cp_active = can_nsa_prefill_cp_round_robin_split(forward_batch)
+
         device = forward_batch.seq_lens.device
         if forward_batch.forward_mode.is_extend():
             seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             if isinstance(seq_lens_cpu, list):
-                seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
+                seq_lens_cpu_list = list(seq_lens_cpu)
+                seq_lens_cpu = torch.tensor(seq_lens_cpu_list, dtype=torch.int32)
             else:
                 seq_lens_cpu = seq_lens_cpu.int()
+                seq_lens_cpu_list = seq_lens_cpu.tolist()
+            # Round-robin CP: model.forward() will call cp_split_and_rebuild_data
+            # AFTER this method, so q is rank-local at attention time.
+            # KV remains global (pool holds full KV after the in-model gather).
+            #
+            # Q layout contract (must match model.cp_split_and_rebuild_data):
+            # model uses PADDED-UNIFORM distribution. input_ids was ceil_aligned
+            # by batch-prep to ceil_align(real_seq, cp_size); then
+            # nsa_cp_round_robin_split_data does .view(-1, cp_size, *)[:, cp_rank]
+            # so EVERY rank gets exactly padded_len // cp_size tokens, regardless
+            # of how many are real. cu_seqlens_q must mirror that exact count.
+            #
+            # The previous code used nsa_cp_round_robin_split_q_seqs_cpu which
+            # computes UNPADDED round-robin (leading ranks +1, trailing ranks
+            # baseline). For divisible seq_len it happens to coincide with the
+            # padded-uniform answer, masking the bug — but for non-divisible
+            # cases (e.g. seq_len=14, cp=8) the two schemes diverge:
+            #   padded-uniform → [2,2,2,2,2,2,2,2]  (matches model)
+            #   unpadded RR    → [2,2,2,2,2,2,1,1]  (mismatches model on rank 6/7)
+            # The mismatch makes the NPU kernel read q past its actual length,
+            # producing garbage tokens that never emit EOS.
+            if cp_active and self.attn_cp_size > 1:
+                padded_total = int(forward_batch.input_ids.shape[0])
+                assert padded_total % self.attn_cp_size == 0, (
+                    f"input_ids length {padded_total} not divisible by "
+                    f"attn_cp_size {self.attn_cp_size}; batch-prep "
+                    f"(cal_padded_tokens) should have ceil_aligned."
+                )
+                local_q_total = padded_total // self.attn_cp_size
+                # PCP requires batch_size=1 for prefill; assert so multi-req
+                # batches don't silently take an unverified path.
+                assert len(seq_lens_cpu_list) == 1, (
+                    f"V4 NPU prefill CP only supports batch_size=1 "
+                    f"(got {len(seq_lens_cpu_list)} requests). "
+                    f"Multi-request CP needs per-request padded-uniform "
+                    f"distribution which is not implemented."
+                )
+                seq_lens_cpu = torch.tensor([local_q_total], dtype=torch.int32)
             actual_q = torch.cumsum(seq_lens_cpu, dim=0).int().to(device)
             fm.actual_seq_lengths_q = actual_q
             fm.actual_seq_lengths_q_pa = torch.cat(
@@ -243,6 +317,71 @@ class DeepseekV4AscendAttnBackend(
         # swa translation.
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
+
+        # CP round-robin sanity check.
+        #
+        # NOTE: attn_cp_metadata is set inside model.forward() (deepseek_v4.py
+        # DeepseekV4ForCausalLM.forward), which runs AFTER init_forward_metadata.
+        # We cannot guard on it here.  Instead we use the same env-flag condition
+        # that controls whether cp_split_and_rebuild_data will run.
+        #
+        # Q metadata: rank-local (pre-divided by cp_size in the extend branch
+        # above).  KV metadata: global (pool holds full KV after the in-model
+        # CP gather in MQALayer._forward_prepare).  swa_page_table: unchanged
+        # (indexes the full KV pool).
+        if cp_active and self.attn_cp_size > 1:
+            from sglang.srt.layers.dp_attention import (
+                get_attention_cp_rank,
+                get_attention_cp_size,
+            )
+
+            cp_rank = get_attention_cp_rank()
+            cp_size = get_attention_cp_size()
+            global_tokens = int(forward_batch.seq_lens_cpu.sum().item())
+            local_q = (
+                int(fm.actual_seq_lengths_q[-1].item())
+                if fm.actual_seq_lengths_q is not None
+                else -1
+            )
+            global_kv = int(fm.actual_seq_lengths_kv.sum().item())
+            # Expected local q = padded_total // cp_size. This MUST match
+            # model.cp_split_and_rebuild_data which uses
+            # .view(-1, cp_size, *)[:, cp_rank] on the padded input_ids.
+            # For non-divisible real seq_len the difference is real:
+            # batch-prep padded input_ids to ceil_align(real, cp_size),
+            # and model gives every rank the same padded_total // cp_size
+            # tokens (some of which are pad).
+            padded_total = int(forward_batch.input_ids.shape[0])
+            expected_local_q = padded_total // cp_size
+
+            logger.info(
+                "[V4-CP] sanity: rank=%d/%d global_tokens=%d padded_total=%d "
+                "local_q=%d expected_local_q=%d global_kv=%d",
+                cp_rank,
+                cp_size,
+                global_tokens,
+                padded_total,
+                local_q,
+                expected_local_q,
+                global_kv,
+            )
+
+            # Padded-uniform contract: every rank gets exactly
+            # padded_total // cp_size q tokens, including any padding
+            # introduced by batch-prep's ceil_align for non-divisible real
+            # seq_len. Padding tokens get attention computed but their
+            # outputs are dropped (sampler indexes by real seq_lens).
+            assert local_q == expected_local_q, (
+                f"V4 Ascend CP rank={cp_rank}/{cp_size}: actual_seq_lengths_q "
+                f"trail={local_q} != expected padded-uniform {expected_local_q} "
+                f"(= padded_total {padded_total} // cp_size {cp_size}). "
+                f"Backend q metadata disagrees with model's "
+                f"cp_split_and_rebuild_data — kernel will read OOB."
+            )
+            assert global_kv == global_tokens, (
+                f"V4 Ascend CP: actual_seq_lengths_kv sum={global_kv} != "
+                f"global_tokens={global_tokens}. KV metadata must remain global."
+            )
 
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
         fm = self.forward_metadata
@@ -338,6 +477,7 @@ class DeepseekV4AscendAttnBackend(
         is_decode = forward_batch.forward_mode.is_decode()
 
         seq_lens = forward_batch.seq_lens.to(torch.int32)
+        print(f"[DEBUG] bs={bs}, seq_lens={seq_lens}, seq_lens.shape={seq_lens.shape}")
         seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
 

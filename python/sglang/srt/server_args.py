@@ -4921,7 +4921,12 @@ class ServerArgs:
             "--attn-cp-size",
             type=int,
             default=ServerArgs.attn_cp_size,
-            help="The attention context parallelism size.",
+            help=(
+                "The attention context parallelism size. "
+                "On NPU, this flag activates V4 CP only when combined with "
+                "--enable-nsa-prefill-context-parallel AND --moe-a2a-backend deepep. "
+                "DSV3/DSV3.2 NPU paths ignore this flag (CP unsupported on those MLA models)."
+            ),
         )
         parser.add_argument(
             "--moe-data-parallel-size",
