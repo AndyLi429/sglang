@@ -537,6 +537,7 @@ class MQALayer(nn.Module):
                     forward_batch=forward_batch,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
+                    positions=positions,
                 )
 
         with torch.cuda.stream(stream_kv):
@@ -646,7 +647,12 @@ class MQALayer(nn.Module):
         )
 
         if self.indexer is not None:
-            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                positions=positions,
+            )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,

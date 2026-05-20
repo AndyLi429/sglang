@@ -566,6 +566,7 @@ class C4Indexer(nn.Module):
         forward_batch: ForwardBatch,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> None:
         if _is_npu and not forward_batch.forward_mode.is_idle():
             # NPU path: do the indexer compute inline (compressor write +
@@ -573,7 +574,7 @@ class C4Indexer(nn.Module):
             # the backend's forward_metadata for _forward_compressed to pick
             # up. CUDA path delegates to the triton + deep_gemm pipeline in
             # the backend mixin below.
-            topk_idxs = self.forward_npu(x, q_lora, forward_batch)
+            topk_idxs = self.forward_npu(x, q_lora, forward_batch, positions)
             forward_batch.attn_backend.forward_metadata.c4_topk_indices = topk_idxs
             return None
         if TYPE_CHECKING:
@@ -626,6 +627,7 @@ class C4Indexer(nn.Module):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute c4 top-k sparse indices on NPU; returns a [T, index_topk]
         int32 tensor.
@@ -652,8 +654,10 @@ class C4Indexer(nn.Module):
             and not forward_batch.forward_mode.is_target_verify()
         )
 
-        # q path
-        q = self._compute_q_npu(q_lora, forward_batch.positions)
+        # q path — under prefill CP, `positions` has been split per-rank by the
+        # caller; fall back to forward_batch.positions for the non-CP path.
+        q_positions = positions if positions is not None else forward_batch.positions
+        q = self._compute_q_npu(q_lora, q_positions)
 
         # weights path — keep the bf16 → bf16 projection and apply the
         # combined softmax + n_heads scaling here so the int8 indexer kernel
@@ -706,10 +710,8 @@ class C4Indexer(nn.Module):
             kv_indices = _get_kv_indices(
                 forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
             )
-            kv_cache_value = (
-                forward_batch.token_to_kv_pool.get_compress_buffer(
-                    self.layer_id, True, kv_indices
-                )
+            kv_cache_value = forward_batch.token_to_kv_pool.get_compress_buffer(
+                self.layer_id, True, kv_indices
             )
             if is_prefill:
                 start = 0 if i == 0 else int(end_pos[i - 1])
@@ -746,9 +748,9 @@ class C4Indexer(nn.Module):
                     q[i : i + 1, ...],
                     kv_cache_value.squeeze(1),
                 )
-                index_score = (
-                    index_score.relu_() * weights.unsqueeze(-1)[i]
-                ).sum(dim=1)
+                index_score = (index_score.relu_() * weights.unsqueeze(-1)[i]).sum(
+                    dim=1
+                )
                 topk_idx = index_score.topk(
                     min(self.index_topk, seq_i // ratio), dim=-1
                 )[1]
