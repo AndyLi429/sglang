@@ -406,6 +406,22 @@ class Compressor(nn.Module):
             # NPU path: run the full compress flow inline. Writes go straight
             # to the kv pool via set_compress_*_buffer, so there's nothing
             # for forward_core_compressor to write afterwards.
+            #
+            # Under prefill CP, `x` was sliced to the rank-local subset by
+            # `cp_split_and_rebuild_data` in Model.forward, but the per-request
+            # loop inside `forward_npu` indexes with the global `seq_lens_cpu`
+            # / `out_cache_loc` / `positions`, so it needs the full-sequence
+            # view. Mirror the CUDA path: all-gather + rerange back to the
+            # original order before running the compress loop. `forward_batch.
+            # positions` is the unsplit tensor (Model.forward only rebinds the
+            # local `positions` arg, not the field), so we pass it directly.
+            if nsa_use_prefill_cp(forward_batch):
+                x = cp_all_gather_rerange_output(
+                    x,
+                    get_attention_cp_size(),
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
             return self.forward_npu(x, forward_batch.positions, forward_batch)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
