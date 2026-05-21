@@ -17,12 +17,6 @@ from sglang.jit_kernel.deepseek_v4 import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.chunked_compress_layout import (
-    SRC_CHUNK,
-    SRC_STATE,
-    SRC_ZERO,
-    compute_chunked_compress_layout,
-)
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -619,16 +613,10 @@ class Compressor(nn.Module):
                             )
                         )
                 else:
-                    # ---- Layout-driven path: chunked prefill follow-up
-                    # (prefix_len > 0). The chunk may complete compressed
-                    # outputs whose raw-token inputs span state ring (from
-                    # a previous chunk's stash) + current chunk.
-                    #
-                    # NOTE — UNTESTED ON NPU. Validated structurally via
-                    # test_dsv4_chunked_compress_layout and numerically
-                    # (fp64 / 1e-10) via
-                    # test_dsv4_chunked_compress_numerical_equivalence.
-                    # NPU end-to-end logits parity is pending on lph-050600.
+                    # ---- Triton path: chunked prefill follow-up
+                    # (prefix_len > 0). The kernel derives state/chunk
+                    # sources directly from prefix_len/chunk_len and avoids
+                    # CPU-side layout materialization.
                     self._npu_prefill_chunked_one_req(
                         idx=idx,
                         prefix_len=prefix_len,
@@ -799,30 +787,13 @@ class Compressor(nn.Module):
         write_pos_in_req: list,
         device: torch.device,
     ) -> None:
-        """Layout-driven compress for one chunked-prefill request (prefix_len > 0).
+        """Triton compress for one chunked-prefill request (prefix_len > 0)."""
+        from sgl_kernel_npu.attention.dsv4_chunked_compress import (
+            dsv4_chunked_prefill_compress,
+        )
 
-        Drives ``compute_chunked_compress_layout`` to figure out which
-        compressed-token outputs the chunk completes, which of their raw-token
-        inputs must be sourced from the state ring (stashed by a previous chunk)
-        vs the current chunk, and which current-chunk tokens must be stashed for
-        the next chunk. Appends to caller's accumulators in-place so the outer
-        flush (set_compress_state_buffer + _compressor_epilog_npu) stays unchanged.
-
-        NPU correctness is currently *only* established structurally
-        (test_dsv4_chunked_compress_layout) + numerically in fp64
-        (test_dsv4_chunked_compress_numerical_equivalence). End-to-end logits
-        parity on lph-050600 is the next gate.
-        """
         ratio = self.ratio
         overlap = self.overlap
-        d = self.head_dim
-
-        layout = compute_chunked_compress_layout(
-            prefix_len=prefix_len,
-            chunk_len=chunk_len,
-            ratio=ratio,
-            overlap=overlap,
-        )
 
         chunk_kv = kv_full[seqlen_offset : seqlen_offset + chunk_len]
         chunk_score = score_full[seqlen_offset : seqlen_offset + chunk_len]
@@ -834,126 +805,58 @@ class Compressor(nn.Module):
         )
         page_size = forward_batch.attn_backend.page_size
 
-        # ---- State stashes ----
-        # The ape index for each stashed token is ``gp % ratio`` (= its
-        # position within the future compressed chunk that will consume it).
-        # The historical single-shot code uses ``ape[:remainder]`` because
-        # cutoff is always ratio-aligned there; under chunked prefill stash
-        # can start at any offset, so we must compute the j index explicitly.
-        for stash in layout.state_stashes:
-            if not stash.chunk_local_indices:
-                continue
-            local_idx_t = torch.tensor(
-                stash.chunk_local_indices, dtype=torch.long, device=device
-            )
-            j_t = torch.tensor(
-                [gp % ratio for gp in stash.global_positions],
+        total_len = prefix_len + chunk_len
+        first_k = prefix_len // ratio
+        last_k_exclusive = total_len // ratio
+
+        def stash_range(global_start: int, global_end: int) -> None:
+            if global_end <= global_start:
+                return
+            local_idx = torch.arange(
+                global_start - prefix_len,
+                global_end - prefix_len,
                 dtype=torch.long,
                 device=device,
             )
-            kv_state_to_be_cached.append(chunk_kv[local_idx_t])
-            score_state_to_be_cached.append(chunk_score[local_idx_t] + self.ape[j_t])
-            state_loc_list.append(chunk_state_loc[local_idx_t])
+            if local_idx.numel() == 0:
+                return
+            global_pos = local_idx + prefix_len
+            ape_idx = (global_pos % ratio).long()
+            kv_state_to_be_cached.append(chunk_kv[local_idx])
+            score_state_to_be_cached.append(chunk_score[local_idx] + self.ape[ape_idx])
+            state_loc_list.append(chunk_state_loc[local_idx])
 
-        if not layout.compress_outputs:
+        l_cmp = last_k_exclusive * ratio
+        stash_range(max(l_cmp, prefix_len), total_len)
+
+        if overlap and last_k_exclusive > first_k:
+            k_last = last_k_exclusive - 1
+            stash_range(max(k_last * ratio, prefix_len), k_last * ratio + ratio)
+
+        n_out = last_k_exclusive - first_k
+        if n_out == 0:
             return
 
-        n_out = len(layout.compress_outputs)
-        coff_d = chunk_kv.shape[-1]
-        n_src = 2 * ratio if overlap else ratio
-
-        # Collect unique global positions needed from the state ring.
-        # page_table[idx, gp // page_size] gives the state-buffer page id;
-        # slot = page_id * page_size + (gp % page_size).
-        state_gps: list[int] = []
-        seen_gp: set = set()
-        for co in layout.compress_outputs:
-            for src in co.sources:
-                if src[0] == SRC_STATE and src[1] not in seen_gp:
-                    state_gps.append(src[1])
-                    seen_gp.add(src[1])
-
-        if state_gps:
-            gp_tensor = torch.tensor(state_gps, dtype=torch.long, device=device)
-            slots = page_table[idx, gp_tensor // page_size].to(
-                torch.long
-            ) * page_size + (gp_tensor % page_size)
-            state_kv_batch, state_score_batch = (
-                token_to_kv_pool.get_compress_state_buffer(
-                    self.layer_id, self.is_in_indexer, slots
-                )
-            )
-            # get_compress_state_buffer returns (kv [N, 1, coff_d], score [N, 1, coff_d]).
-            state_kv_batch = state_kv_batch.squeeze(-2)
-            state_score_batch = state_score_batch.squeeze(-2)
-            gp_to_row = {gp: i for i, gp in enumerate(state_gps)}
-        else:
-            state_kv_batch = None
-            state_score_batch = None
-            gp_to_row = {}
-
-        # Effective per-row dim for the stack: overlap takes a half-slice
-        # (current half [d:] or prev half [:d]); non-overlap uses full coff_d
-        # (= d, since coff=1 for non-overlap).
-        d_eff = d if overlap else coff_d
-        out_kv = chunk_kv.new_zeros((n_out, n_src, d_eff))
-        out_score = chunk_kv.new_full((n_out, n_src, d_eff), float("-inf"))
-
-        rope_positions_list: list[int] = []
-        for co_i, co in enumerate(layout.compress_outputs):
-            rope_positions_list.append(co.rope_position)
-            for src_i, src in enumerate(co.sources):
-                kind, sidx = src
-                if overlap:
-                    if src_i < ratio:
-                        # Current-half row → [d:] slice; ape at j = src_i.
-                        j_for_ape = src_i
-                        take_right = True
-                    else:
-                        # Prev-half row → [:d] slice; ape at j = src_i - ratio.
-                        j_for_ape = src_i - ratio
-                        take_right = False
-                else:
-                    j_for_ape = src_i
-                    take_right = False  # unused: no slicing in non-overlap path
-
-                if kind == SRC_ZERO:
-                    # Neutral fill already in place (kv=0, score=-inf).
-                    continue
-                if kind == SRC_CHUNK:
-                    kv_row = chunk_kv[sidx]
-                    sc_row = chunk_score[sidx] + self.ape[j_for_ape]
-                else:  # SRC_STATE
-                    row = gp_to_row[sidx]
-                    kv_row = state_kv_batch[row]
-                    sc_row = state_score_batch[row]  # already +ape at stash time
-
-                if overlap:
-                    if take_right:
-                        out_kv[co_i, src_i] = kv_row[d:]
-                        out_score[co_i, src_i] = sc_row[d:]
-                    else:
-                        out_kv[co_i, src_i] = kv_row[:d]
-                        out_score[co_i, src_i] = sc_row[:d]
-                else:
-                    out_kv[co_i, src_i] = kv_row
-                    out_score[co_i, src_i] = sc_row
-
-        weights = out_score.softmax(dim=1)
-        compressed = (out_kv * weights).sum(dim=1)
-        if not overlap and compressed.shape[-1] != d:
-            # Defensive: non-overlap should have coff_d == d.
-            compressed = compressed[..., :d]
-
+        state_pool = self._get_state_pool(forward_batch)
+        compressed = dsv4_chunked_prefill_compress(
+            chunk_kv.contiguous(),
+            chunk_score.contiguous(),
+            state_pool.kv_score_buffer.kv_score,
+            page_table[idx].contiguous(),
+            self.ape.contiguous(),
+            prefix_len=prefix_len,
+            chunk_len=chunk_len,
+            ratio=ratio,
+            overlap=overlap,
+            page_size=page_size,
+        )
         kv_out_list.append(compressed)
         kv_out_positions.append(
-            torch.tensor(rope_positions_list, dtype=torch.long, device=device)
+            (torch.arange(n_out, dtype=torch.long, device=device) + first_k) * ratio
         )
         write_req_indices.append(
             torch.full((n_out,), idx, dtype=torch.int64, device=device)
         )
-        # New compressed_seq_positions = [prefix_len // ratio, ..., +n_out).
-        first_k = prefix_len // ratio
         write_pos_in_req.append(
             torch.arange(first_k, first_k + n_out, dtype=torch.int64, device=device)
         )
