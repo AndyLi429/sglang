@@ -838,17 +838,34 @@ class Compressor(nn.Module):
             return
 
         state_pool = self._get_state_pool(forward_batch)
+        state_base = max(0, (first_k - (1 if overlap else 0)) * ratio)
+        if prefix_len > state_base:
+            state_global_pos = torch.arange(
+                state_base,
+                prefix_len,
+                dtype=torch.long,
+                device=device,
+            )
+            state_slots = page_table[idx, state_global_pos // page_size].to(
+                torch.long
+            ) * page_size + (state_global_pos % page_size)
+            state_kv_score_window = state_pool.kv_score_buffer.kv_score[
+                state_slots
+            ].contiguous()
+        else:
+            state_kv_score_window = state_pool.kv_score_buffer.kv_score.new_empty(
+                (0, state_pool.kv_score_buffer.kv_score.shape[-1])
+            )
         compressed = dsv4_chunked_prefill_compress(
             chunk_kv.contiguous(),
             chunk_score.contiguous(),
-            state_pool.kv_score_buffer.kv_score,
-            page_table[idx].contiguous(),
+            state_kv_score_window,
             self.ape.contiguous(),
             prefix_len=prefix_len,
             chunk_len=chunk_len,
             ratio=ratio,
             overlap=overlap,
-            page_size=page_size,
+            state_base=state_base,
         )
         kv_out_list.append(compressed)
         kv_out_positions.append(
