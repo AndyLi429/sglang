@@ -286,3 +286,5 @@ extra-info*
 
 # Local git worktrees
 .worktrees/
+
+.agents

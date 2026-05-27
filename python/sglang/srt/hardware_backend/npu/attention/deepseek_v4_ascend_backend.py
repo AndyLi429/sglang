@@ -942,10 +942,9 @@ class DeepseekV4AscendAttnBackend(
                 else:
                     state_loc_decode = state_loc_decode.to(torch.int32)
                 # c{ratio}_loc comes from the DSV4OutCacheLoc bundle the
-                # allocator stashed in alloc_decode. The kernel expects a
-                # [bs]-shaped tensor (0 padding for non-compressing reqs);
-                # the allocator only emits slots for reqs that closed a ratio
-                # chunk, so we scatter into a [bs]-padded buffer here.
+                # allocator stashed in alloc_decode. The CANN compressor emits
+                # compressed outputs compactly (all compressing requests first,
+                # then padding), so locs must be compact-padded the same way.
                 #
                 # out_cache_loc_dsv4 is None on IDLE DP-attention ranks
                 # (alloc_decode short-circuited because there's no real batch
@@ -962,18 +961,10 @@ class DeepseekV4AscendAttnBackend(
                         else out_cache_loc_dsv4.out_c128_loc
                     )
                     if bundle_loc.numel() > 0:
-                        valid = seq_lens > 0
-                        should_compress = ((seq_lens % ratio) == 0) & valid
-                        # from sglang.srt.layers.dp_attention import get_attention_dp_rank
-                        # print(f"[dsv4-compress] dp_rank={get_attention_dp_rank()} seq_lens={seq_lens.tolist()} should_compress={should_compress.tolist()}", flush=True)
-                        idx = torch.nonzero(
-                            should_compress, as_tuple=False
-                        ).flatten()
-                        n_compress = idx.numel()
-                        if n_compress > 0:
-                            compress_out_loc[idx] = (
-                                bundle_loc[:n_compress].to(torch.int32)
-                            )
+                        n_compress = min(bundle_loc.numel(), bs)
+                        compress_out_loc[:n_compress] = bundle_loc[
+                            :n_compress
+                        ].to(torch.int32)
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
