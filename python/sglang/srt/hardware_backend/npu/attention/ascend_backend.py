@@ -23,7 +23,10 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
+    mla_use_prefill_cp,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
@@ -251,6 +254,35 @@ def _cp_allgather_and_save_kv_npu(
         key_cache_full,
         value_cache_full,
     )
+
+
+def _cp_allgather_mla_kv_npu(forward_batch, k, v, cp_size):
+    """MLA-aware CP all-gather: merge k(=[k_nope|k_rope]) and v into one
+    all-gather and return the full-rank tensors.
+
+    Caller is responsible for KV-pool save (the absorb-form layout here
+    differs from the un-absorbed latent that the MLA pool stores, so we
+    don't write to the pool — this matches the PD-disaggregated CP mode
+    where the prefill rank does not reuse its own pool for decode).
+
+    k shape: [S_local, tp_k_head_num, v_head_dim + qk_rope_head_dim]
+    v shape: [S_local, tp_k_head_num, v_head_dim]
+    """
+    k_tail = k.shape[1:]
+    v_tail = v.shape[1:]
+
+    k_flat = k.contiguous().reshape(k.shape[0], -1)
+    v_flat = v.contiguous().reshape(v.shape[0], -1)
+    k_feat_size = k_flat.shape[-1]
+    kv_flat = torch.cat([k_flat, v_flat], dim=-1)
+
+    kv_full = cp_all_gather_rerange_kv_cache(
+        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
+    )
+
+    k_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
+    v_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
+    return k_full, v_full
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -977,6 +1009,203 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _attention_with_mask_and_nomask(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        value: torch.Tensor,
+        kv_mask_slice: slice,
+        kv_nomask_slice: slice,
+        attn_mask_seqlens,
+        attn_nomask_seqlens,
+        mask: torch.Tensor,
+        layer,
+    ):
+        """Two-phase ring_mla: first compute attention over the Q-aligned KV
+        chunk (causal mask), then merge the previously-visible KV chunk via
+        online-softmax LSE accumulation. KV chunks are contiguous slices of
+        the full-gathered tensors — no torch.index_select copy needed.
+        """
+        attn_output = torch.zeros(
+            q_nope.shape[0],
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=k_pe.dtype,
+            device=k_pe.device,
+        )
+        attn_lse = torch.zeros(
+            layer.tp_q_head_num, q_pe.shape[0], dtype=torch.float32, device=k_pe.device
+        )
+
+        k_nope_mask = k_nope[kv_mask_slice].contiguous()
+        value_mask = value[kv_mask_slice].contiguous()
+        k_pe_mask = k_pe[kv_mask_slice].contiguous()
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=k_nope_mask,
+            k_rope=k_pe_mask,
+            value=value_mask,
+            mask=mask,
+            seqlen=attn_mask_seqlens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=None,
+            prev_lse=None,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="mask_type_triu",
+            input_layout="type_bsnd",
+            calc_type="calc_type_first_ring",
+            output=attn_output,
+            softmax_lse=attn_lse,
+        )
+
+        nomask_len = kv_nomask_slice.stop - kv_nomask_slice.start
+        if nomask_len == 0:
+            return attn_output, attn_lse
+
+        k_nope_nomask = k_nope[kv_nomask_slice].contiguous()
+        value_nomask = value[kv_nomask_slice].contiguous()
+        k_pe_nomask = k_pe[kv_nomask_slice].contiguous()
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=k_nope_nomask,
+            k_rope=k_pe_nomask,
+            value=value_nomask,
+            mask=mask,
+            seqlen=attn_nomask_seqlens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=attn_output,
+            prev_lse=attn_lse,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="no_mask",
+            input_layout="type_bsnd",
+            calc_type="calc_type_default",
+            output=attn_output,
+            softmax_lse=attn_lse,
+        )
+        return attn_output, attn_lse
+
+    def _forward_mla_pcp(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch: ForwardBatch,
+    ):
+        """MLA prefill context-parallel path on Ascend.
+
+        Algorithm: all-gather KV across cp ranks, keep Q sharded (zigzag),
+        then run two ring_mla passes per Q half (head + tail) — first ring
+        on the Q-aligned KV chunk with triu mask, second ring on all earlier
+        KV chunks with LSE-merge. Mirrors the CUDA design but uses the NPU
+        npu_ring_mla kernel's built-in online-softmax merge instead of a
+        full-KV FlashAttention call.
+
+        Inputs (local rank, zigzag-split):
+          q : [S_local, tp_q_head_num * (v_head_dim + qk_rope_head_dim)]
+          k : [S_local, tp_k_head_num,  v_head_dim + qk_rope_head_dim]
+          v : [S_local, tp_k_head_num,  v_head_dim]
+
+        Returns:
+          attn_output : [S_local, tp_q_head_num * v_head_dim]
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+        cp_size = self.attn_cp_size
+        cp_rank = cp_meta.bs and 0  # placeholder; real cp_rank read below
+        # We rely on get_attention_cp_group()'s rank in the metadata builder
+        # rather than re-deriving here.
+
+        # 1) All-gather K and V across CP ranks (one collective for both).
+        k_full, v_full = _cp_allgather_mla_kv_npu(forward_batch, k, v, cp_size)
+        k_nope_full, k_pe_full = k_full.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        # 2) Split local Q into prev/next zigzag halves using community
+        #    metadata (bs>1-safe; do not use (S+1)//2).
+        q_view = q.view(-1, layer.tp_q_head_num, self.q_head_dim)
+        q_nope_all, q_pe_all = q_view.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        n_prev = cp_meta.total_q_prev_tokens
+        q_nope_head = q_nope_all[:n_prev].contiguous()
+        q_nope_tail = q_nope_all[n_prev:].contiguous()
+        q_pe_head = q_pe_all[:n_prev].contiguous()
+        q_pe_tail = q_pe_all[n_prev:].contiguous()
+
+        # 3) Build per-half KV slice boundaries from community metadata.
+        #    For each sequence s on this rank:
+        #      head Q corresponds to KV[: kv_len_prev[s]]:
+        #        - mask region (Q-aligned KV) = last actual_seq_q_prev[s] tokens
+        #        - nomask region = everything before that
+        #    Same shape for tail using kv_len_next / actual_seq_q_next.
+        #    For bs=1 (the supported case in the first cut) the slices are
+        #    plain contiguous ranges.
+        assert cp_meta.bs == 1, (
+            "MLA CP currently supports bs==1; multi-batch zigzag KV indexing "
+            "is a follow-up."
+        )
+        kv_len_prev = int(cp_meta.kv_len_prev_list[0])
+        kv_len_next = int(cp_meta.kv_len_next_list[0])
+        q_prev_len = int(cp_meta.actual_seq_q_prev_list[0])
+        q_next_len = int(cp_meta.actual_seq_q_next_list[0])
+
+        head_nomask_slice = slice(0, kv_len_prev - q_prev_len)
+        head_mask_slice = slice(kv_len_prev - q_prev_len, kv_len_prev)
+        tail_nomask_slice = slice(0, kv_len_next - q_next_len)
+        tail_mask_slice = slice(kv_len_next - q_next_len, kv_len_next)
+
+        # ring_mla seqlen format: [q_len, kv_len] per call.
+        head_mask_seqlens = torch.tensor([q_prev_len, q_prev_len], dtype=torch.int32)
+        head_nomask_seqlens = torch.tensor(
+            [q_prev_len, head_nomask_slice.stop - head_nomask_slice.start],
+            dtype=torch.int32,
+        )
+        tail_mask_seqlens = torch.tensor([q_next_len, q_next_len], dtype=torch.int32)
+        tail_nomask_seqlens = torch.tensor(
+            [q_next_len, tail_nomask_slice.stop - tail_nomask_slice.start],
+            dtype=torch.int32,
+        )
+
+        # 4) Run ring_mla on both Q halves.
+        out_head, _ = self._attention_with_mask_and_nomask(
+            q_nope=q_nope_head,
+            q_pe=q_pe_head,
+            k_nope=k_nope_full,
+            k_pe=k_pe_full,
+            value=v_full,
+            kv_mask_slice=head_mask_slice,
+            kv_nomask_slice=head_nomask_slice,
+            attn_mask_seqlens=head_mask_seqlens,
+            attn_nomask_seqlens=head_nomask_seqlens,
+            mask=self.ringmla_mask,
+            layer=layer,
+        )
+        out_tail, _ = self._attention_with_mask_and_nomask(
+            q_nope=q_nope_tail,
+            q_pe=q_pe_tail,
+            k_nope=k_nope_full,
+            k_pe=k_pe_full,
+            value=v_full,
+            kv_mask_slice=tail_mask_slice,
+            kv_nomask_slice=tail_nomask_slice,
+            attn_mask_seqlens=tail_mask_seqlens,
+            attn_nomask_seqlens=tail_nomask_seqlens,
+            mask=self.ringmla_mask,
+            layer=layer,
+        )
+
+        attn_output = torch.cat([out_head, out_tail], dim=0)
+        return attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -1227,6 +1456,11 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif mla_use_prefill_cp(forward_batch) and self.attn_cp_size > 1:
+            # MLA prefill context-parallel path: all-gather KV across cp
+            # ranks, run two-phase ring_mla per Q half. Assumes PD-disagg
+            # mode — local KV pool is not reused after prefill.
+            attn_output = self._forward_mla_pcp(q, k, v, layer, forward_batch)
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
