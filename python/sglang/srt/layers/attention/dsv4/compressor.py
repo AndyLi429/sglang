@@ -335,7 +335,7 @@ class Compressor(nn.Module):
         self.is_in_indexer = is_in_indexer
         self.dim = config.hidden_size
         self.head_dim = head_dim
-        self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
+        self.rope_head_dim = config.qk_rope_head_dim
         assert compress_ratio != 0, "compress_ratio should not be 0"
         self.ratio = compress_ratio
         self.overlap = self.ratio == 4
@@ -369,6 +369,12 @@ class Compressor(nn.Module):
             # (init runs on CPU before weights move to NPU); cache key
             # includes device so it's safe.
             self._npu_hadamard_built = False
+            # Lazy caches for the fused-compressor op (built on first call,
+            # after weight loading + device move). See _ensure_fused_caches.
+            self._fused_caches_built = False
+            self._fused_wkv_w: Optional[torch.Tensor] = None
+            self._fused_wgate_w: Optional[torch.Tensor] = None
+            self._fused_norm_weight_bf16: Optional[torch.Tensor] = None
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -406,6 +412,23 @@ class Compressor(nn.Module):
             # NPU path: run the full compress flow inline. Writes go straight
             # to the kv pool via set_compress_*_buffer, so there's nothing
             # for forward_core_compressor to write afterwards.
+            #
+            # Fused path (_forward_npu_fused) is decode-only: it reads write
+            # locations from fm.c{ratio}_loc, which _compute_compress_locs
+            # populates only in its is_decode branch. Prefill / extend keep
+            # the per-request forward_npu path, which derives write_locs
+            # inline via req_to_token_c{4,128}[req_pool, pos_in_req]. The
+            # per-request loop is safe in non-decode modes because prefill /
+            # extend are never CUDA-graph-captured under our setup
+            # (--cuda-graph-bs only enumerates decode bs values), so the
+            # capture-time loop-skip bug (decode-graph-only) does not apply.
+            if (
+                envs.SGLANG_DSV4_NPU_FUSED_COMPRESSOR.get()
+                and forward_batch.forward_mode.is_decode()
+            ):
+                return self._forward_npu_fused(
+                    x, forward_batch.positions, forward_batch
+                )
             return self.forward_npu(x, forward_batch.positions, forward_batch)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
@@ -451,6 +474,131 @@ class Compressor(nn.Module):
             self.register_buffer("hadamard_matrix", H, persistent=False)
             self._npu_hadamard_built = True
         return H
+
+    def _ensure_fused_caches(self) -> None:
+        """Build the per-instance views the fused compressor op needs.
+
+        Lazy because at __init__ time wkv_gate.weight is uninitialized and
+        norm.weight hasn't been loaded yet; first forward fires after
+        weight loading + device move, when these slices are stable.
+
+        * ``_fused_wkv_w`` / ``_fused_wgate_w``: views into
+          ``wkv_gate.weight`` (which stores ``[kv;gate]`` concatenated
+          along output dim, kv first per ``ReplicatedLinear`` convention).
+          The op signature wants them separately; views avoid the copy
+          cost on every forward.
+        * ``_fused_norm_weight_bf16``: bf16 copy of the fp32 RMSNorm
+          weight. The op signature requires bf16/fp16; the cast result is
+          a constant since the underlying weight is frozen post-load.
+        """
+        if self._fused_caches_built:
+            return
+        coff = 1 + int(self.overlap)
+        split = coff * self.head_dim
+        # wkv_gate.weight shape: [2*coff*head_dim, hidden_size]. Split row-wise.
+        w = self.wkv_gate.weight
+        assert (
+            w.shape[0] == 2 * split
+        ), f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
+        self._fused_wkv_w = w[:split]
+        self._fused_wgate_w = w[split:]
+        self._fused_norm_weight_bf16 = self.norm.weight.to(torch.bfloat16)
+        self._fused_caches_built = True
+
+    def _forward_npu_fused(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Fused-op NPU compressor path — single ``torch.ops.custom.compressor``
+        call replaces the per-request Python loop in :meth:`forward_npu`.
+
+        The op:
+          1. Computes ``kv_state = x @ wkv``, ``score_state = x @ wgate``.
+          2. Writes (kv_state, score_state) into ``state_cache`` at offsets
+             derived from ``start_pos`` + ``cu_seqlens``.
+          3. Per-ratio: adds ``ape``, softmax over the ratio dim, sum-reduces,
+             applies RMSNorm + interleave-mode rope (rotary_mode=2), returns
+             ``cmp_kv`` of shape ``[min(T, T//ratio + B), head_dim]``.
+
+        State_cache writes happen inside the op, so we do NOT also call
+        ``set_compress_state_buffer`` afterwards — only the compressed-kv
+        epilog (:meth:`_compressor_epilog_npu`) runs on the returned tensor.
+
+        Requires ``state_dtype=fp32`` (already the case for DSV4), the new
+        backend metadata fields from :meth:`_compute_compress_locs` and
+        :meth:`_build_npu_compress_metadata_prefill`, and a wheel where
+        ``torch.ops.custom.compressor`` is registered.
+        """
+        from sglang.srt.models.deepseek_v4 import get_fused_compressor_rope_cos_sin
+
+        ratio = self.ratio
+        coff = 1 + int(self.overlap)
+        device = x.device
+        self._ensure_npu_hadamard(device)
+        self._ensure_fused_caches()
+
+        fm = forward_batch.attn_backend.forward_metadata
+        positions_cmp = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
+        page_table = getattr(fm, f"c{ratio}_state_page_table", None)
+        start_pos = getattr(fm, "start_pos", None)
+        seqused = getattr(fm, "seqused", None)
+        # cu_seqlens: prefix-sum query lengths with leading 0, [bs+1] int32.
+        cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
+        assert positions_cmp is not None and page_table is not None, (
+            "fused compressor needs backend metadata "
+            "(positions_cmp_padding / c*_state_page_table) — make sure "
+            "_build_npu_compress_metadata ran before this forward."
+        )
+        assert start_pos is not None, "fused compressor needs start_pos"
+        assert cu_seqlens is not None, "fused compressor needs cu_seqlens"
+
+        # state_cache: fp32 [block_num, page_size, 2*coff*D].
+        pool = forward_batch.token_to_kv_pool
+        if TYPE_CHECKING:
+            assert isinstance(pool, DeepSeekV4TokenToKVPool)
+        if self.is_in_indexer:
+            state_cache = pool.get_indexer_compress_state_cache(self.layer_id)
+        else:
+            state_cache = pool.get_attention_compress_state_cache(self.layer_id)
+
+        cos, sin = get_fused_compressor_rope_cos_sin(
+            self.freqs_cis, positions_cmp, dtype=torch.bfloat16
+        )
+
+        cmp_kv = torch.ops.custom.compressor(
+            x,
+            self._fused_wkv_w,
+            self._fused_wgate_w,
+            state_cache,
+            self.ape,
+            self._fused_norm_weight_bf16,
+            rope_sin=sin,
+            rope_cos=cos,
+            rope_head_dim=self.rope_head_dim,
+            cmp_ratio=ratio,
+            state_block_table=page_table,
+            cu_seqlens=cu_seqlens,
+            seqused=seqused,
+            start_pos=start_pos,
+            coff=coff,
+            norm_eps=self.norm.variance_epsilon,
+            rotary_mode=2,
+            cache_mode=1,
+        )
+
+        # cmp_kv shape: [min(T, T//ratio + B), head_dim]. For prefill the loc
+        # tensor may be shorter than the padded output (trailing slots are
+        # never compressed-to); trim to len(loc) before hadamard + epilog.
+        loc = getattr(fm, f"c{ratio}_loc", None)
+        if loc is not None and loc.numel() < cmp_kv.shape[0]:
+            cmp_kv = cmp_kv[: loc.numel()]
+
+        if forward_batch.attn_backend.graph_mode or cmp_kv.shape[0] > 0:
+            if self.rotate:
+                cmp_kv = _apply_hadamard(cmp_kv, self.hadamard_matrix)
+            self._compressor_epilog_npu(cmp_kv, forward_batch)
 
     def forward_npu(
         self,
@@ -525,6 +673,11 @@ class Compressor(nn.Module):
         write_req_indices: list[torch.Tensor] = []
         write_pos_in_req: list[torch.Tensor] = []
         seqlen_offset = 0
+        # Running offset into the tail-only state bundle. The bundle's flat
+        # layout is ``[req0_alloc_len_slots, req1_alloc_len_slots, ...]``
+        # where ``alloc_len_i = seqlen_i - c{ratio}_state_alloc_offset_i`` —
+        # NOT the raw seqlen (see ScheduleBatch._compute_dsv4_state_lens_extend).
+        state_bundle_offset = 0
 
         for idx, seqlen in enumerate(seq_lens_cpu):
             seqlen = int(seqlen)
@@ -550,21 +703,54 @@ class Compressor(nn.Module):
                     # ---- Fast path: non-chunked prefill OR first chunk of
                     # a chunked request. All compress inputs live within
                     # the current chunk so no state-ring reads are needed.
-                    # Use chunk_len (not seqlen) for tensor slicing so this
-                    # is bit-exact equivalent to the historical behaviour
-                    # under non-chunked AND correct for the first chunk
-                    # of a multi-chunk request.
                     pos_req = positions[seqlen_offset : seqlen_offset + chunk_len]
-                    raw_kv_loc = forward_batch.out_cache_loc[
-                        seqlen_offset : seqlen_offset + chunk_len
-                    ]
-                    out_cache_loc = (
-                        token_to_kv_pool.translate_kv_loc_to_compress_state_loc(
-                            raw_kv_loc, ratio
+
+                    # Per-req tail-only state alloc range. Same formula as
+                    # ScheduleBatch._compute_dsv4_state_lens_extend; recomputed
+                    # here to avoid threading another tensor through forward_batch.
+                    tail_128 = chunk_len % 128
+                    if ratio == 4:
+                        c_alloc_len = (
+                            tail_128 + 128
+                            if (tail_128 <= 3 and chunk_len >= 128)
+                            else tail_128
                         )
+                    else:  # ratio == 128
+                        c_alloc_len = tail_128
+                    c_alloc_offset = chunk_len - c_alloc_len
+
+                    # Bundle slice for this req. The NPU paged state pool emits
+                    # real slot ids in the bundle (no ring-hash); slice by
+                    # ``state_bundle_offset`` (cumulative alloc_len across reqs),
+                    # NOT by ``seqlen_offset`` (cumulative raw seqlen).
+                    bundle = forward_batch.out_cache_loc_dsv4
+                    assert bundle is not None, (
+                        "Compressor.forward_npu prefill on NPU needs the DSV4 "
+                        "alloc bundle; expected maybe_write_dsv4_extend to have "
+                        "populated batch.out_cache_loc_dsv4 before forward."
                     )
+                    bundle_state_loc = (
+                        bundle.out_c4_state_loc
+                        if ratio == 4
+                        else bundle.out_c128_state_loc
+                    )
+                    assert (
+                        bundle_state_loc is not None and bundle_state_loc.numel() > 0
+                    ), (
+                        f"Compressor.forward_npu prefill: bundle.out_c{ratio}_state_loc "
+                        f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
+                        f"c{ratio}_state_attn_allocator was not initialized (check "
+                        f"pool_configurator's NPU branch + npu_state_pool_size)."
+                    )
+                    out_cache_loc = bundle_state_loc[
+                        state_bundle_offset : state_bundle_offset + c_alloc_len
+                    ]
+                    state_bundle_offset += c_alloc_len
                     remainder = chunk_len % ratio
                     cutoff = chunk_len - remainder
+                    # ``cutoff`` in raw coords; subtract ``c_alloc_offset`` for
+                    # slice-relative indexing into the per-req bundle slice.
+                    cutoff_in_slice = cutoff - c_alloc_offset
                     should_compress = cutoff >= ratio
                     pos_compressed = pos_req[:cutoff:ratio]
                     kv = kv_full[seqlen_offset : seqlen_offset + chunk_len]
@@ -575,7 +761,9 @@ class Compressor(nn.Module):
                         score_state_to_be_cached.append(
                             score[cutoff - ratio : cutoff] + self.ape
                         )
-                        state_loc_list.append(out_cache_loc[cutoff - ratio : cutoff])
+                        state_loc_list.append(
+                            out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
+                        )
                     if remainder > 0:
                         kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
                         score_cut, score_rem = score.split([cutoff, remainder], dim=0)
@@ -736,6 +924,7 @@ class Compressor(nn.Module):
             # why (.real / .imag on a complex tensor are strided views and
             # aclnnIndex over them triggers StridedSlice materialization).
             from sglang.srt.models.deepseek_v4 import _get_contig_freqs_real_imag
+
             freqs_real, freqs_imag = _get_contig_freqs_real_imag(self.freqs_cis)
             cos_half = freqs_real[pos_out].to(kv_out.dtype)
             sin_half = freqs_imag[pos_out].to(kv_out.dtype)
@@ -757,18 +946,21 @@ class Compressor(nn.Module):
             rope_slice.copy_(rope_rot.view_as(rope_slice))
             if self.rotate:
                 kv_out = _apply_hadamard(kv_out, self.hadamard_matrix)
-            # Slab → c{N}_kv_pool slot for each compressed token.
+            # c{N}_kv_pool slot for each compressed token. The per-req
+            # token-level slot id table on DSV4NPUReqToTokenPool is indexed
+            # directly by compressed-seq position — no page table indirection
+            # needed since the table elements already are c-pool slot ids.
             req_indices_flat = torch.cat(write_req_indices, dim=0)
             pos_in_req_flat = torch.cat(write_pos_in_req, dim=0)
             req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
-            kernel_page_size = forward_batch.attn_backend.page_size
-            page_seq = pos_in_req_flat // kernel_page_size
-            offset = pos_in_req_flat % kernel_page_size
-            pages_table = token_to_kv_pool.get_req_to_token_c_pages(ratio)
-            kernel_page = pages_table[req_pool_flat.to(torch.int64), page_seq]
-            write_locs = (kernel_page.to(torch.int64) * kernel_page_size + offset).to(
-                torch.int32
+            c_table = (
+                forward_batch.req_to_token_pool.req_to_token_c4
+                if ratio == 4
+                else forward_batch.req_to_token_pool.req_to_token_c128
             )
+            write_locs = c_table[
+                req_pool_flat.to(torch.int64), pos_in_req_flat.to(torch.int64)
+            ].to(torch.int32)
             self._compressor_epilog_npu(kv_out, forward_batch, override_loc=write_locs)
         return None
 

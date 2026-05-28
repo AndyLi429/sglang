@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -12,8 +12,10 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip, support_triton
+from sglang.srt.utils import is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
+
+_is_npu = is_npu()
 
 _is_hip = is_hip()
 
@@ -353,6 +355,30 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
+def _collect_dsv4_state_kwargs(batch) -> Optional[dict]:
+    """Pull the per-req c{4,128}_state pool lens off the batch.
+
+    Populated by :meth:`ScheduleBatch._compute_dsv4_state_lens_extend` /
+    ``..._decode`` when the allocator is DSV4-NPU; absent otherwise. Returns
+    None when the helper did not run (CUDA / non-V4 paths), so the
+    ``alloc_paged_token_slots_*`` forwarding stays a no-op.
+    """
+    if getattr(batch, "c4_state_seq_lens", None) is None:
+        return None
+    return {
+        "c4_state_prefix_lens": batch.c4_state_prefix_lens,
+        "c4_state_prefix_lens_cpu": batch.c4_state_prefix_lens_cpu,
+        "c4_state_seq_lens": batch.c4_state_seq_lens,
+        "c4_state_seq_lens_cpu": batch.c4_state_seq_lens_cpu,
+        "c4_state_extend_num_tokens": batch.c4_state_extend_num_tokens,
+        "c128_state_prefix_lens": batch.c128_state_prefix_lens,
+        "c128_state_prefix_lens_cpu": batch.c128_state_prefix_lens_cpu,
+        "c128_state_seq_lens": batch.c128_state_seq_lens,
+        "c128_state_seq_lens_cpu": batch.c128_state_seq_lens_cpu,
+        "c128_state_extend_num_tokens": batch.c128_state_extend_num_tokens,
+    }
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -362,6 +388,8 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_kwargs: Optional[dict] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -372,6 +400,18 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
+    # DSV4-NPU allocator additionally needs req_pool_indices (for c-pool
+    # last_loc lookup via per-req tables) and per-req c{4,128}_state pool
+    # lens (tail-only allocation in a separate paged slot space). Gate via
+    # hasattr so non-DSV4 allocators stay unchanged.
+    extra_alloc_kwargs = {}
+    if req_pool_indices is not None and hasattr(
+        allocator, "register_req_to_token_pool"
+    ):
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        if dsv4_state_kwargs:
+            extra_alloc_kwargs.update(dsv4_state_kwargs)
+
     out_cache_loc = allocator.alloc_extend(
         prefix_lens,
         prefix_lens_cpu,
@@ -379,6 +419,7 @@ def alloc_paged_token_slots_extend(
         seq_lens_cpu,
         last_loc,
         extend_num_tokens,
+        **extra_alloc_kwargs,
     )
 
     if out_cache_loc is None:
@@ -472,6 +513,8 @@ def alloc_for_extend(
             seq_lens_cpu=batch.seq_lens_cpu,
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
+            req_pool_indices=req_pool_indices_device,
+            dsv4_state_kwargs=_collect_dsv4_state_kwargs(batch),
         )
 
     # Write to req_to_token_pool
@@ -489,11 +532,20 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    # Allocate per-req auxiliary pages (no-op for non-DSV4 pools). seq_lens_cpu
-    # here is already post-extend, which is what the c-page allocator needs.
-    batch.tree_cache.token_to_kv_pool_allocator.get_kvcache().alloc_c_pages_for_batch(
-        req_pool_indices_cpu, batch.seq_lens_cpu,
-    )
+    # DSV4-NPU hook: stash bundled per-pool slots on batch.out_cache_loc_dsv4
+    # and write the c4/c128/swa per-req tables. No-op on non-DSV4 paths
+    # (gated by `hasattr(allocator, 'get_last_dsv4_alloc')`).
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+            maybe_write_dsv4_extend,
+        )
+
+        maybe_write_dsv4_extend(
+            batch,
+            req_pool_indices_cpu,
+            prefix_lens_cpu,
+            batch.seq_lens_cpu,
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
@@ -504,6 +556,8 @@ def alloc_paged_token_slots_decode(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     token_per_req: int = 1,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_kwargs: Optional[dict] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -511,7 +565,20 @@ def alloc_paged_token_slots_decode(
     num_tokens = len(seq_lens) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
-    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+    # DSV4-NPU allocator additionally needs req_pool_indices and per-req
+    # c{4,128}_state pool lens; gate via hasattr so non-DSV4 allocators
+    # stay unchanged.
+    extra_alloc_kwargs = {}
+    if req_pool_indices is not None and hasattr(
+        allocator, "register_req_to_token_pool"
+    ):
+        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
+        if dsv4_state_kwargs:
+            extra_alloc_kwargs.update(dsv4_state_kwargs)
+
+    out_cache_loc = allocator.alloc_decode(
+        seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
+    )
 
     if out_cache_loc is None:
         error_msg = (
@@ -554,6 +621,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
             last_loc=last_loc,
             token_per_req=token_per_req,
+            req_pool_indices=batch.req_pool_indices,
+            dsv4_state_kwargs=_collect_dsv4_state_kwargs(batch),
         )
 
     # Write to req_to_token_pool
@@ -566,12 +635,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
-    # Allocate per-req auxiliary pages (no-op for non-DSV4 pools). batch.seq_lens_cpu
-    # here is still the pre-decode value; the post-decode seq_len is needed so
-    # the c-page allocator sees the just-written token position.
-    batch.tree_cache.token_to_kv_pool_allocator.get_kvcache().alloc_c_pages_for_batch(
-        batch.req_pool_indices.cpu(), batch.seq_lens_cpu + token_per_req,
-    )
+    # DSV4-NPU hook: post-decode write of per-req c4/c128/swa tables and
+    # stash bundled slots on batch.out_cache_loc_dsv4. No-op on non-DSV4.
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.dsv4_common_hooks import (
+            maybe_write_dsv4_decode,
+        )
+
+        maybe_write_dsv4_decode(
+            batch,
+            batch.seq_lens_cpu + token_per_req,
+            token_per_req,
+        )
 
     return out_cache_loc
 
@@ -629,10 +704,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
-    # Free per-req auxiliary pages (no-op for non-DSV4 pools). Must happen
-    # before the req_pool_idx slot itself is released, so the same slot can
-    # be re-admitted with a clean c-page table.
-    tree_cache.token_to_kv_pool_allocator.get_kvcache().free_c_pages(req.req_pool_idx)
+    # DSV4-NPU c4/c128 pool free piggy-backs on DSV4NPUReqToTokenPool.free —
+    # see hardware_backend/npu/dsv4_req_to_token_pool.py:free. No-op for
+    # other ReqToTokenPool subclasses.
     tree_cache.req_to_token_pool.free(req)
 
 

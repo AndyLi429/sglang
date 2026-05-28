@@ -33,11 +33,14 @@ from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
+    attn_tp_all_reduce,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -120,6 +123,35 @@ def _get_contig_freqs_real_imag(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, 
         cached = (freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
         _NPU_ROPE_CONTIG_CACHE[cache_key] = cached
     return cached
+
+
+def get_fused_compressor_rope_cos_sin(
+    freqs_cis: torch.Tensor,
+    positions_cmp: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (cos, sin) tensors shaped ``[T, rope_head_dim]`` for the fused
+    compressor op (``torch.ops.custom.compressor``).
+
+    The op consumes ``rope_cos`` / ``rope_sin`` of shape
+    ``[min(T, T//cmp_ratio + B), rope_head_dim]`` in bf16/fp16. We index
+    the cached contig real/imag halves of the complex ``freqs_cis`` and
+    interleave-double the last dim to match the kernel's expected layout
+    (matches dsv4_release ``ComplexExpRotaryEmbedding.cos_cache``, which
+    is built as ``complex_cache.real.repeat_interleave(2, dim=-1)``).
+
+    Safe to call from inside a captured aclgraph: both ``index_select`` and
+    ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
+    capture-time shape produce static-shape outputs. Identical to what the
+    existing inplace_partial_rotary_mul fallback does at
+    :func:`_v4_rope_inplace_npu`, just without the inverse / 4D-view step.
+    """
+    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos_half = real_contig.index_select(0, positions_cmp)
+    sin_half = imag_contig.index_select(0, positions_cmp)
+    cos = cos_half.repeat_interleave(2, dim=-1).to(dtype)
+    sin = sin_half.repeat_interleave(2, dim=-1).to(dtype)
+    return cos, sin
 
 
 def _v4_rope_inplace_npu(
@@ -494,7 +526,7 @@ class MQALayer(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=attn_tp_size > 1,
+            reduce_results=attn_tp_size == get_tensor_model_parallel_world_size() and attn_tp_size > 1,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -729,9 +761,6 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = forward_batch.attn_backend
@@ -815,6 +844,8 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
+        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+            o = attn_tp_all_reduce(o)
 
         return o
 
@@ -938,21 +969,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "norm_eps": self.rms_norm_eps,
                 "hc_eps": self.hc_eps,
             }
-            import os as _os, time as _time, uuid as _uuid
-            try:
-                from sglang.srt.layers.dp_attention import get_attention_dp_rank as _get_dp_rank
-                _dp_rank = _get_dp_rank()
-            except Exception:
-                _dp_rank = 0
-            _dump_dir = _os.path.join(
-                "/home/t00937989/logs/npu_hc_pre_input", f"dp_rank_{_dp_rank}"
-            )
-            _os.makedirs(_dump_dir, exist_ok=True)
-            _dump_path = _os.path.join(
-                _dump_dir,
-                f"hc_pre_{_time.time_ns()}_{_uuid.uuid4().hex[:8]}.pt",
-            )
-            torch.save(_hc_pre_inputs, _dump_path)
+            # import os as _os, time as _time, uuid as _uuid
+            # try:
+            #     from sglang.srt.layers.dp_attention import get_attention_dp_rank as _get_dp_rank
+            #     _dp_rank = _get_dp_rank()
+            # except Exception:
+            #     _dp_rank = 0
+            # _dump_dir = _os.path.join(
+            #     "/home/t00937989/logs/npu_hc_pre_input", f"dp_rank_{_dp_rank}"
+            # )
+            # _os.makedirs(_dump_dir, exist_ok=True)
+            # _dump_path = _os.path.join(
+            #     _dump_dir,
+            #     f"hc_pre_{_time.time_ns()}_{_uuid.uuid4().hex[:8]}.pt",
+            # )
+            # torch.save(_hc_pre_inputs, _dump_path)
             y, post, comb = torch.ops.custom.npu_hc_pre(
                 x,
                 hc_fn,
@@ -1090,30 +1121,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        # [layer_probe] hang-localization probe. Tags each phase boundary
-        # only on layer 0/1 for the first 4 forwards, so we can read off
-        # the log AFTER a crash to see which rank's last printed marker
-        # is — the next phase is where it hung. Env-gated by
-        # SGLANG_LAYER_PROBE (default on; set =0 to silence).
-        import os as _os_lp, logging as _log_lp
-        _LP_ON = (
-            _os_lp.environ.get("SGLANG_LAYER_PROBE", "1") != "0"
-            and self.layer_id <= 1
-        )
-        if _LP_ON:
-            self._layer_call_ct = getattr(self, "_layer_call_ct", 0) + 1
-            _ct = self._layer_call_ct
-            _LP_ON = _ct <= 4
-            if _LP_ON:
-                _lp = _log_lp.getLogger("sglang.layer_probe")
-                _lp.warning(
-                    "[layer_probe L%d ct=%d] start  mode=%s shape=%s",
-                    self.layer_id, _ct, forward_batch.forward_mode,
-                    tuple(hidden_states.shape),
-                )
-
         residual = hidden_states
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before hc_pre1", self.layer_id, _ct)
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
             self.hc_attn_fn,
@@ -1122,23 +1130,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.input_layernorm,
             forward_batch=forward_batch,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  hc_pre1  shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if not norm_fused:
             hidden_states = self.input_layernorm(hidden_states)
 
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before self_attn", self.layer_id, _ct)
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  self_attn shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
 
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before hc_post1", self.layer_id, _ct)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  hc_post1 shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         residual = hidden_states
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before hc_pre2", self.layer_id, _ct)
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
             self.hc_ffn_fn,
@@ -1147,7 +1149,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.post_attention_layernorm,
             forward_batch=forward_batch,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  hc_pre2  shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -1173,16 +1174,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            # `get_global_dp_buffer` upstream now requires the TP group as an
-            # explicit positional arg; mirror communicator.py:986 to fix the
-            # nodeepep (moe_a2a_backend=none) path which crashed with
-            # `TypeError: get_global_dp_buffer() missing 1 required positional
-            # argument: 'group'` on every DP rank's first forward.
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # hidden_states here follow TP_ATTN_FULL semantics: they are replicated
+            # within an attention-TP group. Use replicate gather to avoid summing the
+            # same activations across attention-TP ranks before entering MLP/MoE.
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
@@ -1190,19 +1189,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] before mlp     shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
-        if _LP_ON: _lp.warning("[layer_probe L%d ct=%d] after  mlp     shape=%s", self.layer_id, _ct, tuple(hidden_states.shape))
         if _use_tp_moe_gather:
-            # Paired scatter back to local buffer; same TP group as the gather
-            # above (see fix comment there).
             hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
+                get_local_dp_buffer(get_attention_tp_group()),
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -1308,7 +1303,9 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            # Token ids are replicated within an attention-TP group. Use replicate
+            # gather here to avoid summing duplicated ids when attention_tp_size > 1.
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
