@@ -90,12 +90,22 @@ def forward_mha_prepare_npu(
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
         ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+        # MLA prefill CP: hidden_states (-> latent_cache) was zigzag-split to
+        # local size by cp_split_and_rebuild_data, but out_cache_loc is still
+        # the full per-sequence allocation. The fused kernel requires
+        # index.shape[0] == B*S; apply the SAME zigzag permutation to
+        # out_cache_loc so each local token writes to its real global slot.
+        cache_loc = forward_batch.out_cache_loc.to(torch.int64)
+        cp_meta = getattr(forward_batch, "attn_cp_metadata", None)
+        if cp_meta is not None and cache_loc.shape[0] != latent_cache.shape[0]:
+            chunks = torch.split(cache_loc, cp_meta.split_list, dim=0)
+            cache_loc = torch.cat([chunks[i] for i in cp_meta.zigzag_index], dim=0)
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
             cos,
             sin,
-            forward_batch.out_cache_loc.to(torch.int64),
+            cache_loc,
             k_rope_cache,
             ckv_cache,
             k_rope_scale=None,

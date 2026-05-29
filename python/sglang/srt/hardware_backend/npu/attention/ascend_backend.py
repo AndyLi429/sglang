@@ -1023,10 +1023,19 @@ class AscendAttnBackend(AttentionBackend):
         mask: torch.Tensor,
         layer,
     ):
-        """Two-phase ring_mla: first compute attention over the Q-aligned KV
-        chunk (causal mask), then merge the previously-visible KV chunk via
-        online-softmax LSE accumulation. KV chunks are contiguous slices of
-        the full-gathered tensors — no torch.index_select copy needed.
+        """Two-phase ring_mla mirroring the in-file prefix-cache MLA path:
+
+        1. first_ring + triu over the Q-aligned (diagonal) KV chunk -> seeds
+           attn_output / attn_lse. The diagonal block is square (q_len ==
+           kv_len), every query sees at least its own key, so no row is fully
+           masked and the seed LSE never contains NaN.
+        2. calc_type_default + no_mask over the earlier, fully-visible KV
+           chunk, merged into the seed via the kernel's built-in
+           online-softmax LSE accumulation (pre_out / prev_lse).
+
+        seqlen format follows the proven convention used elsewhere in this
+        file: first_ring takes 1D [bs] (q-lengths), default takes 2D [2, bs]
+        ([q_lengths; kv_lengths]).
         """
         attn_output = torch.zeros(
             q_nope.shape[0],
@@ -1039,6 +1048,7 @@ class AscendAttnBackend(AttentionBackend):
             layer.tp_q_head_num, q_pe.shape[0], dtype=torch.float32, device=k_pe.device
         )
 
+        # 1) Diagonal (Q-aligned) KV chunk: first_ring with causal triu mask.
         k_nope_mask = k_nope[kv_mask_slice].contiguous()
         value_mask = value[kv_mask_slice].contiguous()
         k_pe_mask = k_pe[kv_mask_slice].contiguous()
@@ -1065,8 +1075,11 @@ class AscendAttnBackend(AttentionBackend):
 
         nomask_len = kv_nomask_slice.stop - kv_nomask_slice.start
         if nomask_len == 0:
+            # rank-0 head block: no earlier KV, diagonal result is final.
             return attn_output, attn_lse
 
+        # 2) Earlier, fully-visible KV chunk: default + no_mask, merged into
+        #    the seed via the kernel's online-softmax LSE accumulation.
         k_nope_nomask = k_nope[kv_nomask_slice].contiguous()
         value_nomask = value[kv_nomask_slice].contiguous()
         k_pe_nomask = k_pe[kv_nomask_slice].contiguous()
@@ -1119,9 +1132,6 @@ class AscendAttnBackend(AttentionBackend):
         """
         cp_meta = forward_batch.attn_cp_metadata
         cp_size = self.attn_cp_size
-        cp_rank = cp_meta.bs and 0  # placeholder; real cp_rank read below
-        # We rely on get_attention_cp_group()'s rank in the metadata builder
-        # rather than re-deriving here.
 
         # 1) All-gather K and V across CP ranks (one collective for both).
         k_full, v_full = _cp_allgather_mla_kv_npu(forward_batch, k, v, cp_size)
@@ -1163,15 +1173,18 @@ class AscendAttnBackend(AttentionBackend):
         tail_nomask_slice = slice(0, kv_len_next - q_next_len)
         tail_mask_slice = slice(kv_len_next - q_next_len, kv_len_next)
 
-        # ring_mla seqlen format: [q_len, kv_len] per call.
-        head_mask_seqlens = torch.tensor([q_prev_len, q_prev_len], dtype=torch.int32)
+        # ring_mla seqlen format (proven by the prefix-cache MLA path in this
+        # file): first_ring takes 1D [bs] q-lengths (diagonal block is square,
+        # so kv_len == q_len); default takes 2D [2, bs] = [q_lengths;
+        # kv_lengths]. seqlen lives on CPU (unlike most other Ascend ops).
+        head_mask_seqlens = torch.tensor([q_prev_len], dtype=torch.int32)
         head_nomask_seqlens = torch.tensor(
-            [q_prev_len, head_nomask_slice.stop - head_nomask_slice.start],
+            [[q_prev_len], [head_nomask_slice.stop - head_nomask_slice.start]],
             dtype=torch.int32,
         )
-        tail_mask_seqlens = torch.tensor([q_next_len, q_next_len], dtype=torch.int32)
+        tail_mask_seqlens = torch.tensor([q_next_len], dtype=torch.int32)
         tail_nomask_seqlens = torch.tensor(
-            [q_next_len, tail_nomask_slice.stop - tail_nomask_slice.start],
+            [[q_next_len], [tail_nomask_slice.stop - tail_nomask_slice.start]],
             dtype=torch.int32,
         )
 
@@ -1203,8 +1216,10 @@ class AscendAttnBackend(AttentionBackend):
             layer=layer,
         )
 
+        # Match existing MLA prefill paths by returning 3D
+        # [N, tp_q_head_num, v_head_dim].
         attn_output = torch.cat([out_head, out_tail], dim=0)
-        return attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return attn_output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
 
     def forward_extend(
         self,
@@ -1572,6 +1587,7 @@ class AscendAttnBackend(AttentionBackend):
                     qk_scale=layer.scaling,
                     kernel_type="kernel_type_high_precision",
                     mask_type="mask_type_triu",
+                    input_layout="type_bsnd",
                     calc_type="calc_type_first_ring",
                     output=attn_output,
                     softmax_lse=attn_lse,
@@ -1616,6 +1632,7 @@ class AscendAttnBackend(AttentionBackend):
                     qk_scale=layer.scaling,
                     kernel_type="kernel_type_high_precision",
                     mask_type="no_mask",
+                    input_layout="type_bsnd",
                     calc_type="calc_type_default",
                     output=attn_output,
                     softmax_lse=attn_lse,

@@ -256,18 +256,23 @@ class TestForwardMlaPcp(CustomTestCase):
 
     def test_seqlens_match_metadata(self):
         """Verify ring_mla seqlen args match attn_cp_metadata exactly,
-        proving we do NOT use the legacy (seq_len+1)//2 path."""
+        proving we do NOT use the legacy (seq_len+1)//2 path.
+
+        seqlen format follows the proven npu_ring_mla convention:
+          - first_ring (diagonal, square q x q): 1D [bs] q-lengths.
+          - default (q x kv): 2D [2, bs] = [q_lengths; kv_lengths].
+        """
         q_prev, q_next, kv_prev, kv_next = 5, 7, 11, 19
         _, _, ring_mock, _ = self._run(q_prev, q_next, kv_prev, kv_next)
-        # Call 0: head mask  → seqlen = [q_prev, q_prev]
-        # Call 1: head nomask→ seqlen = [q_prev, kv_prev - q_prev]
-        # Call 2: tail mask  → seqlen = [q_next, q_next]
-        # Call 3: tail nomask→ seqlen = [q_next, kv_next - q_next]
+        # Call 0: head mask   (first_ring) → [q_prev]
+        # Call 1: head nomask (default)    → [[q_prev], [kv_prev - q_prev]]
+        # Call 2: tail mask   (first_ring) → [q_next]
+        # Call 3: tail nomask (default)    → [[q_next], [kv_next - q_next]]
         seqlens = [c.kwargs["seqlen"].tolist() for c in ring_mock.call_args_list]
-        self.assertEqual(seqlens[0], [q_prev, q_prev])
-        self.assertEqual(seqlens[1], [q_prev, kv_prev - q_prev])
-        self.assertEqual(seqlens[2], [q_next, q_next])
-        self.assertEqual(seqlens[3], [q_next, kv_next - q_next])
+        self.assertEqual(seqlens[0], [q_prev])
+        self.assertEqual(seqlens[1], [[q_prev], [kv_prev - q_prev]])
+        self.assertEqual(seqlens[2], [q_next])
+        self.assertEqual(seqlens[3], [[q_next], [kv_next - q_next]])
 
     def test_q_split_uses_total_q_prev_tokens(self):
         """The Q split must use total_q_prev_tokens, not (S+1)//2.
