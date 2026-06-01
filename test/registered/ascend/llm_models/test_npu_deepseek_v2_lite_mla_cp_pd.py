@@ -4,17 +4,17 @@ This test validates the **MLA prefill context-parallel (CP)** code path on NPU
 under a **PD-disaggregated** deployment, which is the only configuration that
 produces correct results for MLA CP today:
 
-  - Prefill node: TP=4, MOE_DP=2, ATTN_CP=2, ``--enable-prefill-context-parallel``.
-    On Ascend, CP is driven by ``--attn-cp-size`` + ``--moe-dp-size`` and the
-    total NPU count == tp_size (no replication). ``--moe-dp-size > 1`` turns on
-    the MoE all2all backend so the MLP-sync / DP-gather buffer
-    (``set_dp_buffer_len`` → ``_dp_max_padding``) is initialized for the CP
-    communicator. ``max_running_requests == 1`` because batch_size==1 is a hard
-    CP restriction. Each CP rank stores only its slice of the context KV and
-    rebuilds the full KV (via ``cp_all_gather_rerange_output``) before handing
-    it to decode.
-    NOTE: do NOT pass ``--dp-size`` here — on Ascend that triggers classic
-    data-parallel replication (dp_size * tp_size NPUs) and does not enable CP.
+  - Prefill node: TP=4, DP=2 → ATTN_CP=2, with DP attention + DeepEP MoE.
+    IMPORTANT: SGLang's MLA-CP auto-config (server_args.py:1936) is gated to
+    DeepseekV3ForCausalLM / V3.2 / Kimi-K2.5 / GLM-MoE-DSA. DeepSeek-V2-Lite is
+    DeepseekV2ForCausalLM and is NOT covered, so this test replicates the
+    auto-config knobs by hand (--enable-dp-attention, --moe-a2a-backend deepep,
+    --ep-size == tp_size, --moe-dense-tp-size 1, --disable-piecewise-cuda-graph).
+    The model code in deepseek_v2.py is shared by V2/V3, but MLA CP on the V2
+    arch is NOT an officially supported combination — treat results accordingly.
+    ``max_running_requests == 1`` because batch_size==1 is a hard CP restriction.
+    Each CP rank stores only its slice of the context KV and rebuilds the full
+    KV (via ``cp_all_gather_rerange_output``) before handing it to decode.
   - Decode node: TP=2, no CP (CP is a prefill-only optimization).
   - A mini load balancer (sglang_router) fronts both sides.
 
@@ -59,16 +59,15 @@ register_npu_ci(est_time=900, suite="nightly-8-npu-a3", nightly=True)
 
 MODEL_PATH = "/home/weights/DeepSeek-V2-Lite/"
 
-# Parallelism / placement (Ascend CP recipe; mirrors test_npu_qwen3_30b_attn_cp).
-# On Ascend, prefill CP is driven by --attn-cp-size + --moe-dp-size, and total
-# GPUs == tp_size (NO replication). Do NOT use --dp-size: that triggers classic
-# data-parallel replication (dp_size * tp_size GPUs) and does NOT enable CP.
-# --moe-dp-size>1 turns on the MoE all2all backend, which makes
-# require_attn_tp_gather True so the MLP sync runs and the DP-gather buffer
-# (set_dp_buffer_len → `_dp_max_padding`) is initialized for the CP communicator.
+# Parallelism / placement.
+# MLA CP needs DP attention with dp_size > 1; attn_cp_size = tp_size // dp_size.
+# With --enable-dp-attention, the dp groups SHARE the tp_size NPUs (total NPUs ==
+# tp_size, NO replication). With TP=4, DP=2 we get ATTN_CP=2 → prefill uses 4 NPUs.
+# (Passing --dp-size WITHOUT --enable-dp-attention would instead replicate into
+#  dp_size * tp_size NPUs and not enable CP — that is NOT what we want.)
 PREFILL_TP = 4
+PREFILL_DP = 2  # → attn_cp_size = 4 // 2 = 2
 PREFILL_ATTN_CP = 2
-PREFILL_MOE_DP = 2
 DECODE_TP = 2
 PREFILL_BASE_GPU_ID = 0  # NPUs 0..(PREFILL_TP-1)  → 0..3
 DECODE_BASE_GPU_ID = PREFILL_TP  # NPUs 4..(4+DECODE_TP-1) → 4..5
@@ -184,13 +183,29 @@ class TestDeepSeekV2LiteMLACPPD(CustomTestCase):
             cls.bootstrap_port,
             "--base-gpu-id",
             str(PREFILL_BASE_GPU_ID),
+            # --- MLA CP geometry (TP=4, DP=2 → ATTN_CP=2) ---
             "--tp-size",
             str(PREFILL_TP),
-            "--moe-dp-size",
-            str(PREFILL_MOE_DP),
+            "--dp-size",
+            str(PREFILL_DP),
+            "--enable-dp-attention",
             "--attn-cp-size",
             str(PREFILL_ATTN_CP),
             "--enable-prefill-context-parallel",
+            # The DeepSeek MLA-CP auto-config (server_args.py:1936) only runs for
+            # DeepseekV3ForCausalLM / V3.2 / Kimi-K2.5 / GLM-MoE-DSA archs.
+            # DeepSeek-V2-Lite is DeepseekV2ForCausalLM and is NOT in that list,
+            # so we replicate the auto-config knobs by hand here (the model code
+            # in deepseek_v2.py is shared by V2 and V3). Without these,
+            # require_mlp_sync stays False, set_dp_buffer_len is never called,
+            # and the CP communicator crashes on the unset `_dp_max_padding`.
+            "--moe-a2a-backend",
+            "deepep",
+            "--ep-size",
+            str(PREFILL_TP),
+            "--moe-dense-tp-size",
+            "1",
+            "--disable-piecewise-cuda-graph",
             # CP hard limit: prefill batch_size must be 1.
             "--max-running-requests",
             "1",  # prefill bs==1
@@ -293,7 +308,7 @@ class TestDeepSeekV2LiteMLACPPD(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(
             "GSM8K accuracy "
-            f"(PD-disagg MLA CP: prefill TP={PREFILL_TP} MOE_DP={PREFILL_MOE_DP} "
+            f"(PD-disagg MLA CP: prefill TP={PREFILL_TP} DP={PREFILL_DP} "
             f"ATTN_CP={PREFILL_ATTN_CP}, decode TP={DECODE_TP}, "
             f"{GSM8K_NUM_QUESTIONS} samples): {metrics['accuracy']:.3f}"
         )
