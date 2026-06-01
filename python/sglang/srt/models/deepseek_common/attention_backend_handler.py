@@ -38,6 +38,15 @@ def _dispatch_mla_subtype(attn, forward_batch):
 
 
 def handle_attention_ascend(attn, forward_batch):
+    # MLA prefill CP must use the absorbed MLA path (mirrors CUDA's
+    # _handle_attention_backend): forward_mla_prepare_npu gathers latent KV via
+    # rebuild_cp_kv_cache and the backend runs forward_mla_pcp. The default
+    # MHA_NPU prefill path has no CP wiring and writes rank-local KV at a
+    # full-length out_cache_loc, crashing npu_kv_rmsnorm_rope_cache
+    # ("Index's shape size must equal with B*S"). DSA models keep their own CP
+    # path (DSA_NPU + do_cp_balance_attn).
+    if mla_use_prefill_cp(forward_batch) and not hasattr(attn, "indexer"):
+        return AttnForwardMethod.MLA_NPU
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
