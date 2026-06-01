@@ -4,17 +4,19 @@ This test validates the **MLA prefill context-parallel (CP)** code path on NPU
 under a **PD-disaggregated** deployment, which is the only configuration that
 produces correct results for MLA CP today:
 
-  - Prefill node: TP=2, ATTN_CP=2, ``--enable-prefill-context-parallel``.
-    MLA CP forces ``enable_dp_attention``, ``ep_size == tp_size`` and
-    ``max_running_requests == 1`` (batch_size==1 is a hard CP restriction).
-    Each CP rank stores only its slice of the context KV and rebuilds the full
-    KV (via ``cp_all_gather_rerange_output``) before handing it to decode.
+  - Prefill node: TP=4, DP=2 → ATTN_CP=2, ``--enable-prefill-context-parallel``.
+    MLA CP derives ``attn_cp_size = tp_size // dp_size`` and REQUIRES dp_size>1
+    (it forces ``enable_dp_attention``); it also forces ``ep_size == tp_size``
+    and the deepep MoE a2a backend. ``max_running_requests == 1`` because
+    batch_size==1 is a hard CP restriction. Each CP rank stores only its slice
+    of the context KV and rebuilds the full KV (via
+    ``cp_all_gather_rerange_output``) before handing it to decode.
   - Decode node: TP=2, no CP (CP is a prefill-only optimization).
   - A mini load balancer (sglang_router) fronts both sides.
 
 KV is transferred over the Ascend backend (``--disaggregation-transfer-backend
-ascend`` + ``ASCEND_MF_STORE_URL``), so all four NPUs live on a single node:
-prefill on NPU 0-1, decode on NPU 2-3.
+ascend`` + ``ASCEND_MF_STORE_URL``), so all six NPUs live on a single node:
+prefill on NPU 0-3, decode on NPU 4-5.
 
 Run locally::
 
@@ -48,17 +50,21 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-# 4 NPUs (prefill TP=2 + decode TP=2); MLA CP is experimental → nightly only.
-register_npu_ci(est_time=900, suite="nightly-4-npu-a3", nightly=True)
+# 6 NPUs: prefill TP=4 (DP=2, ATTN_CP=2) + decode TP=2. MLA CP is experimental.
+register_npu_ci(est_time=900, suite="nightly-8-npu-a3", nightly=True)
 
 MODEL_PATH = "/home/weights/DeepSeek-V2-Lite/"
 
-# Parallelism / placement
-PREFILL_TP = 2
-PREFILL_ATTN_CP = 2
+# Parallelism / placement.
+# MLA prefill CP auto-derives attn_cp_size = PREFILL_TP // PREFILL_DP and
+# REQUIRES dp_size > 1 (it forces DP attention). With TP=4, DP=2 we get
+# ATTN_CP=2. dp_size=1 is illegal here and makes the DP-gather buffer setup
+# (set_dp_buffer_len) be skipped → AttributeError on `_dp_max_padding`.
+PREFILL_TP = 4
+PREFILL_DP = 2  # → attn_cp_size = 4 // 2 = 2
 DECODE_TP = 2
-PREFILL_BASE_GPU_ID = 0  # NPUs 0..(PREFILL_TP-1)
-DECODE_BASE_GPU_ID = PREFILL_TP  # decode starts after the prefill NPUs
+PREFILL_BASE_GPU_ID = 0  # NPUs 0..(PREFILL_TP-1)  → 0..3
+DECODE_BASE_GPU_ID = PREFILL_TP  # NPUs 4..(4+DECODE_TP-1) → 4..5
 
 # GSM8K accuracy gate (DeepSeek-Coder-V2-Lite-Instruct, 5-shot). This is a
 # correctness sanity check for the CP path, not a tight perf bar.
@@ -173,9 +179,11 @@ class TestDeepSeekV2LiteMLACPPD(CustomTestCase):
             str(PREFILL_BASE_GPU_ID),
             "--tp-size",
             str(PREFILL_TP),
+            "--dp-size",
+            str(PREFILL_DP),
             "--enable-prefill-context-parallel",
-            "--attn-cp-size",
-            str(PREFILL_ATTN_CP),
+            # attn_cp_size is auto-derived as tp_size // dp_size; MLA CP also
+            # auto-sets enable_dp_attention / ep_size==tp_size / deepep.
             # MLA CP hard limit: prefill batch_size must be 1.
             "--max-running-requests",
             "1",  # prefill bs==1
@@ -278,9 +286,9 @@ class TestDeepSeekV2LiteMLACPPD(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(
             "GSM8K accuracy "
-            f"(PD-disagg MLA CP: prefill TP={PREFILL_TP} ATTN_CP={PREFILL_ATTN_CP}, "
-            f"decode TP={DECODE_TP}, {GSM8K_NUM_QUESTIONS} samples): "
-            f"{metrics['accuracy']:.3f}"
+            f"(PD-disagg MLA CP: prefill TP={PREFILL_TP} DP={PREFILL_DP} "
+            f"ATTN_CP={PREFILL_TP // PREFILL_DP}, decode TP={DECODE_TP}, "
+            f"{GSM8K_NUM_QUESTIONS} samples): {metrics['accuracy']:.3f}"
         )
         self.assertGreaterEqual(metrics["accuracy"], GSM8K_MIN_ACCURACY)
 
