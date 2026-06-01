@@ -23,7 +23,10 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
+    mla_use_prefill_cp,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
@@ -1027,6 +1030,12 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope,
                 topk_indices,
             )
+        if self.use_mla and mla_use_prefill_cp(forward_batch):
+            # MLA prefill context parallel. k/k_rope are already the full
+            # all-gathered KV (rebuild_cp_kv_cache ran in forward_absorb_prepare);
+            # q is this rank's local zigzag Q. Do not save/re-gather KV here.
+            return self.forward_mla_pcp(q, k, v, layer, forward_batch, q_rope, k_rope)
+
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -1565,6 +1574,146 @@ class AscendAttnBackend(AttentionBackend):
                     )
 
         return attn_output
+
+    def _attention_with_mask_and_nomask(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        value: torch.Tensor,
+        kv_mask_idx: torch.Tensor,
+        kv_nomask_idx: torch.Tensor,
+        attn_mask_seqlens: torch.Tensor,
+        attn_nomask_seqlens: torch.Tensor,
+        layer: "RadixAttention",
+    ):
+        """Attention for one Q chunk against the full gathered KV, split into a
+        diagonal (causal/triangular) "mask" block and a preceding "nomask"
+        prefix block whose result is LSE-combined onto the mask result. This is
+        the same two-pass npu_ring_mla primitive used by the prefix-cache branch
+        (forward_extend, ~line 1387/1431), generalized for CP head/tail Q.
+        """
+        attn_output = torch.zeros(
+            q_nope.shape[0],
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=k_pe.dtype,
+            device=k_pe.device,
+        )
+        attn_lse = torch.zeros(
+            layer.tp_q_head_num,
+            q_pe.shape[0],
+            dtype=torch.float32,
+            device=k_pe.device,
+        )
+
+        # mask (diagonal block): triangular causal.
+        k_nope_mask = torch.index_select(k_nope, 0, kv_mask_idx)
+        value_mask = torch.index_select(value, 0, kv_mask_idx)
+        k_pe_mask = torch.index_select(k_pe, 0, kv_mask_idx)
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=k_nope_mask,
+            k_rope=k_pe_mask,
+            value=value_mask,
+            mask=self.ringmla_mask,
+            seqlen=attn_mask_seqlens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=None,
+            prev_lse=None,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="mask_type_triu",
+            input_layout="type_bsnd",
+            calc_type="calc_type_first_ring",
+            output=attn_output,
+            softmax_lse=attn_lse,
+        )
+
+        # nomask (prefix blocks): full attention, LSE-combined onto the mask result.
+        if kv_nomask_idx.shape[0] == 0:
+            return attn_output, attn_lse
+        k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx)
+        value_nomask = torch.index_select(value, 0, kv_nomask_idx)
+        k_pe_nomask = torch.index_select(k_pe, 0, kv_nomask_idx)
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=k_nope_nomask,
+            k_rope=k_pe_nomask,
+            value=value_nomask,
+            mask=self.ringmla_mask,
+            seqlen=attn_nomask_seqlens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=attn_output,
+            prev_lse=attn_lse,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="no_mask",
+            input_layout="type_bsnd",
+            calc_type="calc_type_default",
+            output=attn_output,
+            softmax_lse=attn_lse,
+        )
+        return attn_output, attn_lse
+
+    def forward_mla_pcp(
+        self,
+        q_nope,
+        k_nope,
+        v,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        q_rope,
+        k_rope,
+    ):
+        """MLA prefill context-parallel attention on Ascend.
+
+        The model side (rebuild_cp_kv_cache) has already all-gathered + reranged
+        the full KV (k_nope/k_rope/v), while q_nope/q_rope are this rank's local
+        zigzag Q laid out as [all_seqs_head, all_seqs_tail]. Split at
+        total_q_prev_tokens (bs>1 correct), compute head and tail against their
+        causal prefix of the full KV via mask+nomask npu_ring_mla, then concat.
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+
+        split = cp_meta.total_q_prev_tokens
+        q_nope_head = q_nope[:split].contiguous()
+        q_nope_tail = q_nope[split:].contiguous()
+        q_rope_head = q_rope[:split].contiguous()
+        q_rope_tail = q_rope[split:].contiguous()
+
+        output_head, lse_head = self._attention_with_mask_and_nomask(
+            q_nope=q_nope_head,
+            q_pe=q_rope_head,
+            k_nope=k_nope,
+            k_pe=k_rope,
+            value=v,
+            kv_mask_idx=cp_meta.npu_head_mask_idx,
+            kv_nomask_idx=cp_meta.npu_head_nomask_idx,
+            attn_mask_seqlens=cp_meta.npu_head_mask_seqlens,
+            attn_nomask_seqlens=cp_meta.npu_head_nomask_seqlens,
+            layer=layer,
+        )
+        output_tail, lse_tail = self._attention_with_mask_and_nomask(
+            q_nope=q_nope_tail,
+            q_pe=q_rope_tail,
+            k_nope=k_nope,
+            k_pe=k_rope,
+            value=v,
+            kv_mask_idx=cp_meta.npu_tail_mask_idx,
+            kv_nomask_idx=cp_meta.npu_tail_nomask_idx,
+            attn_mask_seqlens=cp_meta.npu_tail_mask_seqlens,
+            attn_nomask_seqlens=cp_meta.npu_tail_nomask_seqlens,
+            layer=layer,
+        )
+
+        attn_output = torch.cat([output_head, output_tail], dim=0)
+        return attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_dllm(
         self,

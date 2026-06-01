@@ -16,6 +16,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -55,6 +58,25 @@ class ContextParallelMetadata:
     # Aggregate sum of extend_seq_lens across the batch.
     total_seq_lens: int = 0
     bs: int = 1
+
+    # NPU-only fields for the Ascend MLA CP path (forward_mla_pcp). These index
+    # into the full all-gathered KV (rebuild_cp_kv_cache reranges it to original
+    # per-sequence order, so each sequence occupies a contiguous region). For the
+    # rank-local head (prev) and tail (next) Q blocks, attention is split into a
+    # diagonal "mask" block (triangular causal, computed via npu_ring_mla
+    # mask_type_triu) and the preceding "nomask" prefix block (full attention,
+    # LSE-combined onto the mask result). Left None on non-NPU devices.
+    npu_head_mask_idx: torch.Tensor = None  # int64, diagonal block rows for head Q
+    npu_head_nomask_idx: torch.Tensor = None  # int64, prefix block rows for head Q
+    npu_tail_mask_idx: torch.Tensor = None  # int64, diagonal block rows for tail Q
+    npu_tail_nomask_idx: torch.Tensor = None  # int64, prefix block rows for tail Q
+    # Per-sequence seqlens. mask: [bs] (q==kv, the diagonal block length).
+    # nomask: [2, bs] = stack([q_lens, kv_nomask_lens]), mirroring the
+    # torch.stack([extend_seq_lens, prefix_lens]) form at ascend_backend.py:1425.
+    npu_head_mask_seqlens: torch.Tensor = None
+    npu_tail_mask_seqlens: torch.Tensor = None
+    npu_head_nomask_seqlens: torch.Tensor = None
+    npu_tail_nomask_seqlens: torch.Tensor = None
 
 
 def is_prefill_context_parallel_enabled():
@@ -627,6 +649,64 @@ def prepare_context_parallel_metadata(
     assert sorted(cp_reverse_index) == list(range(bs * cp_segment_num))
     assert sum(per_rank_actual_token) == total_seq_lens
 
+    # NPU MLA CP indices/seqlens (Ascend forward_mla_pcp). Derived purely from
+    # the prefix-free per-seq block sizes so they index into the all-gathered
+    # extend KV regardless of NSA/prefix concerns. The full KV is laid out as
+    # [seq0_block0..seq0_blockN, seq1_block0.., ...] in original order, so each
+    # sequence s starts at full_base[s] = sum(extend_seqs_len[:s]).
+    npu_head_mask_idx = npu_head_nomask_idx = None
+    npu_tail_mask_idx = npu_tail_nomask_idx = None
+    npu_head_mask_seqlens = npu_tail_mask_seqlens = None
+    npu_head_nomask_seqlens = npu_tail_nomask_seqlens = None
+    if _is_npu:
+        head_mask_rows: List[int] = []
+        head_nomask_rows: List[int] = []
+        tail_mask_rows: List[int] = []
+        tail_nomask_rows: List[int] = []
+        head_mask_len: List[int] = []
+        tail_mask_len: List[int] = []
+        head_nomask_kv_len: List[int] = []
+        tail_nomask_kv_len: List[int] = []
+        full_base = 0
+        tail_block = cp_segment_num - cp_rank - 1
+        for s in range(bs):
+            blk = per_seq_block_sizes[s]
+            cum_prev = sum(blk[: cp_rank + 1])  # end of head diagonal block
+            cum_next = sum(blk[: tail_block + 1])  # end of tail diagonal block
+            head_diag = blk[cp_rank]
+            tail_diag = blk[tail_block]
+            head_prefix = cum_prev - head_diag
+            tail_prefix = cum_next - tail_diag
+            head_mask_rows += range(full_base + head_prefix, full_base + cum_prev)
+            head_nomask_rows += range(full_base, full_base + head_prefix)
+            tail_mask_rows += range(full_base + tail_prefix, full_base + cum_next)
+            tail_nomask_rows += range(full_base, full_base + tail_prefix)
+            head_mask_len.append(head_diag)
+            tail_mask_len.append(tail_diag)
+            head_nomask_kv_len.append(head_prefix)
+            tail_nomask_kv_len.append(tail_prefix)
+            full_base += sum(blk)  # == extend_seqs_len[s]
+
+        _idx = lambda rows: torch.tensor(rows, device=device, dtype=torch.int64)
+        npu_head_mask_idx = _idx(head_mask_rows)
+        npu_head_nomask_idx = _idx(head_nomask_rows)
+        npu_tail_mask_idx = _idx(tail_mask_rows)
+        npu_tail_nomask_idx = _idx(tail_nomask_rows)
+        # mask seqlens: q==kv diagonal length, [bs].
+        npu_head_mask_seqlens = torch.tensor(
+            head_mask_len, device=device, dtype=torch.int32
+        )
+        npu_tail_mask_seqlens = torch.tensor(
+            tail_mask_len, device=device, dtype=torch.int32
+        )
+        # nomask seqlens: [2, bs] = [q_lens(diag), kv_lens(prefix)].
+        npu_head_nomask_seqlens = torch.tensor(
+            [head_mask_len, head_nomask_kv_len], device=device, dtype=torch.int32
+        )
+        npu_tail_nomask_seqlens = torch.tensor(
+            [tail_mask_len, tail_nomask_kv_len], device=device, dtype=torch.int32
+        )
+
     return ContextParallelMetadata(
         split_list=split_list,
         zigzag_index=zigzag_index,
@@ -650,4 +730,12 @@ def prepare_context_parallel_metadata(
         actual_seq_q_next_list=actual_seq_q_next_list,
         total_seq_lens=total_seq_lens,
         bs=bs,
+        npu_head_mask_idx=npu_head_mask_idx,
+        npu_head_nomask_idx=npu_head_nomask_idx,
+        npu_tail_mask_idx=npu_tail_mask_idx,
+        npu_tail_nomask_idx=npu_tail_nomask_idx,
+        npu_head_mask_seqlens=npu_head_mask_seqlens,
+        npu_tail_mask_seqlens=npu_tail_mask_seqlens,
+        npu_head_nomask_seqlens=npu_head_nomask_seqlens,
+        npu_tail_nomask_seqlens=npu_tail_nomask_seqlens,
     )
