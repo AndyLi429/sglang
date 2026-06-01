@@ -34,7 +34,8 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.test_ascend_utils import DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH
+
+# from sglang.test.ascend.test_ascend_utils import DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -50,7 +51,7 @@ from sglang.utils import wait_for_http_ready
 # 4 NPUs (prefill TP=2 + decode TP=2); MLA CP is experimental → nightly only.
 register_npu_ci(est_time=900, suite="nightly-4-npu-a3", nightly=True)
 
-MODEL_PATH = DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH
+MODEL_PATH = "/home/weights/DeepSeek-V2-Lite/"
 
 # Parallelism / placement
 PREFILL_TP = 2
@@ -247,7 +248,7 @@ class TestDeepSeekV2LiteMLACPPD(CustomTestCase):
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
             num_shots=GSM8K_NUM_SHOTS,
-            data_path=None,
+            data_path="/home/lws/aisbench_auto_tools_prefix/GSM8K.jsonl",
             num_questions=GSM8K_NUM_QUESTIONS,
             max_new_tokens=512,
             parallel=128,
