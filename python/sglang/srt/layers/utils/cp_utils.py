@@ -687,24 +687,24 @@ def prepare_context_parallel_metadata(
             tail_nomask_kv_len.append(tail_prefix)
             full_base += sum(blk)  # == extend_seqs_len[s]
 
+        # Index tensors feed torch.index_select on the NPU KV tensors → must be
+        # on the compute device.
         _idx = lambda rows: torch.tensor(rows, device=device, dtype=torch.int64)
         npu_head_mask_idx = _idx(head_mask_rows)
         npu_head_nomask_idx = _idx(head_nomask_rows)
         npu_tail_mask_idx = _idx(tail_mask_rows)
         npu_tail_nomask_idx = _idx(tail_nomask_rows)
-        # mask seqlens: q==kv diagonal length, [bs].
-        npu_head_mask_seqlens = torch.tensor(
-            head_mask_len, device=device, dtype=torch.int32
-        )
-        npu_tail_mask_seqlens = torch.tensor(
-            tail_mask_len, device=device, dtype=torch.int32
-        )
-        # nomask seqlens: [2, bs] = [q_lens(diag), kv_lens(prefix)].
+        # seqlen tensors feed torch_npu.atb.npu_ring_mla, which requires a CPU
+        # tensor (mirrors forward_metadata.extend_seq_lens_cpu_int usage in the
+        # prefix-cache ring_mla branch). mask: [bs] (q==kv diagonal length).
+        # nomask: [2, bs] = [q_lens(diag), kv_lens(prefix)].
+        npu_head_mask_seqlens = torch.tensor(head_mask_len, dtype=torch.int32)
+        npu_tail_mask_seqlens = torch.tensor(tail_mask_len, dtype=torch.int32)
         npu_head_nomask_seqlens = torch.tensor(
-            [head_mask_len, head_nomask_kv_len], device=device, dtype=torch.int32
+            [head_mask_len, head_nomask_kv_len], dtype=torch.int32
         )
         npu_tail_nomask_seqlens = torch.tensor(
-            [tail_mask_len, tail_nomask_kv_len], device=device, dtype=torch.int32
+            [tail_mask_len, tail_nomask_kv_len], dtype=torch.int32
         )
 
     return ContextParallelMetadata(
