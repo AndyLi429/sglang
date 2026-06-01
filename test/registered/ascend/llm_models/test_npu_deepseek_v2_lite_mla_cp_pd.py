@@ -66,6 +66,22 @@ GSM8K_MIN_ACCURACY = 0.85
 GSM8K_NUM_QUESTIONS = 200
 GSM8K_NUM_SHOTS = 5
 
+# Everything here is local (127.0.0.1): prefill/decode bootstrap registration
+# and the GSM8K client must NOT go through any inherited proxy. A SOCKS proxy in
+# the shell env without PySocks installed makes `requests` raise
+# "Missing dependencies for SOCKS support", so the prefill instance never
+# registers to the bootstrap server and the whole run hangs.
+_NO_PROXY_ENV = {
+    "no_proxy": "*",
+    "NO_PROXY": "*",
+    "all_proxy": "",
+    "ALL_PROXY": "",
+    "http_proxy": "",
+    "HTTP_PROXY": "",
+    "https_proxy": "",
+    "HTTPS_PROXY": "",
+}
+
 # Canonical Ascend env for MLA CP + Ascend KV transfer (see gsm8k_ascend_mixin
 # and the Qwen3-235B PCP deployment reference).
 _NPU_ENV_VARS = {
@@ -74,6 +90,7 @@ _NPU_ENV_VARS = {
     "ASCEND_USE_FIA": "1",
     "HCCL_BUFFSIZE": "200",
     "HCCL_EXEC_TIMEOUT": "200",
+    **_NO_PROXY_ENV,
 }
 
 
@@ -83,6 +100,9 @@ class TestDeepSeekV2LiteMLACPPD(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_PATH
+        # Bypass any inherited (SOCKS) proxy for the in-process GSM8K client too;
+        # it talks to the LB on 127.0.0.1.
+        os.environ.update(_NO_PROXY_ENV)
         cls.npu_env = {**os.environ, **_NPU_ENV_VARS}
 
         parsed = urlparse(DEFAULT_URL_FOR_TEST)
