@@ -38,6 +38,9 @@ def _dispatch_mla_subtype(attn, forward_batch):
 
 
 def handle_attention_ascend(attn, forward_batch):
+    if mla_use_prefill_cp(forward_batch):
+        return AttnForwardMethod.MLA_NPU
+
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()

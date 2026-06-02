@@ -15,6 +15,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.cp_mla_utils import (
+    build_mla_cp_ring_segments,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -874,6 +877,118 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _get_ringmla_mask(self, q_len: int, device) -> torch.Tensor:
+        if self.ringmla_mask.shape[-1] >= q_len:
+            return self.ringmla_mask
+        return AscendAttnMaskBuilder.generate_attn_mask(
+            q_len, "norm", self.ringmla_mask.dtype
+        ).to(device)
+
+    @staticmethod
+    def _kv_ranges_to_indices(ranges, device) -> torch.Tensor:
+        indices = [
+            torch.arange(start, end, dtype=torch.long, device=device)
+            for start, end in ranges
+            if end > start
+        ]
+        if len(indices) == 1:
+            return indices[0]
+        return torch.cat(indices, dim=0)
+
+    def do_cp_mla_ring_attn(
+        self,
+        q_nope: torch.Tensor,
+        k_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        segments=None,
+    ) -> torch.Tensor:
+        if segments is None:
+            segments = build_mla_cp_ring_segments(
+                forward_batch.attn_cp_metadata,
+                prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            )
+
+        outs = []
+        for segment in segments:
+            q_nope_cur = q_nope[segment.query_start : segment.query_end].contiguous()
+            q_rope_cur = q_rope[segment.query_start : segment.query_end].contiguous()
+
+            attn_output = torch.zeros(
+                segment.q_len,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            attn_lse = torch.zeros(
+                layer.tp_q_head_num,
+                segment.q_len,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+
+            mask_idx = self._kv_ranges_to_indices(segment.mask_kv_ranges, k_nope.device)
+            k_nope_mask = torch.index_select(k_nope, 0, mask_idx).contiguous()
+            k_rope_mask = torch.index_select(k_rope, 0, mask_idx).contiguous()
+            mask_seqlen = torch.tensor(segment.q_lens, dtype=torch.int32)
+
+            torch_npu.atb.npu_ring_mla(
+                q_nope=q_nope_cur,
+                q_rope=q_rope_cur,
+                k_nope=k_nope_mask,
+                k_rope=k_rope_mask,
+                value=k_nope_mask,
+                mask=self._get_ringmla_mask(segment.max_q_len, q_nope.device),
+                seqlen=mask_seqlen,
+                head_num=layer.tp_q_head_num,
+                kv_head_num=layer.tp_k_head_num,
+                pre_out=None,
+                prev_lse=None,
+                qk_scale=layer.scaling,
+                kernel_type="kernel_type_high_precision",
+                mask_type="mask_type_triu",
+                calc_type="calc_type_first_ring",
+                output=attn_output,
+                softmax_lse=attn_lse,
+            )
+
+            if segment.nomask_kv_len > 0:
+                nomask_idx = self._kv_ranges_to_indices(
+                    segment.nomask_kv_ranges, k_nope.device
+                )
+                k_nope_nomask = torch.index_select(k_nope, 0, nomask_idx).contiguous()
+                k_rope_nomask = torch.index_select(k_rope, 0, nomask_idx).contiguous()
+                nomask_seqlen = torch.tensor(
+                    [segment.q_lens, segment.nomask_kv_lens], dtype=torch.int32
+                )
+
+                torch_npu.atb.npu_ring_mla(
+                    q_nope=q_nope_cur,
+                    q_rope=q_rope_cur,
+                    k_nope=k_nope_nomask,
+                    k_rope=k_rope_nomask,
+                    value=k_nope_nomask,
+                    mask=self._get_ringmla_mask(segment.max_q_len, q_nope.device),
+                    seqlen=nomask_seqlen,
+                    head_num=layer.tp_q_head_num,
+                    kv_head_num=layer.tp_k_head_num,
+                    pre_out=attn_output,
+                    prev_lse=attn_lse,
+                    qk_scale=layer.scaling,
+                    kernel_type="kernel_type_high_precision",
+                    mask_type="no_mask",
+                    calc_type="calc_type_default",
+                    output=attn_output,
+                    softmax_lse=attn_lse,
+                )
+
+            outs.append(attn_output)
+
+        return torch.cat(outs, dim=0).view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1043,14 +1158,14 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope=k_rope,
             )
 
-        if not self.use_mla:
-            # Detect CP mode for prefill (context parallel)
-            is_cp_mode = (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            )
+        # Detect CP mode for prefill (context parallel)
+        is_cp_mode = (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        )
 
+        if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
@@ -1288,6 +1403,26 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif is_cp_mode:
+            if is_mla_preprocess_enabled():
+                raise NotImplementedError(
+                    "SGLANG_NPU_USE_MLAPO/MLAPROLOG is not supported with MLA "
+                    "prefill context parallel yet."
+                )
+            if q_rope is None or k_rope is None:
+                raise ValueError("MLA CP on Ascend requires q_rope and k_rope")
+            segments = build_mla_cp_ring_segments(
+                forward_batch.attn_cp_metadata,
+                prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            )
+            if save_kv_cache:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
+            return self.do_cp_mla_ring_attn(
+                q, k, q_rope, k_rope, layer, forward_batch, segments=segments
+            )
+
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
