@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
@@ -26,6 +27,40 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
 # region MHA
+def _gather_cp_mla_latent(m, forward_batch, kv_a, k_pe):
+    """All-gather a rank's zigzag latent KV across the CP group for MLA prefill.
+
+    Reuses ``DeepseekV2AttentionMLA.rebuild_cp_kv_cache`` (the same allgather +
+    rerange used by the DSA CP path) so each rank ends up with the FULL
+    sequence latent in original token order, then writes that full latent into
+    the local KV pool (the FA3-consistent "store full" convention so PD/decode
+    see a complete cache).
+
+    Args:
+        kv_a: [T_local, kv_lora_rank] post-layernorm compressed KV.
+        k_pe: [T_local, 1, qk_rope_head_dim] post-rope key positional part.
+
+    Returns:
+        (kv_a_full [T_full, kv_lora_rank], k_pe_full [T_full, 1, rope]).
+
+    NOTE: requires ``forward_batch.out_cache_loc`` to cover the full sequence
+    on every rank. The yarn-rope branch additionally performs an in-kernel
+    cache write with rank-local data; under CP that local write is superseded
+    here. Validate the out_cache_loc length / pool semantics on Ascend.
+    """
+    kv_a = kv_a.reshape(kv_a.shape[0], m.kv_lora_rank)
+    k_pe = k_pe.reshape(k_pe.shape[0], 1, m.qk_rope_head_dim)
+    latent_buf = kv_a.new_empty((kv_a.shape[0], m.kv_lora_rank + m.qk_rope_head_dim))
+    k_nope_full, k_pe_full = m.rebuild_cp_kv_cache(
+        latent_buf, forward_batch, kv_a.unsqueeze(1), k_pe
+    )
+    kv_a_full = k_nope_full.squeeze(1)
+    get_token_to_kv_pool().set_kv_buffer(
+        m, forward_batch.out_cache_loc, kv_a_full.unsqueeze(1), k_pe_full
+    )
+    return kv_a_full, k_pe_full
+
+
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -113,10 +148,19 @@ def forward_mha_prepare_npu(
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-        # this is for model kimi-vl-a3B-instruct
-        get_token_to_kv_pool().set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-        )
+        if not mla_use_prefill_cp(forward_batch):
+            # this is for model kimi-vl-a3B-instruct
+            # (under MLA CP the full latent is written by _gather_cp_mla_latent
+            # below, after the cross-rank all-gather.)
+            get_token_to_kv_pool().set_kv_buffer(
+                m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+
+    if mla_use_prefill_cp(forward_batch):
+        # All-gather this rank's zigzag latent KV across the CP group so every
+        # rank holds the full sequence before kv_b_proj; q stays rank-local and
+        # is split into prev/next halves inside the attention backend.
+        kv_a, k_pe = _gather_cp_mla_latent(m, forward_batch, kv_a, k_pe)
 
     q[..., m.qk_nope_head_dim :] = q_pe
 

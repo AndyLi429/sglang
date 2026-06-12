@@ -23,7 +23,10 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache,
+    mla_use_prefill_cp,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -922,6 +925,214 @@ class AscendAttnBackend(AttentionBackend):
         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    @staticmethod
+    def _build_mla_cp_index_metadata(cp_meta, device):
+        """Derive npu_ring_mla mask/nomask index + seqlen tensors from the
+        shared zigzag CP metadata.
+
+        After ``rebuild_cp_kv_cache`` each rank holds the FULL latent KV for
+        the batch in original token order. This rank's local query is laid out
+        ``[all_prev_blocks, all_next_blocks]`` (block ``cp_rank`` then block
+        ``2*cp_size-1-cp_rank`` of every sequence). For each query half and
+        each sequence we attend causally to the gathered KV up to that block:
+
+          * mask part    = the diagonal block itself (causal/triangular)
+          * nomask part  = every earlier block (full attention)
+
+        Index ranges are absolute offsets into the gathered KV. ``kv_len_*``
+        are within-sequence cumulatives (prefix-free; MLA CP requires
+        ``extend_prefix_lens == 0``). Cached on ``cp_meta`` so the 60+ decoder
+        layers in one forward reuse it.
+        """
+        cached = getattr(cp_meta, "_npu_ring_mla_idx", None)
+        if cached is not None:
+            return cached
+
+        split_list = cp_meta.split_list
+        bs = cp_meta.bs
+        seg = len(split_list) // bs  # cp_segment_num = 2 * cp_size
+
+        # Per-sequence extend length and its base offset in the gathered KV.
+        base, acc = [0] * bs, 0
+        for s in range(bs):
+            base[s] = acc
+            acc += sum(split_list[s * seg : (s + 1) * seg])
+
+        prev_mask, prev_nomask, next_mask, next_nomask = [], [], [], []
+        prev_q, prev_kv, next_q, next_kv = [], [], [], []
+        for s in range(bs):
+            b = base[s]
+            cum_prev, blk_prev = (
+                cp_meta.kv_len_prev_list[s],
+                cp_meta.actual_seq_q_prev_list[s],
+            )
+            cum_next, blk_next = (
+                cp_meta.kv_len_next_list[s],
+                cp_meta.actual_seq_q_next_list[s],
+            )
+            prev_mask.extend(range(b + cum_prev - blk_prev, b + cum_prev))
+            prev_nomask.extend(range(b, b + cum_prev - blk_prev))
+            next_mask.extend(range(b + cum_next - blk_next, b + cum_next))
+            next_nomask.extend(range(b, b + cum_next - blk_next))
+            prev_q.append(blk_prev)
+            prev_kv.append(cum_prev - blk_prev)
+            next_q.append(blk_next)
+            next_kv.append(cum_next - blk_next)
+
+        idx = lambda l: torch.tensor(l, device=device, dtype=torch.int32)
+        cpu = lambda l: torch.tensor(l, dtype=torch.int32)
+        result = {
+            "prev_mask_idx": idx(prev_mask),
+            "prev_nomask_idx": idx(prev_nomask),
+            "next_mask_idx": idx(next_mask),
+            "next_nomask_idx": idx(next_nomask),
+            # mask (triu): seqlen is 1D q-lens (kv == q for the diagonal block).
+            "prev_mask_seqlens": cpu(prev_q),
+            "next_mask_seqlens": cpu(next_q),
+            # nomask (full): seqlen is stack([q_lens, kv_history_lens]).
+            "prev_nomask_seqlens": torch.stack([cpu(prev_q), cpu(prev_kv)]),
+            "next_nomask_seqlens": torch.stack([cpu(next_q), cpu(next_kv)]),
+        }
+        cp_meta._npu_ring_mla_idx = result
+        return result
+
+    def _ring_mla_mask_nomask(
+        self,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        value,
+        mask_idx,
+        nomask_idx,
+        mask_seqlens,
+        nomask_seqlens,
+        layer,
+    ):
+        """One query half against the gathered KV: diagonal (triu) block first,
+        then earlier (no_mask) blocks accumulated via ring online-softmax."""
+        num_tokens = q_nope.shape[0]
+        attn_output = torch.zeros(
+            num_tokens,
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        attn_lse = torch.zeros(
+            layer.tp_q_head_num,
+            num_tokens,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+
+        # Diagonal block (causal): first ring, creates output + lse.
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=torch.index_select(k_nope, 0, mask_idx),
+            k_rope=torch.index_select(k_pe, 0, mask_idx),
+            value=torch.index_select(value, 0, mask_idx),
+            mask=self.ringmla_mask,
+            seqlen=mask_seqlens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=None,
+            prev_lse=None,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="mask_type_triu",
+            calc_type="calc_type_first_ring",
+            output=attn_output,
+            softmax_lse=attn_lse,
+        )
+
+        # Earlier blocks (full attention): default ring, accumulates onto above.
+        if nomask_idx.shape[0] == 0:
+            return attn_output, attn_lse
+
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_pe,
+            k_nope=torch.index_select(k_nope, 0, nomask_idx),
+            k_rope=torch.index_select(k_pe, 0, nomask_idx),
+            value=torch.index_select(value, 0, nomask_idx),
+            mask=self.ringmla_mask,
+            seqlen=nomask_seqlens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=attn_output,
+            prev_lse=attn_lse,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="no_mask",
+            calc_type="calc_type_default",
+            output=attn_output,
+            softmax_lse=attn_lse,
+        )
+        return attn_output, attn_lse
+
+    def do_cp_attn_mla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Context-parallel MLA prefill attention on Ascend via npu_ring_mla.
+
+        Mirrors the zigzag (head/tail) load-balanced split used by the shared
+        CP infra and the FA3 ``_mla_cp_attn`` closure, but expressed with the
+        ATB ring-MLA kernel (mask + nomask passes).
+
+        Layout contract (set by the MHA-NPU prefill path under CP):
+          q : local query   [T_local, tp_q_head_num, qk_head_dim]   (nope|rope)
+          k : full gathered  [T_full,  tp_k_head_num, qk_head_dim]   (nope|rope)
+          v : full gathered  [T_full,  tp_v_head_num, v_head_dim]
+        ``T_local`` are this rank's prev+next zigzag blocks; ``T_full`` is the
+        whole batch's tokens in original order (gathered in the model via
+        ``rebuild_cp_kv_cache``).
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_nope, q_pe = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        k_nope, k_pe = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+        meta = self._build_mla_cp_index_metadata(cp_meta, q.device)
+        split = cp_meta.total_q_prev_tokens
+
+        output_prev, _ = self._ring_mla_mask_nomask(
+            q_nope[:split].contiguous(),
+            q_pe[:split].contiguous(),
+            k_nope,
+            k_pe,
+            v,
+            meta["prev_mask_idx"],
+            meta["prev_nomask_idx"],
+            meta["prev_mask_seqlens"],
+            meta["prev_nomask_seqlens"],
+            layer,
+        )
+        output_next, _ = self._ring_mla_mask_nomask(
+            q_nope[split:].contiguous(),
+            q_pe[split:].contiguous(),
+            k_nope,
+            k_pe,
+            v,
+            meta["next_mask_idx"],
+            meta["next_nomask_idx"],
+            meta["next_mask_seqlens"],
+            meta["next_nomask_seqlens"],
+            layer,
+        )
+
+        attn_output = torch.cat([output_prev, output_next], dim=0)
+        return attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1346,6 +1557,13 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif mla_use_prefill_cp(forward_batch):
+            # MLA prefill context parallelism. The model has already gathered
+            # the full latent KV across CP ranks (rebuild_cp_kv_cache) so k/v
+            # here cover the whole sequence while q is this rank's zigzag share.
+            # Prefix cache is not supported under MLA CP (kv_len_* are derived
+            # prefix-free); the scheduler guarantees extend_prefix_lens == 0.
+            attn_output = self.do_cp_attn_mla(q, k, v, layer, forward_batch)
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
