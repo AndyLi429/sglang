@@ -3108,9 +3108,9 @@ class Scheduler(
         prof = torch.profiler.profile(
             activities=activities,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(outdir),
-            schedule=torch.profiler.schedule(
-                wait=1, warmup=1, active=max(1, step - 2), repeat=1, skip_first=1
-            ),
+            # No schedule: a one-shot fixed-count window records continuously from
+            # start() to stop(). A schedule (wait/warmup/active) is a repeating
+            # state machine and stopping mid-RECORD truncates memory records.
             record_shapes=True,
             profile_memory=True,
             with_stack=_flag("SGLANG_PROF_WITH_STACK"),
@@ -3167,8 +3167,6 @@ class Scheduler(
             logger.warning(
                 "[sglang-prof] auto profiler stopped after %d batches", ap["cnt"]
             )
-        else:
-            ap["prof"].step()
 
     def run_batch(
         self,
