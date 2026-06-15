@@ -3052,6 +3052,124 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    def _init_auto_profiler(self):
+        """Lazily build the auto-startup torch profiler from SGLANG_PROF_* env vars.
+
+        Returns a state dict, or False when disabled / not this rank so the caller
+        can short-circuit. Activates only on SGLANG_PROF_RANK (default 0).
+        See the sglang-perfermance-ascend skill (Strategy B) for field meanings.
+        """
+        import os
+
+        def _flag(name, default="0"):
+            return os.environ.get(name, default).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+
+        def _int(name, default):
+            try:
+                return int(os.environ.get(name, str(default)))
+            except ValueError:
+                return default
+
+        if not _flag("SGLANG_PROF_ENABLE"):
+            return False
+        if getattr(self, "tp_rank", 0) != _int("SGLANG_PROF_RANK", 0):
+            return False
+
+        import torch
+        import torch.profiler as tprof
+
+        try:
+            import torch_npu  # noqa: F401
+
+            has_npu = True
+        except ImportError:
+            has_npu = False
+
+        activity_map = {
+            "cpu": tprof.ProfilerActivity.CPU,
+            "npu": getattr(tprof.ProfilerActivity, "NPU", None)
+            or getattr(tprof.ProfilerActivity, "PrivateUse1", None),
+        }
+        activities = [
+            activity_map[a.strip()]
+            for a in os.environ.get("SGLANG_PROF_ACTIVITIES", "cpu").lower().split(",")
+            if a.strip() in activity_map and activity_map[a.strip()] is not None
+        ] or [tprof.ProfilerActivity.CPU]
+
+        outdir = os.environ.get("SGLANG_PROF_OUTDIR", "./profiling")
+        os.makedirs(outdir, exist_ok=True)
+        step = _int("SGLANG_PROF_STEP", 10)
+
+        prof = torch.profiler.profile(
+            activities=activities,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(outdir),
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=1, active=max(1, step - 2), repeat=1, skip_first=1
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=_flag("SGLANG_PROF_WITH_STACK"),
+            with_flops=False,
+            with_modules=False,
+        )
+        return {
+            "prof": prof,
+            "stage": os.environ.get("SGLANG_PROF_STAGE", "prefill").lower(),
+            "bs": _int("SGLANG_PROF_BS", 1),
+            "step": step,
+            "outdir": outdir,
+            "has_npu": has_npu,
+            "started": False,
+            "stopped": False,
+            "cnt": 0,
+        }
+
+    def _auto_profile_step(self, batch: ScheduleBatch):
+        """Drive the auto-startup profiler once per batch (env-gated, no-op if off)."""
+        ap = getattr(self, "_auto_prof", None)
+        if ap is None:
+            ap = self._auto_prof = self._init_auto_profiler()
+        if not ap or ap["stopped"]:
+            return
+
+        is_target = (ap["stage"] == "decode" and batch.forward_mode.is_decode()) or (
+            ap["stage"] == "prefill" and batch.forward_mode.is_extend()
+        )
+        if not is_target or len(batch.reqs) < ap["bs"]:
+            return
+
+        if not ap["started"]:
+            ap["prof"].start()
+            ap["started"] = True
+            ap["cnt"] = 1
+            logger.warning(
+                "[sglang-prof] auto profiler started (stage=%s bs>=%d step=%d outdir=%s)",
+                ap["stage"],
+                ap["bs"],
+                ap["step"],
+                ap["outdir"],
+            )
+            return
+
+        ap["cnt"] += 1
+        if ap["cnt"] >= ap["step"]:
+            import torch
+
+            if ap["has_npu"]:
+                torch.npu.synchronize()
+            ap["prof"].stop()
+            ap["stopped"] = True
+            logger.warning(
+                "[sglang-prof] auto profiler stopped after %d batches", ap["cnt"]
+            )
+        else:
+            ap["prof"].step()
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3060,6 +3178,10 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+
+        # [auto-profiling] env-gated (SGLANG_PROF_ENABLE); rank-0 torch profiler
+        # that starts on its own once real traffic hits the target stage.
+        self._auto_profile_step(batch)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
