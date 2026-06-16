@@ -106,24 +106,29 @@ class AscendTorchNativeAttnBackend:
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
+        extend_seq_lens_list = extend_seq_lens.tolist()
+        extend_prefix_lens_list = extend_prefix_lens.tolist()
+        seq_lens_list = seq_lens.tolist()
+        encoder_lens_list = encoder_lens.tolist() if encoder_lens is not None else None
+
         start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
+        for seq_idx in range(len(seq_lens_list)):
             # Need optimize the performance later.
 
-            extend_seq_len_q = int(extend_seq_lens[seq_idx].item())
-            prefill_seq_len_q = int(extend_prefix_lens[seq_idx].item())
+            extend_seq_len_q = extend_seq_lens_list[seq_idx]
+            prefill_seq_len_q = extend_prefix_lens_list[seq_idx]
 
-            seq_len_kv = int(seq_lens[seq_idx].item())
+            seq_len_kv = seq_lens_list[seq_idx]
             end_q = start_q + extend_seq_len_q
             end_kv = start_kv + seq_len_kv
             atten_start_kv = 0
             atten_end_kv = seq_len_kv
             # support cross attention
-            if encoder_lens is not None:
+            if encoder_lens_list is not None:
                 if is_cross_attention:
-                    atten_end_kv = int(encoder_lens[seq_idx].item())
+                    atten_end_kv = encoder_lens_list[seq_idx]
                 else:
-                    atten_start_kv = int(encoder_lens[seq_idx].item())
+                    atten_start_kv = encoder_lens_list[seq_idx]
                     atten_end_kv = atten_start_kv + extend_seq_len_q
 
             if (
@@ -242,22 +247,25 @@ class AscendTorchNativeAttnBackend:
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
+        seq_lens_list = seq_lens.tolist()
+        encoder_lens_list = encoder_lens.tolist() if encoder_lens is not None else None
+
         start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
+        for seq_idx in range(len(seq_lens_list)):
             # Need optimize the performance later.
 
             seq_len_q = 1
-            seq_len_kv = int(seq_lens[seq_idx].item())
+            seq_len_kv = seq_lens_list[seq_idx]
             end_q = start_q + seq_len_q
             end_kv = start_kv + seq_len_kv
             atten_start_kv = 0
             atten_end_kv = seq_len_kv
             # support cross attention
-            if encoder_lens is not None:
+            if encoder_lens_list is not None:
                 if is_cross_attention:
-                    atten_end_kv = int(encoder_lens[seq_idx].item())
+                    atten_end_kv = encoder_lens_list[seq_idx]
                 else:
-                    atten_start_kv = int(encoder_lens[seq_idx].item())
+                    atten_start_kv = encoder_lens_list[seq_idx]
                     atten_end_kv = atten_start_kv + seq_len_kv
 
             if (

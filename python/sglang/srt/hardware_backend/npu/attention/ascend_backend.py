@@ -757,8 +757,10 @@ class AscendAttnBackend(AttentionBackend):
         head_size_v = v_cache.shape[3]
         block_size = k_cache.shape[1]
         attn_output = []
+        seq_lens_list = seq_lens.tolist()
+        query_lens_list = query_lens.tolist()
         for i in range(num_prompts):
-            seq_len = seq_lens[i].item()
+            seq_len = seq_lens_list[i]
             block_table = block_tables[i]
 
             j = torch.arange(seq_len, device=block_table.device)
@@ -772,7 +774,7 @@ class AscendAttnBackend(AttentionBackend):
             v = v.view(seq_len, num_heads, head_size_v)
 
             if is_extend:
-                q_len = query_lens[i].item()
+                q_len = query_lens_list[i]
                 query = q[curr : curr + q_len]
             else:
                 q_len = 1
