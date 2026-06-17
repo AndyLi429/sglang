@@ -185,7 +185,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
 
-        for ratio in self._dsv4_compress_ratios:
+        unique_ratios = list(dict.fromkeys(self._dsv4_compress_ratios))
+
+        for ratio in unique_ratios:
             if ratio not in (4, 128):
                 continue
             # state table holds one slot per RAW token; block 0 is the skip sentinel reserved by NPUCompressStatePool
@@ -258,7 +260,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if is_decode:
             valid = seq_lens > 0
             positions_last = torch.clamp(seq_lens - 1, min=0)
-            for ratio in self._dsv4_compress_ratios:
+            for ratio in unique_ratios:
                 if ratio not in (4, 128):
                     continue
                 padding_size = min(bs, bs // ratio + bs)
