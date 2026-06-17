@@ -32,18 +32,9 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
 
 # skip gpu branch
-# W8A8 (modelslim) weights don't create blockwise-FP8 weight_scale_inv,
-# so the FP8 wo_a GEMM opt must be off or MQALayer.__init__ asserts.
-export SGLANG_OPT_FP8_WO_A_GEMM=0
-# export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
-# export FORCE_DRAFT_MODEL_NON_QUANT=1
 export SGLANG_DSV4_FP4_EXPERTS=False
 export SGLANG_OPT_FUSE_WQA_WKV=0
-# export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
-# export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
-# export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
-# export SGLANG_OPT_USE_TILELANG_MHC_POST=False
 
 # mtp
 # export SGLANG_ENABLE_SPEC_V2=1
