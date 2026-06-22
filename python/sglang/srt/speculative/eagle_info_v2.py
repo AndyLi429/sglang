@@ -57,6 +57,122 @@ if is_cuda() or is_musa():
     )
 
 
+def _npu_renorm_probs(
+    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    """Top-k + top-p renormalization in pure torch (NPU has no sgl_kernel renorm op).
+
+    Mirrors the sort/cumsum masking used by the Ascend sampler
+    (`top_k_top_p_min_p_sampling_from_probs_torch`) and scatters the renormalized
+    mass back to the dense vocab order so callers can index by token id.
+    """
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    vocab = probs.shape[-1]
+    rank = torch.arange(vocab, device=probs.device).view(1, -1)
+    # Multiplicative masking (NPU-safe): drop ranks beyond top-k, then the top-p tail.
+    probs_sort = probs_sort * (rank < top_ks.view(-1, 1)).to(probs_sort.dtype)
+    probs_sort = probs_sort * ((probs_sum - probs_sort) <= top_ps.view(-1, 1)).to(
+        probs_sort.dtype
+    )
+    probs_sort = probs_sort / probs_sort.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return torch.zeros_like(probs).scatter_(1, probs_idx, probs_sort)
+
+
+def _npu_build_target_probs(
+    next_token_logits: torch.Tensor, sampling_info, draft_token_num: int
+) -> torch.Tensor:
+    """Build per-verify-row target distributions (temp + top-k + top-p) on NPU."""
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
+    top_ks = torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
+    top_ps = torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
+    return _npu_renorm_probs(probs, top_ks, top_ps)
+
+
+def _npu_chain_rejection_sample(
+    target_probs: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    coins: torch.Tensor,
+    coins_final: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+):
+    """Chain (topk==1) speculative rejection sampling for NPU, in pure torch.
+
+    Fills ``predict`` / ``accept_index`` / ``num_correct_drafts`` with the same
+    contract as the greedy NPU kernel (``verify_tree_greedy``), but accepts each
+    draft token ``c`` at verify level ``i`` stochastically with probability
+    ``min(1, target_probs[i-1][c] / threshold_acc)`` or immediately when
+    ``target_probs[i-1][c] >= threshold_single``. On rejection the bonus token is
+    drawn from the residual ``relu(p - onehot(c)*p[c])`` (i.e. target dist with
+    the rejected token removed, renormalized) per the target-only semantics
+    documented in ``dflash_utils``.
+    """
+    bs, ndt, vocab = target_probs.shape
+    device = target_probs.device
+    ts = float(threshold_single)
+    ta = max(float(threshold_acc), 1e-9)
+
+    ri = retrieve_index.to(torch.int64)
+    last_idx = ri[:, 0].clone()  # flat slot of the last accepted token, per req
+    accept_index[:, 0] = ri[:, 0].to(accept_index.dtype)
+    num_acc = torch.zeros(bs, dtype=torch.int64, device=device)
+    alive = torch.ones(bs, dtype=torch.bool, device=device)
+    rej_cand = torch.full((bs,), -1, dtype=torch.int64, device=device)
+
+    for i in range(1, ndt):
+        prev = target_probs[:, i - 1, :]  # [bs, vocab]
+        c = candidates[:, i].to(torch.int64)  # [bs]
+        p_c = prev.gather(1, c.view(-1, 1)).squeeze(1)
+        accept_prob = torch.clamp(p_c / ta, max=1.0)
+        acc_now = alive & ((coins[:, i - 1] <= accept_prob) | (p_c >= ts))
+
+        # Write the accepted draft token at the *current* last slot (greedy kernel
+        # stores the post-acceptance token at the previous slot, then advances).
+        cur = predict.gather(0, last_idx)
+        predict.scatter_(0, last_idx, torch.where(acc_now, c.to(predict.dtype), cur))
+
+        # accept_index[:, num_acc+1] = ri[:, i] for accepted rows (no-op col 0 else)
+        na_next = num_acc + acc_now.to(torch.int64)
+        col = torch.where(acc_now, na_next, torch.zeros_like(na_next))
+        existing = accept_index.gather(1, col.view(-1, 1)).squeeze(1)
+        accept_index.scatter_(
+            1,
+            col.view(-1, 1),
+            torch.where(acc_now, ri[:, i].to(accept_index.dtype), existing).view(-1, 1),
+        )
+
+        rej_now = alive & ~acc_now
+        rej_cand = torch.where(rej_now, c, rej_cand)
+        last_idx = torch.where(acc_now, ri[:, i], last_idx)
+        num_acc = na_next
+        alive = acc_now  # once a level is rejected the request stops accepting
+
+    num_correct_drafts.copy_(num_acc.to(num_correct_drafts.dtype))
+
+    # Bonus token: drawn from target_probs[:, num_acc, :], with the rejected
+    # candidate removed when a rejection happened (residual = relu(p - p[c]·e_c)).
+    rows = torch.arange(bs, device=device)
+    bonus_probs = target_probs[rows, num_acc, :].clone()
+    rej_idx = rej_cand.clamp_min(0).view(-1, 1)
+    keep = bonus_probs.gather(1, rej_idx)
+    has_rej = (rej_cand >= 0).view(-1, 1)
+    bonus_probs.scatter_(1, rej_idx, torch.where(has_rej, torch.zeros_like(keep), keep))
+    bonus_probs = bonus_probs / bonus_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    cdf = torch.cumsum(bonus_probs, dim=-1)
+    bonus = (cdf < coins_final.view(-1, 1)).sum(dim=-1).clamp_(max=vocab - 1)
+    predict.scatter_(0, last_idx, bonus.to(predict.dtype))
+
+    return predict, accept_index, num_correct_drafts
+
+
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
     req_pool_indices,
@@ -392,8 +508,19 @@ class EagleVerifyInputV2Mixin:
         )
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
+        # On NPU, chain (topk==1) decoding can do real rejection sampling in torch
+        # (the sgl_kernel tree-sampling op is CUDA-only). Anything else on NPU/HIP,
+        # or an all-greedy batch, falls back to the greedy verify kernel.
+        npu_chain_sampling = (
+            _is_npu and self.topk == 1 and not sampling_info.is_all_greedy
+        )
+
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu or _is_hip:
+        if (
+            sampling_info.is_all_greedy
+            or _is_hip
+            or (_is_npu and not npu_chain_sampling)
+        ):
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -407,6 +534,38 @@ class EagleVerifyInputV2Mixin:
                 target_predict=target_predict,
                 topk=self.topk,
             )
+        elif npu_chain_sampling:
+            target_probs = _npu_build_target_probs(
+                next_token_logits, sampling_info, self.draft_token_num
+            ).reshape(bs, self.draft_token_num, -1)
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+            predict, accept_index, num_correct_drafts = _npu_chain_rejection_sample(
+                target_probs=target_probs,
+                candidates=candidates,
+                retrieve_index=self.retrieve_index,
+                coins=coins,
+                coins_final=coins_for_final_sampling,
+                threshold_single=get_global_server_args().speculative_accept_threshold_single,
+                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                predict=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+            )
+
+            # Broadcast from rank 0 so TP ranks stay consistent (softmax/top-k/top-p
+            # fp nondeterminism + independent coins would otherwise diverge).
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
         else:
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(

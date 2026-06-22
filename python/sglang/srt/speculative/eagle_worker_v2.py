@@ -580,11 +580,17 @@ class EagleDraftWorker(BaseDraftWorker):
             - 1
         )
 
+        # Cast next_token_ids to int64 on the main stream BEFORE entering the plan
+        # stream. The draft-extend prep reads next_token_ids cross-stream; doing the
+        # `.to()` inside the plan stream creates a cross-stream dependency that can
+        # race the main-stream sampling write and break MTP acceptance. (#28410)
+        next_token_ids = batch_result.next_token_ids.to(torch.int64)
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
-                batch_result.next_token_ids,
+                next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
