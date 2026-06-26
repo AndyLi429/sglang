@@ -30,25 +30,13 @@ causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
 
-def restore_gdn_prefill_ssm_layout_for_spec(
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-    has_initial_states: Optional[torch.Tensor],
-    *,
-    enabled: bool,
+def _transpose_gdn_ssm_slots_(
+    ssm_states: torch.Tensor, cache_indices: torch.Tensor
 ) -> None:
-    if not enabled or has_initial_states is None:
-        return
-
-    restore_mask = has_initial_states.to(dtype=torch.bool, device=cache_indices.device)
-    restore_mask = restore_mask & (cache_indices >= 0)
-    if not restore_mask.any():
-        return
-
-    restore_indices = cache_indices[restore_mask].to(dtype=torch.long)
-    ssm_states[restore_indices] = (
-        ssm_states[restore_indices].transpose(-1, -2).contiguous()
+    slot_indices = torch.where(cache_indices >= 0, cache_indices, 0).to(
+        dtype=torch.long
     )
+    ssm_states[slot_indices] = ssm_states[slot_indices].transpose(-1, -2).contiguous()
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -245,12 +233,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            restore_gdn_prefill_ssm_layout_for_spec(
-                ssm_states,
-                cache_indices,
-                has_initial_states,
-                enabled=not forward_batch.spec_algorithm.is_none(),
-            )
         if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
             if (
@@ -325,6 +307,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             beta = beta.view(batch_size, -1, num_value_heads)
             g = g.view(batch_size, -1, num_value_heads)
 
+            _transpose_gdn_ssm_slots_(ssm_states, cache_indices)
             core_attn_out = self.fused_recurrent_gated_delta_rule_update(
                 mixed_qkv,
                 num_heads,
@@ -337,6 +320,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 cache_indices=cache_indices,
                 intermediate_state=intermediate_state_cache,
             )
+            _transpose_gdn_ssm_slots_(ssm_states, cache_indices)
             core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
             if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
                 core_attn_out = torch.cat(
@@ -378,16 +362,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
             if h is not None:
-                # Prefix-cache snapshots are consumed by extend kernels, so keep
-                # the tracked state in extend layout before spec verify layout.
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
-            if not forward_batch.spec_algorithm.is_none():
-                last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
-                    ssm_states.dtype, copy=False
-                )
-                ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 

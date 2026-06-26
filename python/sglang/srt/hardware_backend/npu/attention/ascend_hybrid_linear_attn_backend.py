@@ -264,6 +264,12 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             src_indices_tensor,
             last_steps,
         )
+        valid_dst_mask = (last_steps >= 0) & (dst_indices_tensor >= 0)
+        valid_dst_indices = dst_indices_tensor[valid_dst_mask]
+        if valid_dst_indices.numel() > 0:
+            ssm_states[:, valid_dst_indices] = (
+                ssm_states[:, valid_dst_indices].transpose(-1, -2).contiguous()
+            )
 
         draft_token_num = intermediate_state_cache.shape[2]
         if mamba_track_indices is not None:
@@ -279,11 +285,18 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 mamba_steps_to_track,
             )
 
-            track_mask = mamba_steps_to_track >= 0
+            track_mask = (
+                (mamba_steps_to_track >= 0)
+                & (mamba_track_indices >= 0)
+                & (dst_indices_tensor >= 0)
+            )
             # Track conv state from the verify-time window before rolling back
             # the working slot; NPU does not keep per-step conv intermediates.
             track_indices = mamba_track_indices[track_mask]
             if track_indices.numel() > 0:
+                ssm_states[:, track_indices] = (
+                    ssm_states[:, track_indices].transpose(-1, -2).contiguous()
+                )
                 conv_states[:, track_indices] = conv_states[
                     :, dst_indices_tensor[track_mask]
                 ]
