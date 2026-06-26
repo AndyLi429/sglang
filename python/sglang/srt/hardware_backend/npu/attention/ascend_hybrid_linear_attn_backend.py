@@ -134,23 +134,26 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         num_padding = torch.count_nonzero(
             seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
         )
+        num_padding_int = int(num_padding.item())
         # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
+        req_pool_indices[bs - num_padding_int :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         # Padding lanes must not alias a real Mamba slot.
-        mamba_indices[bs - num_padding :] = self.pad_slot_id
+        mamba_indices[bs - num_padding_int :] = self.pad_slot_id
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
-            if num_padding == 0:
+            if num_padding_int == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
+                self.query_start_loc_list[bs - 1][: bs - num_padding_int].copy_(
+                    self.cached_cuda_graph_decode_query_start_loc[
+                        : bs - num_padding_int
+                    ]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    bs - num_padding
+                self.query_start_loc_list[bs - 1][bs - num_padding_int :].fill_(
+                    bs - num_padding_int
                 )
         elif forward_mode.is_target_verify():
             ssm_state_indices = torch.arange(
@@ -159,16 +162,18 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
-            if num_padding == 0:
+            if num_padding_int == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                self.query_start_loc_list[bs - 1][: bs - num_padding_int].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[
+                        : bs - num_padding_int
+                    ]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
+                self.query_start_loc_list[bs - 1][bs - num_padding_int :].fill_(
+                    (bs - num_padding_int) * spec_info.draft_token_num
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")

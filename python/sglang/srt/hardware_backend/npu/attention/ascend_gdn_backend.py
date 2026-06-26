@@ -30,6 +30,27 @@ causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
 
+def restore_gdn_prefill_ssm_layout_for_spec(
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_states: Optional[torch.Tensor],
+    *,
+    enabled: bool,
+) -> None:
+    if not enabled or has_initial_states is None:
+        return
+
+    restore_mask = has_initial_states.to(dtype=torch.bool, device=cache_indices.device)
+    restore_mask = restore_mask & (cache_indices >= 0)
+    if not restore_mask.any():
+        return
+
+    restore_indices = cache_indices[restore_mask].to(dtype=torch.long)
+    ssm_states[restore_indices] = (
+        ssm_states[restore_indices].transpose(-1, -2).contiguous()
+    )
+
+
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
@@ -224,6 +245,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
+            restore_gdn_prefill_ssm_layout_for_spec(
+                ssm_states,
+                cache_indices,
+                has_initial_states,
+                enabled=not forward_batch.spec_algorithm.is_none(),
+            )
         if is_target_verify:
             num_token_padding = mixed_qkv.shape[0]
             if (
