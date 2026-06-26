@@ -350,19 +350,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
+            if h is not None:
+                # Prefix-cache snapshots are consumed by extend kernels, so keep
+                # the tracked state in extend layout before spec verify layout.
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
             if not forward_batch.spec_algorithm.is_none():
                 last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
                     ssm_states.dtype, copy=False
                 )
-            else:
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
-            ssm_states[cache_indices] = last_recurrent_state
-            if h is not None:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+                ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 

@@ -137,7 +137,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = 0
+        # Padding lanes must not alias a real Mamba slot.
+        mamba_indices[bs - num_padding :] = self.pad_slot_id
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
