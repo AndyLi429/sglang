@@ -7,8 +7,9 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_npu
 
-_is_npu = current_platform.is_npu()
+_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
@@ -34,7 +35,7 @@ def npu_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    del input_scale, bias
+    # del input_scale, bias
 
     if block_size != [128, 128]:
         raise ValueError("npu_w8a8_block_fp8_linear only supports block_size == [128, 128]")
@@ -45,19 +46,23 @@ def npu_w8a8_block_fp8_linear(
     k = orig_shape[-1]
     input_2d = input.reshape(-1, k).contiguous()
 
-    x_fp8, x_scale = torch.ops.npu.npu_dynamic_block_quant(
-        input_2d,
-        dst_type=torch.float8_e4m3fn,
-        row_block_size=1,
-        col_block_size=128,
-    )
+    x_fp8, x_scale = torch_npu.npu_dynamic_mx_quant(input_2d, dst_type=torch.float8_e4m3fn)
+    # x_fp8, x_scale = torch.ops.npu.npu_dynamic_block_quant(
+    #     input_2d,
+    #     dst_type=torch.float8_e4m3fn,
+    #     row_block_size=1,
+    #     col_block_size=128,
+    # )
     output_2d = torch.ops.npu.npu_quant_matmul(
         x_fp8,
         weight,
         scale=weight_scale,
+        scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
         pertoken_scale=x_scale,
+        pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        bias=bias,
         output_dtype=torch.bfloat16,
-        group_sizes=(1, 128, 128),
+        group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
     )
 
     return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])

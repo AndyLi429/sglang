@@ -550,10 +550,19 @@ class Fp8LinearMethod(LinearMethodBase):
                     -1, -2
                 ).contiguous()
             else:
-                layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
-                    -1, -2
-                ).contiguous()
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.to(torch.uint8)
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.repeat_interleave(4, dim=1).repeat_interleave(
+                    128,
+                    dim=0)
+                n_dim, k_dim = layer.weight_scale_inv.data.shape
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.reshape(n_dim, k_dim // 2, 2)
+                layer.weight.data = layer.weight.data.transpose(0, 1)
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(0, 1)
+                # layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
+                # layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                #     -1, -2
+                # ).contiguous()
             return
         else:
             # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
