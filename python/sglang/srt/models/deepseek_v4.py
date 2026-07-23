@@ -2422,6 +2422,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
+        # TODO(temp-debug): remove after FP4 expert-scale loading is verified.
+        _expert_scale_params = sorted(
+            p
+            for p in loaded_params
+            if ".experts." in p and p.endswith("weight_scale_inv")
+        )
+        logger.info(
+            f"[DBG-FP4] expert scale params matched during load: "
+            f"{len(_expert_scale_params)} -> {_expert_scale_params[:8]}"
+        )
+
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
