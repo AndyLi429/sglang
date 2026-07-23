@@ -159,6 +159,11 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             if self.moe_runner_config is not None
             else topk_ids.shape[1]
         )
+        swiglu_limit = (
+            self.moe_runner_config.swiglu_limit
+            if self.moe_runner_config is not None
+            else None
+        )
         output = npu_fused_experts_w4a4_mxfp(
             hidden_states,
             layer.w13_weight,
@@ -168,6 +173,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             topk_weights,
             topk_ids,
             top_k,
+            swiglu_limit=swiglu_limit,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -184,6 +190,22 @@ def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     return scale
 
 
+def _apply_swiglu_limit_npu(
+    gate_up: torch.Tensor, swiglu_limit: Optional[float]
+) -> None:
+    """Clamp the SwiGLU input in place before ``npu_swiglu`` (DeepSeek-V4).
+
+    Matches vllm-ascend: gate (first half) <= limit; up (second half) in
+    [-limit, limit]. ``chunk`` returns views, so the in-place clamps mutate
+    ``gate_up`` directly. No-op when ``swiglu_limit`` is unset or <= 0.
+    """
+    if swiglu_limit is None or swiglu_limit <= 0:
+        return
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate.clamp_(max=swiglu_limit)
+    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+
+
 def npu_fused_experts_w4a4_mxfp(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -193,6 +215,7 @@ def npu_fused_experts_w4a4_mxfp(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    swiglu_limit: Optional[float] = None,
     **kwargs,
 ):
     if torch.npu.is_current_stream_capturing():
@@ -205,6 +228,7 @@ def npu_fused_experts_w4a4_mxfp(
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=top_k,
+            swiglu_limit=swiglu_limit,
             **kwargs,
         )
 
@@ -248,6 +272,7 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
+    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
@@ -285,6 +310,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    swiglu_limit: Optional[float] = None,
     **kwargs,
 ):
     num_tokens = hidden_states.shape[:-1].numel()
@@ -316,6 +342,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
+    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
