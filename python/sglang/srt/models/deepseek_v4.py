@@ -2183,6 +2183,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                             f"mlp.experts.{self.config.n_routed_experts}",
                         )
 
+                    # FP4 expert checkpoints store scales as ".weight_scale",
+                    # but NPUW4A4Fp4MoEMethod registers "..._scale_inv"; without
+                    # this remap the scales are silently skipped and stay zero
+                    # (E8M0 zero = 2^-127), making every routed expert output 0.
+                    if (
+                        self.quant_config is not None
+                        and getattr(self.quant_config, "is_fp4_experts", False)
+                        and "mlp.experts." in name
+                        and name.endswith(".weight_scale")
+                    ):
+                        name += "_inv"
+
                     weight_names.append(name)
 
                     if not is_nextn:
