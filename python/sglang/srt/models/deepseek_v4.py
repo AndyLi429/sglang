@@ -2183,18 +2183,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                             f"mlp.experts.{self.config.n_routed_experts}",
                         )
 
-                    # FP4 expert checkpoints store scales as ".weight_scale",
-                    # but NPUW4A4Fp4MoEMethod registers "..._scale_inv"; without
-                    # this remap the scales are silently skipped and stay zero
-                    # (E8M0 zero = 2^-127), making every routed expert output 0.
-                    if (
-                        self.quant_config is not None
-                        and getattr(self.quant_config, "is_fp4_experts", False)
-                        and "mlp.experts." in name
-                        and name.endswith(".weight_scale")
-                    ):
-                        name += "_inv"
-
                     weight_names.append(name)
 
                     if not is_nextn:
@@ -2264,29 +2252,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name not in params_dict:
                                 continue
                             param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            # TODO(temp-debug): inline-load one scale tensor and
-                            # verify the write actually lands in param.data.
+                            # FP4 expert scales ship as E8M0 (float8_e8m0fnu),
+                            # but the param is uint8 and the GMM kernel consumes
+                            # the raw exponent byte. weight_loader's copy_ would
+                            # do a *numeric* cast (2^-k -> 0), silently zeroing
+                            # every routed expert, so reinterpret the bits.
                             if (
-                                expert_id == 0
-                                and shard_id == "w1"
-                                and ".layers.0." in name
-                                and name.endswith("weight_scale_inv")
+                                param.data.dtype == torch.uint8
+                                and loaded_weight.dtype != torch.uint8
+                                and loaded_weight.element_size() == 1
                             ):
-                                weight_loader(
-                                    param,
-                                    loaded_weight,
-                                    name,
-                                    shard_id=shard_id,
-                                    expert_id=expert_id,
-                                )
-                                logger.info(
-                                    f"[DBG-FP4] inline-load {name}: "
-                                    f"lw dtype={loaded_weight.dtype} "
-                                    f"shape={tuple(loaded_weight.shape)} "
-                                    f"absmax={loaded_weight.float().abs().max().item():.6g} "
-                                    f"-> param[0].max={int(param.data[0].max())}"
-                                )
+                                loaded_weight = loaded_weight.view(torch.uint8)
+                            weight_loader = param.weight_loader
                             maybe_executor_submit(
                                 executor=executor,
                                 futures=futures,
@@ -2443,39 +2420,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             logger.warning(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
-
-        # TODO(temp-debug): remove after FP4 expert-scale loading is verified.
-        _expert_scale_params = sorted(
-            p
-            for p in loaded_params
-            if ".experts." in p and p.endswith("weight_scale_inv")
-        )
-        logger.info(
-            f"[DBG-FP4] expert scale params matched during load: "
-            f"{len(_expert_scale_params)} -> {_expert_scale_params[:8]}"
-        )
-        try:
-            from sglang.srt.eplb.expert_location import (
-                get_global_expert_location_metadata,
-            )
-
-            _meta = get_global_expert_location_metadata()
-            _moe = self.model.layers[self.model.start_layer].mlp.experts
-            logger.info(
-                f"[DBG-FP4] expert_location_metadata="
-                f"{type(_meta).__name__ if _meta is not None else None} "
-                f"map_gid0={_moe._map_global_expert_id_to_local_expert_id(0)} "
-                f"num_local_experts={_moe.num_local_experts} "
-                f"post-join w13_scale.max="
-                f"{int(_moe.w13_weight_scale_inv.data.max())}"
-            )
-            if _meta is not None:
-                logger.info(
-                    f"[DBG-FP4] logical_to_all_physical(layer0, expert0)="
-                    f"{_meta.logical_to_all_physical(_moe.layer_id, 0, False)}"
-                )
-        except Exception as _e:
-            logger.info(f"[DBG-FP4] probe failed: {_e!r}")
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

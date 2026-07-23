@@ -1,4 +1,3 @@
-import logging
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -19,8 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 MXFP4_BLOCK_SIZE = 32
-
-logger = logging.getLogger(__name__)
 
 
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
@@ -108,20 +105,15 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Scales are created with torch.zeros; an all-zero E8M0 scale (= 2^-127)
-        # silently zeroes every routed expert output, so fail fast instead.
+        # silently zeroes every routed expert output, so fail fast instead. The
+        # checkpoint ships these as float8_e8m0fnu; the weight loader must
+        # reinterpret the bits into this uint8 param (see deepseek_v4.py) rather
+        # than numerically cast them, or every scale collapses to zero here.
         w13s = layer.w13_weight_scale_inv.data
         w2s = layer.w2_weight_scale_inv.data
-        w13_nonzero_experts = int((w13s.flatten(1).amax(1) > 0).sum())
-        logger.info(
-            f"[DBG-FP4] prefix={self.prefix!r} "
-            f"w13_scale max={int(w13s.max())} w2_scale max={int(w2s.max())} "
-            f"nonzero-scale experts={w13_nonzero_experts}/{w13s.shape[0]} "
-            f"w13_scale shape={tuple(w13s.shape)} dtype={w13s.dtype}"
-        )
         assert w13s.max() > 0 and w2s.max() > 0, (
             f"FP4 expert weight scales all zero (never loaded): "
-            f"prefix={self.prefix!r} "
-            f"nonzero_experts={w13_nonzero_experts}/{w13s.shape[0]}"
+            f"prefix={self.prefix!r}"
         )
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
