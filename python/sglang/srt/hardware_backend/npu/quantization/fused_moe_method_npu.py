@@ -525,15 +525,16 @@ def w4a4_mxfp_gmm_npu(
     else:
         x, x_scale = input, input_scale
 
-    # Byte-for-byte the vllm-ascend W4A8MXFP gmm1 op call (device_op.py
-    # npu_grouped_matmul_swiglu_quant, QuantType.W4A8MXFP branch): FP8 x_dtype,
-    # FP4 weight_dtype, weight dequant via antiquant_scale (scale=None).
+    # W4A8 MXFP GMM: FP8-e4m3 activation (x_dtype) x FP4 weight (weight_dtype),
+    # both with E8M0 per-block MX scales. This is the SAME op invocation as the
+    # working W4A4 path -- ONLY x_dtype changed FP4 -> FP8. The NZ weight op
+    # (aclnnGroupedMatmulWeightNz) requires a non-null `scale` in the quant
+    # case, so the weight scale MUST stay in `scale=`, not `antiquant_scale=`.
     return torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],
-        scale=None,
-        antiquant_scale=[weight_scale],
-        scale_dtype=None,
+        scale=[weight_scale],
+        scale_dtype=torch_npu.float8_e8m0fnu,
         per_token_scale=[x_scale],
         split_item=2,
         group_type=0,
