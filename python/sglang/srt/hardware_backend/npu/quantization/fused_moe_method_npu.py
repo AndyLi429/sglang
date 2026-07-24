@@ -123,12 +123,14 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             f"FP4 expert weight scales all zero (never loaded): "
             f"prefix={self.prefix!r}"
         )
-        # NZ-pack (format 29) the FP4 weight for a GMM whose ACTIVATION is
-        # FP8-e4m3. customize_dtype MUST equal the x_dtype used in
-        # w4a4_mxfp_gmm_npu, and input_dtype declares the stored weight is FP4;
-        # mirrors vllm-ascend AscendW4A8MXFPDynamicFusedMoEMethod. Without these
-        # the packed layout is built for an FP4-activation GMM and won't match
-        # the FP8 activation at matmul time.
+        # W4A8 MXFP: NZ-pack (format 29) the FP4 weight for an FP8-e4m3
+        # activation GMM. customize_dtype declares the matmul compute/act dtype
+        # (FP8) and input_dtype declares the stored weight is FP4, yielding the
+        # FRACTAL_NZ_C0_32 layout the mxfp grouped-matmul kernel expects. This
+        # MUST be paired with the torch_npu.npu_grouped_matmul call in
+        # w4a4_mxfp_gmm_npu -- torch.ops.npu.* routes to the older WeightNz
+        # kernel which rejects C0_32. Mirrors vllm-ascend
+        # AscendW4A8MXFPDynamicFusedMoEMethod.process_weights_after_loading.
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
             29,
@@ -320,7 +322,7 @@ def npu_fused_experts_w4a4_mxfp(
     row_ids = torch.arange(rows, device=hidden_states.device, dtype=torch.int64)
     valid_mask = row_ids < expert_tokens[-1]
     valid_mask_2d = valid_mask.unsqueeze(1)
-
+    # gmm1
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -332,6 +334,7 @@ def npu_fused_experts_w4a4_mxfp(
     )
     _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    # gmm2
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
         input_scale=None,
@@ -525,17 +528,22 @@ def w4a4_mxfp_gmm_npu(
     else:
         x, x_scale = input, input_scale
 
-    # W4A8 MXFP GMM: FP8-e4m3 activation (x_dtype) x FP4 weight (weight_dtype),
-    # both with E8M0 per-block MX scales. This is the SAME op invocation as the
-    # working W4A4 path -- ONLY x_dtype changed FP4 -> FP8. The NZ weight op
-    # (aclnnGroupedMatmulWeightNz) requires a non-null `scale` in the quant
-    # case, so the weight scale MUST stay in `scale=`, not `antiquant_scale=`.
-    return torch.ops.npu.npu_grouped_matmul(
-        [x],
-        [weight],
-        scale=[weight_scale],
-        scale_dtype=torch_npu.float8_e8m0fnu,
+    # W4A8 MXFP GMM, byte-faithful to vllm-ascend's W4A8MXFP path
+    # (device_op.py npu_grouped_matmul_swiglu_quant / gmm2): FP8-e4m3 activation
+    # (x_dtype) x FP4 weight (weight_dtype), weight dequant via antiquant_scale
+    # with scale=None. MUST call torch_npu.npu_grouped_matmul, NOT
+    # torch.ops.npu.npu_grouped_matmul: with identical CANN, only the former
+    # dispatches to the mxfp kernel that accepts the FRACTAL_NZ_C0_32 weight and
+    # antiquant_scale; torch.ops.npu.* falls into aclnnGroupedMatmulWeightNz,
+    # which rejects C0_32 and demands a non-null `scale`.
+    return torch_npu.npu_grouped_matmul(
+        x=[x],
+        weight=[weight],
+        scale=None,
+        antiquant_scale=[weight_scale],
+        scale_dtype=None,
         per_token_scale=[x_scale],
+        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
         split_item=2,
         group_type=0,
         group_list=group_list,
@@ -543,7 +551,6 @@ def w4a4_mxfp_gmm_npu(
         output_dtype=output_dtype,
         x_dtype=torch.float8_e4m3fn,
         weight_dtype=torch_npu.float4_e2m1fn_x2,
-        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
     )[0]
 
 
