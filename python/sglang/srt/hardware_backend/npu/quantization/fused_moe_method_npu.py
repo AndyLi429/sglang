@@ -179,11 +179,12 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             if self.moe_runner_config is not None
             else topk_ids.shape[1]
         )
-        swiglu_limit = (
-            self.moe_runner_config.swiglu_limit
-            if self.moe_runner_config is not None
-            else None
-        )
+        # Prefer the explicit layer attribute (set by DeepseekV2MoE, mirroring
+        # vllm-ascend's layer.swiglu_limit) so the DSV4 SwiGLU clamp reaches the
+        # routed experts even when moe_runner_config.swiglu_limit is unset.
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        if swiglu_limit is None and self.moe_runner_config is not None:
+            swiglu_limit = self.moe_runner_config.swiglu_limit
         output = npu_fused_experts_w4a4_mxfp(
             hidden_states,
             layer.w13_weight,

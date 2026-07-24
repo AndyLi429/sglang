@@ -631,6 +631,12 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
+        # Expose swiglu_limit as a direct attribute on the experts layer, matching
+        # vllm-ascend (DeepseekV4MoE sets self.swiglu_limit; the fused-experts
+        # apply reads layer.swiglu_limit). The NPU W4A8 routed-expert path reads
+        # this so the DSV4 SwiGLU clamp (=10) reaches the experts even if the
+        # moe_runner_config plumbing drops it.
+        self.experts.swiglu_limit = getattr(config, "swiglu_limit", None)
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
