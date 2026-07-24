@@ -115,13 +115,22 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             f"FP4 expert weight scales all zero (never loaded): "
             f"prefix={self.prefix!r}"
         )
+        # W4A8 MXFP: cast the FP4 weights into the A5 NZ layout tiled for an
+        # FP8 activation matmul. customize_dtype/input_dtype tell npu_format_cast
+        # the physical target tile dtype (float8_e4m3fn) and that the source
+        # bytes are packed FP4 (float4_e2m1fn_x2) — matching vllm-ascend's
+        # AscendW4A8MXFPDynamicFusedMoEMethod.process_weights_after_loading.
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
             29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
         ).transpose(1, 2)
         layer.w2_weight.data = torch_npu.npu_format_cast(
             layer.w2_weight.data.view(torch.uint8),
             29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
         ).transpose(1, 2)
         layer.w13_weight_scale_inv = torch.nn.Parameter(
             _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
@@ -450,13 +459,23 @@ def w4a4_mxfp_gmm_npu(
     group_list: torch.Tensor,
     output_dtype=torch.bfloat16,
 ) -> torch.Tensor:
+    """W4A8 MXFP grouped matmul: FP8 activation x FP4 weight (DeepSeek-V4 / A5).
+
+    Mirrors vllm-ascend's W4A8MXFP MoE path (device_op.py
+    ``npu_grouped_matmul_swiglu_quant`` / ``npu_grouped_matmul_gmm2``):
+    activations are dynamically quantized to float8_e4m3fn with an E8M0
+    per-token scale, and the FP4 weight is dequantized through
+    ``antiquant_scale`` (NOT the ``scale=`` quant channel used for W4A4).
+    The ``input_scale is not None`` branch (DeepEP) is not exercised by the
+    dense prefill/decode path and would need its dispatcher to emit FP8.
+    """
     group_list = group_list.to(torch.int64)
     if input_scale is None:
         x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
             input,
             axis=1,
             round_mode="rint",
-            dst_type=torch_npu.float4_e2m1fn_x2,
+            dst_type=torch.float8_e4m3fn,
             block_size=MXFP4_BLOCK_SIZE,
             scale_alg=None,
         )
@@ -466,15 +485,16 @@ def w4a4_mxfp_gmm_npu(
     return torch.ops.npu.npu_grouped_matmul(
         [x],
         [weight],
-        scale=[weight_scale],
-        scale_dtype=torch_npu.float8_e8m0fnu,
+        scale=None,
+        antiquant_scale=[weight_scale],
+        scale_dtype=None,
         per_token_scale=[x_scale],
         split_item=2,
         group_type=0,
         group_list=group_list,
         group_list_type=group_list_type,
         output_dtype=output_dtype,
-        x_dtype=torch_npu.float4_e2m1fn_x2,
+        x_dtype=torch.float8_e4m3fn,
         weight_dtype=torch_npu.float4_e2m1fn_x2,
         per_token_scale_dtype=torch_npu.float8_e8m0fnu,
     )[0]
