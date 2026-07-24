@@ -236,6 +236,46 @@ def npu_fused_experts_w4a4_mxfp(
     original_dtype = hidden_states.dtype
     if len(original_shape) == 3:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+    # === [DSV4 DEBUG] one-shot dump of the routed-expert GMM inputs, for the
+    # offline FP4-vs-FP8-vs-vllm single-op comparison. Enable with
+    # SGLANG_DSV4_DUMP_MOE=1 (dir via SGLANG_DSV4_DUMP_MOE_PATH). Fires on the
+    # first prefill call only (== the first MoE layer, layer 0). w13/w2 are
+    # already NZ-packed FP4 (post process_weights_after_loading); reload on the
+    # SAME A5 so the ACL format survives. Delete this block once RCA is done.
+    import os
+
+    if os.environ.get("SGLANG_DSV4_DUMP_MOE") == "1" and not getattr(
+        torch, "_dsv4_moe_dumped", False
+    ):
+        _p = os.environ.get("SGLANG_DSV4_DUMP_MOE_PATH", "/tmp/dsv4_moe_in.pt")
+        torch.save(
+            {
+                "hidden_states": hidden_states,
+                "w13": w13,
+                "w13_weight_scale_inv": w13_weight_scale_inv,
+                "w2": w2,
+                "w2_weight_scale_inv": w2_weight_scale_inv,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                "top_k": top_k,
+                "swiglu_limit": swiglu_limit,
+            },
+            _p,
+        )
+        torch._dsv4_moe_dumped = True
+        print(
+            f"=== [DSV4 DUMP] wrote {_p} | "
+            f"hs={tuple(hidden_states.shape)}/{hidden_states.dtype} "
+            f"w13={tuple(w13.shape)}/{w13.dtype} "
+            f"w13s={tuple(w13_weight_scale_inv.shape)}/{w13_weight_scale_inv.dtype} "
+            f"w2={tuple(w2.shape)}/{w2.dtype} "
+            f"w2s={tuple(w2_weight_scale_inv.shape)}/{w2_weight_scale_inv.dtype} "
+            f"tid={tuple(topk_ids.shape)} tw={tuple(topk_weights.shape)} "
+            f"top_k={top_k} lim={swiglu_limit}",
+            flush=True,
+        )
+
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
     row_idx_len = num_tokens * top_k
