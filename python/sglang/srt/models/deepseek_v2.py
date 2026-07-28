@@ -431,6 +431,7 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
+        self.weight_fp32 = Optional[torch.Tensor] = None
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
@@ -510,6 +511,10 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             elif _is_npu:
+                if self.is_deepseek_v4:
+                    if self.weight_fp32 is None:
+                        self.weight_fp32 = self.weight.data.float()
+                    logits = F.linear(hidden_states.float(), self.weight_fp32, None)
                 logits = F.linear(hidden_states, self.weight, None)
             else:
                 if self.is_deepseek_v4:
@@ -631,6 +636,8 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
+
+        self.experts.swiglu_limit = getattr(config, "swiglu_limit", None)
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(

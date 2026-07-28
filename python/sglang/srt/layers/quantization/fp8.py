@@ -98,6 +98,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -550,19 +551,65 @@ class Fp8LinearMethod(LinearMethodBase):
                     -1, -2
                 ).contiguous()
             else:
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.to(torch.uint8)
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.repeat_interleave(4, dim=1).repeat_interleave(
-                    128,
-                    dim=0)
+                layer.weight_scale_inv.data = (
+                    layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF
+                )
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.to(
+                    torch.uint8
+                )
+                layer.weight_scale_inv.data = (
+                    layer.weight_scale_inv.data.repeat_interleave(
+                        4, dim=1
+                    ).repeat_interleave(128, dim=0)
+                )
                 n_dim, k_dim = layer.weight_scale_inv.data.shape
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.reshape(n_dim, k_dim // 2, 2)
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.reshape(
+                    n_dim, k_dim // 2, 2
+                )
                 layer.weight.data = layer.weight.data.transpose(0, 1)
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(0, 1)
-                # layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
-                # layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
-                #     -1, -2
-                # ).contiguous()
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                    0, 1
+                )
+                if getattr(layer, "_dsv4_a5_mxfp8_wo_a", False):
+                    num_groups = layer._dsv4_num_groups
+                    rank = layer._dsv4_o_lora_rank
+                    hidden_dim = layer.weight.shape[0]
+                    scale_k64 = layer.weight_scale_inv.shape[0]
+                    output_dim = num_groups * rank
+
+                    if layer.weight.shape != (hidden_dim, output_dim):
+                        raise ValueError(
+                            "Unexpected A5 wo_a weight layout after FP8 "
+                            f"post-processing: got {tuple(layer.weight.shape)}, "
+                            f"expected ({hidden_dim}, {output_dim})."
+                        )
+                    if layer.weight_scale_inv.shape != (scale_k64, output_dim, 2):
+                        raise ValueError(
+                            "Unexpected A5 wo_a scale layout after FP8 "
+                            "post-processing: got "
+                            f"{tuple(layer.weight_scale_inv.shape)}, expected "
+                            f"({scale_k64}, {output_dim}, 2)."
+                        )
+                    if scale_k64 * 64 != hidden_dim:
+                        raise ValueError(
+                            "Unexpected A5 wo_a scale K dimension: "
+                            f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
+                        )
+
+                    # Match vllm-ascend's batched wo_a layout:
+                    # weight [D, G*R] -> [G, D, R]
+                    # scale  [D/64, G*R, 2] -> [G, D/64, R, 2]
+                    layer.weight.data = (
+                        layer.weight.data.T.reshape(num_groups, rank, hidden_dim)
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+                    layer.weight_scale_inv.data = (
+                        layer.weight_scale_inv.data.transpose(0, 1)
+                        .reshape(num_groups, rank, scale_k64, 2)
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
             return
         else:
             # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
@@ -600,7 +647,41 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
-
+        if getattr(layer, "_dsv4_a5_mxfp8_wo_a", False):
+            num_groups = layer._dsv4_num_groups
+            rank = layer._dsv4_o_lora_rank
+            hidden_dim = layer.weight.shape[0]
+            scale_k64 = layer.weight_scale_inv.shape[0]
+            output_dim = num_groups * rank
+            if layer.weight.shape != (hidden_dim, output_dim):
+                raise ValueError(
+                    "Unexpected A5 wo_a weight layout after FP8 "
+                    f"post-processing: got {tuple(layer.weight.shape)}, "
+                    f"expected ({hidden_dim}, {output_dim})."
+                )
+            if layer.weight_scale_inv.shape != (scale_k64, output_dim, 2):
+                raise ValueError(
+                    "Unexpected A5 wo_a scale layout after FP8 "
+                    "post-processing: got "
+                    f"{tuple(layer.weight_scale_inv.shape)}, expected "
+                    f"({scale_k64}, {output_dim}, 2)."
+                )
+            if scale_k64 * 64 != hidden_dim:
+                raise ValueError(
+                    "Unexpected A5 wo_a scale K dimension: "
+                    f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
+                )
+            layer.weight.data = (
+                layer.weight.data.T.reshape(num_groups, rank, hidden_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            layer.weight_scale_inv.data = (
+                layer.weight_scale_inv.data.transpose(0, 1)
+                .reshape(num_groups, rank, scale_k64, 2)
+                .transpose(1, 2)
+                .contiguous()
+            )
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear

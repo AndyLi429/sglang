@@ -133,6 +133,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_gfx95_supported,
+    is_npu_before_atlas_a5,
     log_info_on_rank0,
     make_layers,
 )
@@ -148,6 +149,16 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+
+
+def _use_npu_a5_mxfp8_wo_a(quant_config) -> bool:
+    """Use the native A5 MXFP8 wo_a path for serialized DS block-FP8 weights."""
+    if not _is_npu or is_npu_before_atlas_a5() or quant_config is None:
+        return False
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    return getattr(quant_config, "is_checkpoint_fp8_serialized", False) and tuple(
+        weight_block_size or ()
+    ) == (128, 128)
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -434,17 +445,28 @@ class MQALayer(nn.Module):
             tp_size=attn_tp_size,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
+        self.use_npu_a5_mxfp8_wo_a = _use_npu_a5_mxfp8_wo_a(quant_config)
+        quantize_wo_a = self.use_npu_a5_mxfp8_wo_a or _FP8_WO_A_GEMM
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
-            quant_config=quant_config if _FP8_WO_A_GEMM else None,
+            quant_config=quant_config if quantize_wo_a else None,
             prefix=add_prefix("wo_a", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
+            **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if _FP8_WO_A_GEMM:
+        if quantize_wo_a:
+            assert hasattr(
+                self.wo_a, "weight_scale_inv"
+            ), "FP8 quant_config must create weight_scale_inv"
+        if self.use_npu_a5_mxfp8_wo_a:
+            self.wo_a._dsv4_a5_mxfp8_wo_a = True
+            self.wo_a._dsv4_num_groups = self.n_local_groups
+            self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
+        if _FP8_WO_A_GEMM and not self.use_npu_a5_mxfp8_wo_a:
+            self.wo_a.weight_scale_inv.format_ue8m0 = True
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
@@ -1061,8 +1083,21 @@ class MQALayer(nn.Module):
             )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
-
-        if _FP8_WO_A_GEMM:
+        if self.use_npu_a5_mxfp8_wo_a:
+            o, o_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+            o = torch_npu.npu_transpose_quant_batchmatmul(
+                o,
+                self.wo_a.weight,
+                dtype=torch.bfloat16,
+                bias=None,
+                group_sizes=(0, 0, 32),
+                x1_scale=o_scale.view(torch.float8_e8m0fnu),
+                x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
+        elif _FP8_WO_A_GEMM:
             import deep_gemm
 
             T, G, D = o.shape
@@ -1408,7 +1443,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            return torch.ops.custom.npu_hc_post(
+                x.unsqueeze(0),
+                residual.unsqueeze(0),
+                post.unsqueeze(0),
+                comb.unsqueeze(0),
+            ).squeeze(0)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
@@ -2252,6 +2292,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name not in params_dict:
                                 continue
                             param = params_dict[name]
+                            # FP4 expert scales ship as E8M0 (float8_e8m0fnu),
+                            # but the param is uint8 and the GMM kernel consumes
+                            # the raw exponent byte. weight_loader's copy_ would
+                            # do a *numeric* cast (2^-k -> 0), silently zeroing
+                            # every routed expert, so reinterpret the bits.
+                            if (
+                                param.data.dtype == torch.uint8
+                                and loaded_weight.dtype != torch.uint8
+                                and loaded_weight.element_size() == 1
+                            ):
+                                loaded_weight = loaded_weight.view(torch.uint8)
                             weight_loader = param.weight_loader
                             maybe_executor_submit(
                                 executor=executor,

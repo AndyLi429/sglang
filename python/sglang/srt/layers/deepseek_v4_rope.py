@@ -551,8 +551,8 @@ def v4_rope_inplace_npu(
     sin_half = freqs_imag_contig[positions]
     if inverse:
         sin_half = -sin_half
-    cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
-    sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+    cos_full = cos_half.repeat_interleave(2, dim=-1).to(torch.float32)
+    sin_full = sin_half.repeat_interleave(2, dim=-1).to(torch.float32)
     rope_dim = cos_full.shape[-1]
     # repeat_interleave produces a contiguous tensor, so the .view()
     # below already returns a contiguous result — no .contiguous() needed.
