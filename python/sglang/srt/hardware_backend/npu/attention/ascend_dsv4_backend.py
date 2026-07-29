@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _A5_KV_TILE_SIZE = 64
 _A5_KV_ROPE_HEAD_DIM = 64
 
+
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
     cache = _walsh_hadamard_matrix._cache
@@ -615,7 +616,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         # Norm + rope + optional hadamard on the freshly compressed tokens,
         # then write via _compressor_epilog_npu with explicit slab-derived locs.
         if kv_out_list:
-            kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
+            kv_out = torch.cat(kv_out_list, dim=0)
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = compressor.norm(kv_out)
             # npu_rotary_mul wants cos/sin in repeat_interleave(2) layout, reshaped
@@ -629,8 +630,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             )
 
             freqs_real, freqs_imag = _get_contig_freqs_real_imag(compressor.freqs_cis)
-            cos_half = freqs_real[pos_out].to(kv_out.dtype)
-            sin_half = freqs_imag[pos_out].to(kv_out.dtype)
+            cos_half = freqs_real[pos_out].to(torch.float32)
+            sin_half = freqs_imag[pos_out].to(torch.float32)
             cos = (
                 cos_half.repeat_interleave(2, dim=-1)
                 .view(-1, 1, 1, rope_dim)
@@ -647,6 +648,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 rope_view, cos, sin, rotary_mode="interleave"
             )
             rope_slice.copy_(rope_rot.view_as(rope_slice))
+            kv_out = kv_out.to(dtype)
             if compressor.rotate:
                 kv_out = _apply_hadamard(kv_out, compressor.hadamard_matrix)
             # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
@@ -1336,7 +1338,9 @@ class DeepseekV4AscendAttnBackend(
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
             kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(**c4a_kwargs)
+                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(
+                    **c4a_kwargs
+                )
             )
 
             if actual_seq_lengths_q_pa is not None:
@@ -1366,7 +1370,9 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(**c128a_kwargs)
+                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(
+                    **c128a_kwargs
+                )
             )
 
         return kernel_metadata
@@ -1430,8 +1436,8 @@ class DeepseekV4AscendAttnBackend(
         #     swa_kv_cache = swa_kv_cache.to(torch.float32).to(torch.float8_e4m3fn)
         attn_kwargs = dict(
             kv_quant_mode=1,
-            tile_size = _A5_KV_TILE_SIZE,
-            rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
+            tile_size=_A5_KV_TILE_SIZE,
+            rope_head_dim=_A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1489,8 +1495,8 @@ class DeepseekV4AscendAttnBackend(
 
         attn_kwargs = dict(
             kv_quant_mode=1,
-            tile_size = _A5_KV_TILE_SIZE,
-            rope_head_dim = _A5_KV_ROPE_HEAD_DIM,
+            tile_size=_A5_KV_TILE_SIZE,
+            rope_head_dim=_A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
