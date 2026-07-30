@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 
 _A5_KV_QUANT_GROUP_SIZE = 64
 
+
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU bf16 variant of the full / SWA / c4 / c128 single-KV pool.
 
@@ -509,13 +510,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
 
         torch.ops.custom.kv_compress_epilog(
-            buf.view(-1, buf.shape[-1]),
+            buf.view(-1, 1, buf.shape[-1]),
             cache_2d,
             slot_mapping,
             quant_group_size=_A5_KV_QUANT_GROUP_SIZE,
             quant_mode=2,
             round_scale_flag=True,
+            layout=1,
         )
+
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
     # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.
