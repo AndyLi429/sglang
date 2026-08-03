@@ -5,10 +5,12 @@ scales. This module wires those weights to the A5 grouped-matmul kernels, both
 for the plain (init-routing) path and for the DeepEP dispatch path.
 """
 
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float4_e2m1fn_x2_dtype,
     _get_float8_e8m0fnu_dtype,
@@ -237,6 +239,69 @@ def _apply_swiglu_limit_npu(
     up.clamp_(min=-swiglu_limit, max=swiglu_limit)
 
 
+@lru_cache(maxsize=1)
+def _use_fused_swiglu_quant() -> bool:
+    """Whether the gmm1 epilogue collapses into one kernel.
+
+    Gated on the FP8-activation parameterization because the fused op emits
+    e4m3 activations with MX scales — exactly what ``_w4a8_mxfp_gmm`` consumes.
+    The W4A4 path needs FP4 activations instead, so it keeps the unfused chain.
+    """
+    return (
+        envs.SGLANG_NPU_USE_FUSED_SWIGLU_QUANT.get() and ROUTED_EXPERTS_FP8_ACTIVATION
+    )
+
+
+@lru_cache(maxsize=1)
+def _swiglu_group_quant_op():
+    """Resolve ``npu_swiglu_group_quant`` from whichever namespace registered it.
+
+    The op ships in the external Ascend custom-op package, which lands under
+    ``torch.ops.custom`` in some CANN builds and ``torch.ops.npu`` in others, so
+    the namespace is a property of the deployed package rather than of this
+    code — hence the probe rather than a direct attribute access. Raises when
+    the fusion was asked for but the op is missing: falling back silently would
+    turn a packaging problem into an unexplained perf regression.
+    """
+    for namespace in (torch.ops.custom, torch.ops.npu):
+        op = getattr(namespace, "npu_swiglu_group_quant", None)
+        if op is not None:
+            return op
+    raise RuntimeError(
+        "SGLANG_NPU_USE_FUSED_SWIGLU_QUANT is set but npu_swiglu_group_quant is "
+        "registered under neither torch.ops.custom nor torch.ops.npu. Upgrade "
+        "the Ascend custom-op package or unset the flag."
+    )
+
+
+def _swiglu_act_quant_npu(
+    gate_up: torch.Tensor, swiglu_limit: Optional[float]
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """gmm1 epilogue: clamp -> SwiGLU -> (fused path only) activation requant.
+
+    Returns ``(activations, act_scale)``. ``act_scale`` is ``None`` on the
+    unfused path, which leaves gmm2 to quantize its own input exactly as before;
+    on the fused path it is the per-token MX scale gmm2 would otherwise have
+    recomputed, so the two paths hand gmm2 equivalent inputs.
+    """
+    if not _use_fused_swiglu_quant():
+        _apply_swiglu_limit_npu(gate_up, swiglu_limit)
+        return torch.ops.npu.npu_swiglu(gate_up), None
+
+    # clamp_value=0 disables the clamp, matching _apply_swiglu_limit_npu's
+    # no-op for an unset or non-positive limit.
+    clamp_value = swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else 0.0
+    act, act_scale, _ = _swiglu_group_quant_op()(
+        gate_up,
+        topk_weight=None,
+        group_index=None,
+        dst_type=torch.float8_e4m3fn,
+        quant_mode=2,
+        clamp_value=clamp_value,
+    )
+    return act, act_scale
+
+
 def npu_fused_experts_w4a4_mxfp(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -305,11 +370,10 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, act_scale = _swiglu_act_quant_npu(hidden_states, swiglu_limit)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=act_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=0,
@@ -373,11 +437,10 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, act_scale = _swiglu_act_quant_npu(hidden_states, swiglu_limit)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=act_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=group_list_type,
@@ -482,11 +545,12 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, act_scale = _swiglu_act_quant_npu(
+        hidden_states, layer.moe_runner_config.swiglu_limit
+    )
     return w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=act_scale,
         weight=layer.w2_weight,
         weight_scale=layer.w2_weight_scale_inv,
         group_list_type=group_list_type,
