@@ -56,44 +56,15 @@ def _sparse_attn_ops():
     )
 
 
-def _sparse_attn_kv_quant_kwargs(*, metadata: bool = False) -> dict:
-    """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout.
-
-    The metadata op and the attention op take different subsets. Both declare
-    ``tile_size`` / ``rope_head_dim`` (schema default 0), but only the attention
-    op is meant to receive them — vllm-ascend keeps the two sets in separate
-    helpers (``get_dsa_sparse_attn_metadata_kwargs`` returns just
-    ``kv_quant_mode``; ``get_dsa_sparse_attn_base_kwargs`` adds the other two)
-    and leaves them at 0 for metadata. Passing 64 there changes how the op
-    plans its tiling, so keep the split.
-    """
+def _sparse_attn_kv_quant_kwargs() -> dict:
+    """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
     if not _is_atlas_a5():
         return {}
-    if metadata:
-        return {"kv_quant_mode": 1}
     return {
         "kv_quant_mode": 1,
         "tile_size": _A5_KV_TILE_SIZE,
         "rope_head_dim": _A5_KV_ROPE_HEAD_DIM,
     }
-
-
-def _host_max_len(lens) -> int:
-    """Largest entry of a host-side length container; 0 when there is none.
-
-    The sparse-attention metadata op sizes its tiling from ``max_seqlen_q`` /
-    ``max_seqlen_kv`` (both default to 0 in the schema), so it needs real
-    values. Only CPU lists / tensors are read: ``.max()`` on a device tensor is
-    a D2H sync, which is illegal under graph capture — callers that only hold a
-    device tensor get 0 and the op's own default behaviour.
-    """
-    if lens is None:
-        return 0
-    if isinstance(lens, torch.Tensor):
-        if lens.device.type != "cpu" or lens.numel() == 0:
-            return 0
-        return int(lens.max())
-    return max(lens, default=0)
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -1536,8 +1507,6 @@ class DeepseekV4AscendAttnBackend(
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
             block_tables=fm.block_tables,
             max_seqlen_q=ctx.tokens_per_bs,
-            # Graph buffers are padded past bs; slice like the SWA page table does.
-            max_seqlen_kv=_host_max_len(ctx.seq_lens_cpu[: ctx.bs]),
             is_nextn=False,
         )
         for key in (
@@ -1662,20 +1631,14 @@ class DeepseekV4AscendAttnBackend(
             from sglang.srt.runtime_context import get_server_args
 
             max_seqlen_q = get_server_args().speculative_num_draft_tokens or 1
-        elif forward_batch.forward_mode.is_extend():
-            # Prefill query length is the per-request extend length, not 1 — the
-            # same host tensor that builds actual_seq_lengths_q_pa above.
-            max_seqlen_q = _host_max_len(forward_batch.extend_seq_lens_cpu)
         else:
             max_seqlen_q = 1
-        # seq_lens_cpu_int is unpadded on the eager path, so no bs slice here.
         return self._kernel_metadata_from_parts(
             bs=forward_batch.batch_size,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
             block_tables=fm.block_tables,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=_host_max_len(fm.seq_lens_cpu_int),
             is_nextn=False,
         )
 
@@ -1687,20 +1650,13 @@ class DeepseekV4AscendAttnBackend(
         actual_seq_lengths_kv: torch.Tensor,
         block_tables: torch.Tensor,
         max_seqlen_q: int,
-        max_seqlen_kv: int,
         is_nextn: bool,
     ) -> dict:
         metadata_op, _ = _sparse_attn_ops()
         common = {
-            **_sparse_attn_kv_quant_kwargs(metadata=True),
+            **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
-            # Both default to 0 in the op schema, which leaves it planning for an
-            # empty batch; vllm-ascend always passes real lengths. The c4 / c128
-            # variants below reuse the same uncompressed max_seqlen_kv — cmp_ratio
-            # is what tells the kernel to derive the compressed extent.
-            "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_kv": max_seqlen_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,
             "cmp_mask_mode": 3,
