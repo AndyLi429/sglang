@@ -626,11 +626,6 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
-    # Run the MXFP routed-expert gmm1 epilogue (clamp + SwiGLU + activation
-    # requant) as one fused npu_swiglu_group_quant kernel instead of four
-    # separate ops. Atlas A5 + FP8-activation experts only; off until the
-    # fused path has been accuracy-checked against the unfused chain.
-    SGLANG_NPU_USE_FUSED_SWIGLU_QUANT = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
