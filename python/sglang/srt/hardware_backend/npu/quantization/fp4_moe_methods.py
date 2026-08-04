@@ -237,6 +237,58 @@ def _apply_swiglu_limit_npu(
     up.clamp_(min=-swiglu_limit, max=swiglu_limit)
 
 
+def _swiglu_group_quant_op():
+    """Resolve ``npu_swiglu_group_quant``.
+
+    It ships in the external Ascend custom-op package, which registers under
+    ``torch.ops.custom`` in some CANN builds and ``torch.ops.npu`` in others, so
+    the namespace is a property of the deployed package rather than of this
+    code — hence the probe rather than a direct attribute access. Raises when
+    the op is absent instead of falling back to the unfused chain: that would
+    turn a packaging problem into an unexplained perf regression.
+    """
+    for namespace in (torch.ops.custom, torch.ops.npu):
+        op = getattr(namespace, "npu_swiglu_group_quant", None)
+        if op is not None:
+            return op
+    raise RuntimeError(
+        "npu_swiglu_group_quant is registered under neither torch.ops.custom "
+        "nor torch.ops.npu. The MXFP routed-expert path needs it for the gmm1 "
+        "epilogue — upgrade the Ascend custom-op package."
+    )
+
+
+def _swiglu_act_quant_npu(
+    gate_up: torch.Tensor, swiglu_limit: Optional[float]
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """gmm1 epilogue: clamp -> SwiGLU -> activation requant, in one kernel.
+
+    Mirrors vllm-ascend's W4A8MXFP branch, which runs plain ``npu_grouped_matmul``
+    for gmm1 and then this op — not the ``npu_grouped_matmul_swiglu_quant_v2``
+    fusion, which belongs to the non-MXFP schemes.
+
+    Returns ``(activations, act_scale)``. The FP4-activation parameterization
+    keeps the unfused chain and returns ``act_scale=None``, leaving gmm2 to
+    quantize its own input: this op emits e4m3, which is what ``_w4a8_mxfp_gmm``
+    consumes but not what ``_w4a4_mxfp_gmm`` wants.
+    """
+    if not ROUTED_EXPERTS_FP8_ACTIVATION:
+        _apply_swiglu_limit_npu(gate_up, swiglu_limit)
+        return torch.ops.npu.npu_swiglu(gate_up), None
+
+    # clamp_value=0 disables the clamp inside the kernel, matching
+    # _apply_swiglu_limit_npu's no-op for an unset or non-positive limit.
+    act, act_scale, _ = _swiglu_group_quant_op()(
+        gate_up,
+        topk_weight=None,
+        group_index=None,
+        dst_type=torch.float8_e4m3fn,
+        quant_mode=2,
+        clamp_value=swiglu_limit if swiglu_limit and swiglu_limit > 0 else 0.0,
+    )
+    return act, act_scale
+
+
 def npu_fused_experts_w4a4_mxfp(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -305,11 +357,10 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, act_scale = _swiglu_act_quant_npu(hidden_states, swiglu_limit)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=act_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=0,
@@ -373,11 +424,10 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, act_scale = _swiglu_act_quant_npu(hidden_states, swiglu_limit)
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=act_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=group_list_type,
@@ -482,11 +532,12 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, act_scale = _swiglu_act_quant_npu(
+        hidden_states, layer.moe_runner_config.swiglu_limit
+    )
     return w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=act_scale,
         weight=layer.w2_weight,
         weight_scale=layer.w2_weight_scale_inv,
         group_list_type=group_list_type,
