@@ -482,11 +482,28 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    if ROUTED_EXPERTS_FP8_ACTIVATION:
+        import vllm_ascend  # noqa: F401
+
+        # Match vLLM-Ascend's W4A8_MXFP path: gmm1 produces BF16 gate/up,
+        # then SwiGLU and the FP8 quantization required by gmm2 share one op.
+        hidden_states, hidden_states_scale, _ = (
+            torch.ops._C_ascend.npu_swiglu_group_quant(
+                hidden_states,
+                topk_weight=None,
+                group_index=None,
+                dst_type=torch.float8_e4m3fn,
+                quant_mode=2,
+                clamp_value=layer.moe_runner_config.swiglu_limit or 0.0,
+            )
+        )
+    else:
+        _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        hidden_states_scale = None
     return w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=layer.w2_weight,
         weight_scale=layer.w2_weight_scale_inv,
         group_list_type=group_list_type,
