@@ -5,6 +5,8 @@ scales. This module wires those weights to the A5 grouped-matmul kernels, both
 for the plain (init-routing) path and for the DeepEP dispatch path.
 """
 
+import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -18,6 +20,8 @@ from sglang.srt.utils import is_npu_before_atlas_a5, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+
+logger = logging.getLogger(__name__)
 
 # MXFP4 group size, fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
@@ -35,6 +39,9 @@ ROUTED_EXPERTS_FP8_ACTIVATION = True
 # The router emits weights normalized for a topk sum the FP4 experts do not
 # reproduce; vllm-ascend applies the same constant before combine.
 _ROUTED_SCALING = 1.5
+
+_SWIGLU_GROUP_QUANT_OP: Callable | None = None
+_SWIGLU_GROUP_QUANT_FALLBACK_WARNED = False
 
 
 class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
@@ -265,11 +272,33 @@ def _swiglu_limit_mx_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the DSV4 SwiGLU limit and quantize its output for GMM2.
 
-    This is deliberately the single hand-off point between GMM1 and GMM2.
-    The current torch_npu Python API has no MXFP8 binding for
-    ``aclnnSwigluGroupQuant``; until sgl-kernel-npu exports that binding, this
-    keeps the equivalent implementation and its scale layout explicit.
+    Prefer the fused ``aclnnSwigluGroupQuant`` binding used by vllm-ascend's
+    W4A8_MXFP path. It preserves the FP8/E8M0 contract expected by GMM2. This
+    is not interchangeable with ``npu_dequant_swiglu_quant``, whose output is
+    INT8 with a floating-point per-token scale.
     """
+    fused_op = _get_swiglu_group_quant_op()
+    if fused_op is not None:
+        clamp_value = (
+            swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else 0.0
+        )
+        outputs = fused_op(
+            gate_up,
+            topk_weight=None,
+            group_index=None,
+            dst_type=torch.float8_e4m3fn,
+            quant_mode=2,
+            clamp_value=clamp_value,
+        )
+        return outputs[0], _pair_pack_mxfp_act_scale(outputs[1])
+
+    global _SWIGLU_GROUP_QUANT_FALLBACK_WARNED
+    if not _SWIGLU_GROUP_QUANT_FALLBACK_WARNED:
+        logger.warning(
+            "npu_swiglu_group_quant is unavailable; DSV4 MoE falls back to "
+            "separate clamp, npu_swiglu, and npu_dynamic_mx_quant operators."
+        )
+        _SWIGLU_GROUP_QUANT_FALLBACK_WARNED = True
     _apply_swiglu_limit_npu(gate_up, swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(gate_up)
     hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_mx_quant(
@@ -280,6 +309,24 @@ def _swiglu_limit_mx_quant(
         block_size=MXFP4_BLOCK_SIZE,
     )
     return hidden_states, _pair_pack_mxfp_act_scale(hidden_states_scale)
+
+
+def _get_swiglu_group_quant_op() -> Callable | None:
+    """Resolve the fused op without introducing a vllm-ascend dependency."""
+    global _SWIGLU_GROUP_QUANT_OP
+    if _SWIGLU_GROUP_QUANT_OP is not None:
+        return _SWIGLU_GROUP_QUANT_OP
+
+    for namespace in ("npu", "_C_ascend"):
+        try:
+            _SWIGLU_GROUP_QUANT_OP = getattr(
+                torch.ops, namespace
+            ).npu_swiglu_group_quant
+            logger.info("Using torch.ops.%s.npu_swiglu_group_quant", namespace)
+            return _SWIGLU_GROUP_QUANT_OP
+        except AttributeError:
+            pass
+    return None
 
 
 def npu_fused_experts_w4a4_mxfp(
