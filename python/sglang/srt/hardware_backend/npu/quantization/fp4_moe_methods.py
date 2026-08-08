@@ -14,7 +14,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float8_e8m0fnu_dtype,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_npu_before_atlas_a5, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -161,8 +161,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+        _set_fp4_dispatcher_output_dtype(layer)
 
     def apply(
         self,
@@ -237,6 +236,52 @@ def _apply_swiglu_limit_npu(
     up.clamp_(min=-swiglu_limit, max=swiglu_limit)
 
 
+def _set_fp4_dispatcher_output_dtype(layer: torch.nn.Module) -> None:
+    """Let the A5 Ascend TP routing kernel produce GMM1's MXFP8 input.
+
+    ``npu_moe_init_routing_v2(quant_mode=3)`` emits both e4m3 activations and
+    their E8M0 block scales, so GMM1 can consume them without a second
+    ``npu_dynamic_mx_quant``. DeepEP keeps BF16 because its dispatcher does
+    not transport MXFP8 scales.
+    """
+    if not hasattr(layer, "dispatcher"):
+        return
+
+    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
+
+    dispatcher_output_dtype = "bf16"
+    if (
+        isinstance(layer.dispatcher, AscendTPDispatcher)
+        and not is_npu_before_atlas_a5()
+    ):
+        dispatcher_output_dtype = "mxfp8"
+    layer.dispatcher.set_quant_config(
+        {"dispatcher_output_dtype": dispatcher_output_dtype}
+    )
+
+
+def _swiglu_limit_mx_quant(
+    gate_up: torch.Tensor, swiglu_limit: Optional[float]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the DSV4 SwiGLU limit and quantize its output for GMM2.
+
+    This is deliberately the single hand-off point between GMM1 and GMM2.
+    The current torch_npu Python API has no MXFP8 binding for
+    ``aclnnSwigluGroupQuant``; until sgl-kernel-npu exports that binding, this
+    keeps the equivalent implementation and its scale layout explicit.
+    """
+    _apply_swiglu_limit_npu(gate_up, swiglu_limit)
+    hidden_states = torch.ops.npu.npu_swiglu(gate_up)
+    hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        hidden_states,
+        axis=1,
+        round_mode="rint",
+        dst_type=torch.float8_e4m3fn,
+        block_size=MXFP4_BLOCK_SIZE,
+    )
+    return hidden_states, _pair_pack_mxfp_act_scale(hidden_states_scale)
+
+
 def npu_fused_experts_w4a4_mxfp(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -305,11 +350,12 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, hidden_states_scale = _swiglu_limit_mx_quant(
+        hidden_states, swiglu_limit
+    )
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=0,
@@ -373,11 +419,12 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, hidden_states_scale = _swiglu_limit_mx_quant(
+        hidden_states, swiglu_limit
+    )
     hidden_states = w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=group_list_type,
@@ -482,11 +529,12 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, hidden_states_scale = _swiglu_limit_mx_quant(
+        hidden_states, layer.moe_runner_config.swiglu_limit
+    )
     return w4a4_mxfp_gmm_npu(
         input=hidden_states,
-        input_scale=None,
+        input_scale=hidden_states_scale,
         weight=layer.w2_weight,
         weight_scale=layer.w2_weight_scale_inv,
         group_list_type=group_list_type,
