@@ -1643,9 +1643,7 @@ class DeepseekV4AscendAttnBackend(
                 **c1a_kwargs,
             )
         else:
-            c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c1a_kwargs,
-            )
+            c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
@@ -1729,12 +1727,8 @@ class DeepseekV4AscendAttnBackend(
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
         _, attn_op = _sparse_attn_ops()
-        # cmp_ratio is implicit for the pre-A5 op but required by the kv-quant one.
-        a5_kwargs = _sparse_attn_kv_quant_kwargs()
-        if a5_kwargs:
-            a5_kwargs["cmp_ratio"] = 1
         attn_kwargs = dict(
-            **a5_kwargs,
+            **_sparse_attn_kv_quant_kwargs(),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1761,7 +1755,7 @@ class DeepseekV4AscendAttnBackend(
         if self._is_dspark_draft_worker:
             out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         else:
-            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+            out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(

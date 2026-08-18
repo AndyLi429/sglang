@@ -57,10 +57,10 @@ sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     CompressorAscendBackendMixin,
+    DeepseekV4AscendAttnBackend,
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _get_kv_indices,
-    _overlap_transform,
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
@@ -216,76 +216,101 @@ class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
         self.assertEqual(kwargs, {})
 
 
-class TestOverlapTransform(unittest.TestCase):
-    def test_shape(self):
-        # (n_chunks, ratio, 2*d) -> (n_chunks, 2*ratio, d)
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertEqual(out.shape, (n_chunks, 2 * r, d))
+class TestAtlasA5SparseAttentionRouting(unittest.TestCase):
+    _OPS_PATCH_TARGET = (
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+        "_sparse_attn_ops"
+    )
+    _KWARGS_PATCH_TARGET = (
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+        "_sparse_attn_kv_quant_kwargs"
+    )
 
-    def test_first_chunk_left_half_filled_with_value(self):
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        fill = float("-inf")
-        out = _overlap_transform(tensor, value=fill, head_dim=d)
-        self.assertTrue(torch.equal(out[0, :r], torch.full((r, d), fill)))
-
-    def test_first_chunk_left_half_filled_with_zero(self):
-        n_chunks, r, d = 2, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertTrue(torch.equal(out[0, :r], torch.zeros(r, d)))
-
-    def test_right_half_mirrors_tensor_second_half(self):
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertTrue(torch.equal(out[:, r:], tensor[..., d:]))
-
-    def test_previous_chunk_left_half(self):
-        n_chunks, r, d = 3, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertTrue(torch.equal(out[1:, :r], tensor[:-1, :, :d]))
-
-    def test_single_chunk(self):
-        n_chunks, r, d = 1, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d)
-        fill = 7.0
-        out = _overlap_transform(tensor, value=fill, head_dim=d)
-        self.assertEqual(out.shape, (1, 2 * r, d))
-        self.assertTrue(torch.equal(out[0, :r], torch.full((r, d), fill)))
-        self.assertTrue(torch.equal(out[0, r:], tensor[0, :, d:]))
-
-    def test_full_element_mapping(self):
-        n_chunks, r, d = 2, 2, 3
-        tensor = torch.arange(n_chunks * r * 2 * d, dtype=torch.float32).reshape(
-            n_chunks, r, 2 * d
+    @staticmethod
+    def _metadata_backend():
+        return SimpleNamespace(
+            forward_metadata=SimpleNamespace(ori_win_left=127, ori_win_right=0),
+            _dsv4_sliding_window_size=128,
+            _dsv4_q_head_num=8,
+            _dsv4_kv_head_num=1,
+            _dsv4_head_dim=192,
+            _is_dspark_draft_worker=False,
+            _dsv4_has_c4=False,
+            _dsv4_has_c128=False,
         )
-        fill = -1.0
-        out = _overlap_transform(tensor, value=fill, head_dim=d)
 
-        for c in range(n_chunks):
-            for row in range(2 * r):
-                for col in range(d):
-                    if c == 0 and row < r:
-                        expected = fill
-                    elif row >= r:
-                        expected = tensor[c, row - r, d + col].item()
-                    else:
-                        expected = tensor[c - 1, row, col].item()
-                    self.assertEqual(
-                        out[c, row, col].item(),
-                        expected,
-                        f"mismatch at (c={c}, row={row}, col={col})",
-                    )
+    @staticmethod
+    def _swa_backend():
+        return SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                actual_seq_lengths_q_pa=torch.tensor([0, 1], dtype=torch.int32),
+                actual_seq_lengths_kv=torch.tensor([1], dtype=torch.int32),
+                swa_page_table=torch.zeros((1, 1), dtype=torch.int32),
+                kernel_metadata={"c1a_metadata": object()},
+                ori_sparse_indices=None,
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                get_swa_buffer=MagicMock(return_value=torch.zeros((1, 1, 192)))
+            ),
+            _dsv4_sliding_window_size=128,
+            _is_dspark_draft_worker=False,
+        )
 
-    def test_preserves_input_dtype(self):
-        n_chunks, r, d = 2, 2, 4
-        tensor = torch.randn(n_chunks, r, 2 * d, dtype=torch.bfloat16)
-        out = _overlap_transform(tensor, value=0.0, head_dim=d)
-        self.assertEqual(out.dtype, torch.bfloat16)
+    @patch(_KWARGS_PATCH_TARGET, return_value={"kv_quant_mode": 1})
+    @patch(_OPS_PATCH_TARGET)
+    def test_a5_c1_metadata_uses_selected_metadata_op(self, mock_ops, _):
+        selected_metadata_op = MagicMock(return_value="a5-metadata")
+        mock_ops.return_value = (selected_metadata_op, MagicMock())
+
+        with patch("torch.ops.custom", MagicMock(), create=True):
+            result = DeepseekV4AscendAttnBackend._kernel_metadata_from_parts(
+                self._metadata_backend(),
+                bs=1,
+                actual_seq_lengths_q_pa=torch.tensor([0, 1], dtype=torch.int32),
+                actual_seq_lengths_kv=torch.tensor([1], dtype=torch.int32),
+                block_tables=torch.zeros((1, 1), dtype=torch.int32),
+                max_seqlen_q=1,
+                is_nextn=False,
+            )
+
+        self.assertEqual(result["c1a_metadata"], "a5-metadata")
+
+    @patch(_KWARGS_PATCH_TARGET, return_value={})
+    @patch(_OPS_PATCH_TARGET)
+    def test_a5_swa_uses_selected_attention_op(self, mock_ops, _):
+        selected_attention_op = MagicMock(return_value=("a5-output", None))
+        mock_ops.return_value = (MagicMock(), selected_attention_op)
+
+        with patch("torch.ops.custom", MagicMock(), create=True):
+            result = DeepseekV4AscendAttnBackend._forward_swa(
+                self._swa_backend(),
+                q=torch.zeros((1, 8, 192)),
+                layer=SimpleNamespace(layer_id=0, scaling=1.0),
+                forward_batch=SimpleNamespace(),
+                attn_sink=None,
+            )
+
+        self.assertEqual(result, "a5-output")
+
+    @patch(
+        _KWARGS_PATCH_TARGET,
+        return_value={"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
+    )
+    @patch(_OPS_PATCH_TARGET)
+    def test_a5_swa_passes_cmp_ratio_once(self, mock_ops, _):
+        selected_attention_op = MagicMock(return_value=("a5-output", None))
+        mock_ops.return_value = (MagicMock(), selected_attention_op)
+
+        result = DeepseekV4AscendAttnBackend._forward_swa(
+            self._swa_backend(),
+            q=torch.zeros((1, 8, 192)),
+            layer=SimpleNamespace(layer_id=0, scaling=1.0),
+            forward_batch=SimpleNamespace(),
+            attn_sink=None,
+        )
+
+        self.assertEqual(result, "a5-output")
+        self.assertEqual(selected_attention_op.call_args.kwargs["cmp_ratio"], 1)
 
 
 class TestGetKvIndices(unittest.TestCase):
