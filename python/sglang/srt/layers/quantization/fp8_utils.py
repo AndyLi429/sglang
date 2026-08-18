@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -24,6 +25,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
+    get_w8a8_channelwise_fp8_config,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -746,7 +748,7 @@ def _dispatch_auto_backend() -> Callable:
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. NPU (Ascend)
+    # 5. NPU (Atlas A5)
     # 6. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -758,10 +760,6 @@ def _dispatch_auto_backend() -> Callable:
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
     elif _is_npu and has_npu_a5_support():
-        # A5 only: the NPU implementation is an MXFP8 GEMM, which earlier parts
-        # do not have — they keep the Triton fallback below.
-        # Imported here, not at module scope: the NPU module is only importable
-        # once torch_npu has registered torch.ops.npu.
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             npu_w8a8_block_fp8_linear,
         )
@@ -1802,6 +1800,12 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
+    # Consider a tuned Triton tile only where the shape would otherwise go to
+    # CUTLASS (that is the path the offline sweep tuned against). On by default;
+    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
+    use_tuned_triton_channelwise = (
+        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         _is_sm90_supported or _is_sm100_supported or _is_sm120_supported
     )
@@ -1880,11 +1884,37 @@ def apply_fp8_linear(
                     )
 
     if channelwise_cutlass:
+        # A tuned config exists only for shapes where tuned Triton beat the
+        # CUTLASS dispatch on this GPU; otherwise this is None and the backend
+        # choice below is unchanged. weight is [K, N] here.
+        tuned_config = (
+            get_w8a8_channelwise_fp8_config(
+                N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
+            )
+            if use_tuned_triton_channelwise
+            else None
+        )
         if not use_cutlass_channelwise_gemm:
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
                 qinput, weight, x_scale, weight_scale, output_dtype, bias
+            )
+        elif tuned_config is not None:
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                output_dtype,
+                bias,
+                block_size_m=tuned_config["BLOCK_SIZE_M"],
+                block_size_n=tuned_config["BLOCK_SIZE_N"],
+                block_size_k=tuned_config["BLOCK_SIZE_K"],
+                use_heuristic=False,
+                num_warps=tuned_config["num_warps"],
+                num_stages=tuned_config["num_stages"],
             )
         else:
             output = fp8_scaled_mm(
