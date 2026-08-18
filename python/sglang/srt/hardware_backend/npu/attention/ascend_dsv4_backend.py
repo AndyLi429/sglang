@@ -18,11 +18,9 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
-from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -100,6 +98,16 @@ def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.T
     return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
 
 
+def _overlap_transform(
+    tensor: torch.Tensor, value: float, head_dim: int
+) -> torch.Tensor:
+    n_chunks, ratio, _ = tensor.shape
+    out = tensor.new_full((n_chunks, 2 * ratio, head_dim), value)
+    out[:, ratio:] = tensor[..., head_dim:]
+    out[1:, :ratio] = tensor[:-1, :, :head_dim]
+    return out
+
+
 def _build_explicit_state_block_table(
     *,
     compress_ratio: int,
@@ -148,7 +156,9 @@ class CompressorAscendBackendMixin:
         if values is None:
             return None
         if isinstance(values, torch.Tensor):
-            values = values.cpu().tolist()
+            if values.device.type != "cpu":
+                raise RuntimeError("expected CPU metadata, got a device tensor")
+            values = values.tolist()
         return [int(v) for v in values]
 
     def _extend_prefix_lens_cpu(
@@ -179,9 +189,19 @@ class CompressorAscendBackendMixin:
         fm.dsv4_max_input_capacity = 1 if is_decode else None
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens_cpu = self._to_cpu_int_list(
+            getattr(forward_batch, "seq_lens_cpu", None)
+        )
+        seq_lens_max_override = (
+            max(seq_lens_cpu[: forward_batch.batch_size], default=0)
+            if seq_lens_cpu is not None
+            else None
+        )
         if _verify_compress:
             n_draft = int(forward_batch.spec_info.draft_token_num)
             _seq_lens = _seq_lens + n_draft
+            if seq_lens_max_override is not None:
+                seq_lens_max_override += n_draft
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -193,6 +213,7 @@ class CompressorAscendBackendMixin:
             device=forward_batch.seq_lens.device,
             req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            seq_lens_max_override=seq_lens_max_override,
         )
         for k, v in result.items():
             setattr(fm, k, v)
@@ -204,8 +225,7 @@ class CompressorAscendBackendMixin:
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
             # seqused only for decode. Every eager prefill uses the fused compressor,
             # so build its global block positions, state metadata, and output locs
-            # here. Exclude speculative modes so the cu.cpu() host read never
-            # runs for target_verify / draft_extend (potentially graph-captured).
+            # here. Exclude speculative modes, which use separate metadata paths.
             if forward_batch.forward_mode.is_extend_without_speculative():
                 self._build_npu_compress_metadata_prefill(forward_batch)
 
@@ -213,7 +233,7 @@ class CompressorAscendBackendMixin:
             self._build_npu_compress_metadata_verify(forward_batch)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
-        # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
+        # Eager-only: build host offsets from the existing scheduler CPU mirror.
         fm = self.forward_metadata
         device = forward_batch.seq_lens.device
         positions = forward_batch.positions
@@ -221,7 +241,14 @@ class CompressorAscendBackendMixin:
         bs = forward_batch.batch_size
         cu = fm.actual_seq_lengths_q_pa
 
-        cu_cpu = cu.cpu().tolist()
+        extend_lens_cpu = self._to_cpu_int_list(
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+        )
+        if extend_lens_cpu is None or len(extend_lens_cpu) < bs:
+            raise RuntimeError("DSV4 NPU prefill metadata requires extend_seq_lens_cpu")
+        cu_cpu = [0]
+        for extend_len in extend_lens_cpu[:bs]:
+            cu_cpu.append(cu_cpu[-1] + extend_len)
         fm.dsv4_max_input_capacity = max(
             1,
             max(
@@ -321,10 +348,9 @@ class CompressorAscendBackendMixin:
         req_pool = req_pool_indices
         req_pool_64 = req_pool.to(torch.int64)
 
-        if seq_lens_max_override is not None:
-            seq_lens_max = int(seq_lens_max_override)
-        else:
-            seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
+        if seq_lens_max_override is None:
+            raise RuntimeError("DSV4 NPU metadata requires a CPU sequence-length max")
+        seq_lens_max = int(seq_lens_max_override)
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
