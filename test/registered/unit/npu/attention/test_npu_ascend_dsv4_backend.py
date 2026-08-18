@@ -490,6 +490,74 @@ class TestCommonTemplate(unittest.TestCase):
         self.assertEqual(call_fn.call_count, 1)
 
 
+class TestCompressorMetadataHostPath(unittest.TestCase):
+    @staticmethod
+    def _backend():
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.forward_metadata = SimpleNamespace()
+        backend.token_to_kv_pool = object()
+        backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
+        backend.req_to_token_pool = object()
+        backend._dsv4_compress_ratios = ()
+        backend._dsv4_unique_compress_ratios = (4,)
+        return backend
+
+    def test_build_metadata_passes_max_from_cpu_mirror(self):
+        backend = self._backend()
+        backend._compute_compress_locs = MagicMock(return_value={})
+        forward_mode = MagicMock()
+        forward_mode.is_decode.return_value = True
+        forward_mode.is_target_verify.return_value = False
+        batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            seq_lens=torch.tensor([5, 9]),
+            seq_lens_cpu=torch.tensor([5, 9]),
+            req_pool_indices=torch.tensor([0, 1]),
+            out_cache_loc=torch.tensor([0, 1]),
+            out_cache_loc_dsv4=None,
+            batch_size=2,
+        )
+
+        backend._build_npu_compress_metadata(batch)
+
+        self.assertEqual(
+            backend._compute_compress_locs.call_args.kwargs["seq_lens_max_override"],
+            9,
+        )
+
+    def test_prefill_uses_extend_lengths_without_reading_device_cu(self):
+        class NoHostReadCu:
+            def __init__(self, values):
+                self.values = values
+
+            def cpu(self):
+                raise AssertionError("metadata path attempted a device-to-host read")
+
+            def __getitem__(self, key):
+                return self.values[key]
+
+        backend = self._backend()
+        backend.forward_metadata.actual_seq_lengths_q_pa = NoHostReadCu(
+            torch.tensor([0, 3, 5], dtype=torch.int32)
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([4, 5]),
+            positions=torch.arange(5),
+            batch_size=2,
+            extend_seq_lens_cpu=[3, 2],
+            extend_prefix_lens_cpu=[1, 3],
+            extend_prefix_lens=None,
+            out_cache_loc_dsv4=SimpleNamespace(
+                out_c4_loc=torch.tensor([7, 8]), out_c128_loc=None
+            ),
+        )
+
+        backend._build_npu_compress_metadata_prefill(batch)
+
+        self.assertEqual(backend.forward_metadata.dsv4_max_input_capacity, 3)
+        self.assertEqual(backend.forward_metadata.seqused.tolist(), [3, 2])
+
+
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):
     """A verify step that completes no compression block must write nothing.
 
