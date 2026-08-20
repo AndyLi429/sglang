@@ -234,18 +234,19 @@ class TestCompressorStateTableABI(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5",
         return_value=True,
     )
-    def test_a5_graph_replay_updates_cycle_table_in_place(self, _):
+    def test_a5_graph_replay_slices_static_req_pool_buffer_to_graph_bs(self, _):
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        table = torch.zeros(2, dtype=torch.int32)
+        table = torch.zeros(1, dtype=torch.int32)
         graph_mode = MagicMock()
         graph_mode.is_decode.return_value = False
         graph_mode.is_target_verify.return_value = False
         ctx = SimpleNamespace(
             fm=SimpleNamespace(dsv4_cycle_state_block_table=table),
             forward_batch=SimpleNamespace(
-                req_pool_indices=torch.tensor([7, 3], dtype=torch.int64)
+                req_pool_indices=torch.arange(7, 19, dtype=torch.int64)
             ),
             graph_mode=graph_mode,
+            bs=1,
         )
         backend._build_dsv4_graph_replay_ctx = MagicMock(return_value=ctx)
         for name in (
@@ -260,8 +261,8 @@ class TestCompressorStateTableABI(unittest.TestCase):
 
         backend._apply_dsv4_graph_metadata(SimpleNamespace())
 
-        self.assertIs(backend.forward_metadata.dsv4_cycle_state_block_table, table)
-        self.assertEqual(table.tolist(), [7, 3])
+        self.assertIs(ctx.fm.dsv4_cycle_state_block_table, table)
+        self.assertEqual(table.tolist(), [7])
 
     @patch(
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_atlas_a5",
