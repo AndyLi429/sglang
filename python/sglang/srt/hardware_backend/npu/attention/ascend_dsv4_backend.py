@@ -145,6 +145,54 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
     return req_pool_indices.to(dtype=torch.int32).contiguous()
 
 
+def _build_continuous_state_block_table(
+    *,
+    state_pool,
+    token_to_kv_pool,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    width: Optional[int] = None,
+) -> torch.Tensor:
+    """Build the Atlas A5 cache_mode=1 C4 state page table.
+
+    C4 state pages share SWA-page ownership.  This is required for Radix prefix
+    reuse: a matched SWA page keeps the corresponding compressor state alive,
+    while a request-bank (cycle) table would point a new request at unrelated
+    state.
+    """
+    block_size = state_pool.page_size
+    if block_size != state_pool.ring_size:
+        raise ValueError(
+            "A5 continuous C4 state requires page_size == ring_size, got "
+            f"page_size={block_size}, ring_size={state_pool.ring_size}."
+        )
+
+    req_pool_indices = req_pool_indices.to(torch.int64)
+    seq_lens = seq_lens.to(device=req_to_token.device, dtype=torch.int64)
+    if width is None:
+        max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() else 0
+        width = max(1, (max_seq_len + block_size - 1) // block_size)
+    elif width <= 0:
+        raise ValueError(
+            f"A5 continuous C4 state table width must be positive, got {width}."
+        )
+
+    positions = torch.arange(width, dtype=torch.int64, device=req_to_token.device)
+    positions = positions * block_size
+    valid = positions[None, :] < seq_lens[:, None]
+    safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
+    full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
+    swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
+    state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
+    state_pages = state_locs // block_size
+
+    # Page 0 is the allocator's invalid/reserved page. The kernel does not write
+    # continuous state for table entries equal to zero.
+    valid = valid & (swa_locs >= 0)
+    return torch.where(valid, state_pages, 0).to(torch.int32).contiguous()
+
+
 class CompressorAscendBackendMixin:
 
     @staticmethod
@@ -191,6 +239,15 @@ class CompressorAscendBackendMixin:
         if _verify_compress:
             n_draft = int(forward_batch.spec_info.draft_token_num)
             _seq_lens = _seq_lens + n_draft
+        fm.dsv4_c4_state_block_table = None
+        if _is_atlas_a5() and 4 in self._dsv4_compress_ratios:
+            fm.dsv4_c4_state_block_table = _build_continuous_state_block_table(
+                state_pool=self._dsv4_state_pools_by_ratio[4],
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=_seq_lens,
+            )
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -239,6 +296,20 @@ class CompressorAscendBackendMixin:
             ),
         )
         prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
+        if (
+            _is_atlas_a5()
+            and 4 in self._dsv4_unique_compress_ratios
+            and prefix_cpu is not None
+            and any(prefix > 0 for prefix in prefix_cpu)
+            and not getattr(self, "_dsv4_logged_c4_radix_resume", False)
+        ):
+            logger.info(
+                "DSV4 A5 C4 Radix resume uses SWA-owned continuous state: "
+                "prefix_lens=%s state_table_shape=%s",
+                prefix_cpu,
+                tuple(fm.dsv4_c4_state_block_table.shape),
+            )
+            self._dsv4_logged_c4_radix_resume = True
         ratio_lists: dict = {
             r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
         }
@@ -427,11 +498,16 @@ class CompressorAscendBackendMixin:
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
         if _is_atlas_a5():
-            # A5 cache_mode=2 is CYCLE: one request bank per row.  The
-            # compressor derives the in-bank offset from start_pos; passing
-            # the A3 explicit [B, width] table here would be an ABI violation.
-            state_block_table = fm.dsv4_cycle_state_block_table
-            cache_mode = 2
+            if ratio == 4:
+                # C4 state follows SWA-page ownership so Radix prefix matches
+                # retain the exact overlap history needed by the first block.
+                state_block_table = fm.dsv4_c4_state_block_table
+                cache_mode = 1
+            else:
+                # C128 has no overlap and Radix matches are constrained by the
+                # C128 sidecar to complete groups, so a request cycle bank is safe.
+                state_block_table = fm.dsv4_cycle_state_block_table
+                cache_mode = 2
         else:
             table_cache = fm.dsv4_explicit_state_block_tables
             if ratio not in table_cache:
@@ -916,6 +992,12 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+        self._dsv4_logged_c4_radix_resume = False
+        if _is_atlas_a5() and getattr(self, "_dsv4_has_c4", False):
+            logger.info(
+                "DSV4 A5 compressor state modes: C4=continuous/SWA-owned, "
+                "C128=cycle/request-owned."
+            )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1017,6 +1099,16 @@ class DeepseekV4AscendAttnBackend(
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
+        if _is_atlas_a5() and getattr(self, "_dsv4_has_c4", False):
+            c4_state_pool = self._dsv4_state_pools_by_ratio[4]
+            state_blocks = max(
+                1,
+                (self.req_to_token.shape[1] + c4_state_pool.page_size - 1)
+                // c4_state_pool.page_size,
+            )
+            self.graph_metadata["dsv4_c4_state_block_table"] = torch.zeros(
+                (max_bs, state_blocks), dtype=torch.int32, device=device
+            )
 
         # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
         for key in (
@@ -1104,6 +1196,11 @@ class DeepseekV4AscendAttnBackend(
         metadata.dsv4_cycle_state_block_table = (
             torch.zeros(bs, dtype=torch.int32, device=device)
             if _is_atlas_a5()
+            else None
+        )
+        metadata.dsv4_c4_state_block_table = (
+            self.graph_metadata["dsv4_c4_state_block_table"][:bs, :]
+            if _is_atlas_a5() and getattr(self, "_dsv4_has_c4", False)
             else None
         )
         metadata.dsv4_explicit_state_block_tables = {
@@ -1400,6 +1497,21 @@ class DeepseekV4AscendAttnBackend(
                 )
             )
 
+    def _refresh_graph_c4_state_block_table(self, ctx) -> None:
+        table = getattr(ctx.fm, "dsv4_c4_state_block_table", None)
+        if table is None:
+            return
+        table.copy_(
+            _build_continuous_state_block_table(
+                state_pool=self._dsv4_state_pools_by_ratio[4],
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+                seq_lens=ctx.compress_seq_lens,
+                width=table.shape[1],
+            )
+        )
+
     def _refresh_graph_swa_metadata_direct(self, ctx) -> None:
         fm = ctx.fm
         swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -1488,6 +1600,7 @@ class DeepseekV4AscendAttnBackend(
 
         self._refresh_graph_seq_metadata(ctx)
         self._refresh_graph_compress_page_tables_direct(ctx)
+        self._refresh_graph_c4_state_block_table(ctx)
 
         if ctx.graph_mode.is_decode():
             self._refresh_graph_decode_compress_1d_direct(ctx)

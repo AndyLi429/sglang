@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.utils.common import (
     get_bool_env_var,
     use_intel_amx_backend,
 )
+from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -130,8 +131,18 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = force_marlin or auto_enable
 
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.npu_block_fp8_kernel = None
+        self.w8a8_block_fp8_linear = None
+        if self.block_quant and _is_npu and has_npu_a5_support():
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                NPUW8A8BlockFP8LinearMethod,
+            )
 
-        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            self.npu_block_fp8_kernel = NPUW8A8BlockFP8LinearMethod(
+                self.quant_config.weight_block_size
+            )
+        else:
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(
         self,
@@ -244,6 +255,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
+            if getattr(self, "npu_block_fp8_kernel", None) is not None:
+                self.npu_block_fp8_kernel.process_weights_after_loading(layer)
+                return
+
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 # activation_scheme: dynamic
@@ -407,6 +422,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if getattr(self, "npu_block_fp8_kernel", None) is not None:
+                npu_input = x[0] if isinstance(x, tuple) else x
+                return self.npu_block_fp8_kernel.apply(layer, npu_input, bias)
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,

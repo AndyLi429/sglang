@@ -9,6 +9,7 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 from torch.nn import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -28,11 +29,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -51,8 +53,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         self.strategy = self.weight_quant.strategy
         self.is_static_input_scheme = is_static_input_scheme
         self.weight_block_size = self.weight_quant.block_structure
+        self.npu_block_fp8_kernel = None
         if self.weight_block_size is not None:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            if _is_npu and has_npu_a5_support():
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUW8A8BlockFP8LinearMethod,
+                )
+
+                self.npu_block_fp8_kernel = NPUW8A8BlockFP8LinearMethod(
+                    self.weight_block_size, weight_scale_name="weight_scale"
+                )
+            else:
+                self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -190,7 +202,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
-            if is_fp8_fnuz():
+            npu_kernel = getattr(self, "npu_block_fp8_kernel", None)
+            if npu_kernel is not None:
+                npu_kernel.process_weights_after_loading(layer)
+            elif is_fp8_fnuz():
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.weight, weight_scale=layer.weight_scale
                 )
@@ -201,20 +216,21 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 layer.weight.requires_grad_(False)
                 layer.weight_scale.requires_grad_(False)
 
-            # On Blackwell, block-FP8 dispatches to DeepGEMM, which needs the
-            # weight scales UE8M0-packed to match its UE8M0 activation scales.
-            use_deepgemm_runner = (
-                self.w8a8_block_fp8_linear
-                is deepgemm_w8a8_block_fp8_linear_with_fallback
-            )
-            requant_block_scale_ue8m0_for_deepgemm(
-                layer.weight,
-                layer.weight_scale,
-                self.weight_block_size,
-                use_deepgemm_runner=use_deepgemm_runner,
-                output_dtype=getattr(layer, "orig_dtype", None),
-                weight_shape=layer.weight.shape,
-            )
+            if npu_kernel is None:
+                # On Blackwell, block-FP8 dispatches to DeepGEMM, which needs the
+                # weight scales UE8M0-packed to match its UE8M0 activation scales.
+                use_deepgemm_runner = (
+                    self.w8a8_block_fp8_linear
+                    is deepgemm_w8a8_block_fp8_linear_with_fallback
+                )
+                requant_block_scale_ue8m0_for_deepgemm(
+                    layer.weight,
+                    layer.weight_scale,
+                    self.weight_block_size,
+                    use_deepgemm_runner=use_deepgemm_runner,
+                    output_dtype=getattr(layer, "orig_dtype", None),
+                    weight_shape=layer.weight.shape,
+                )
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -231,6 +247,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        npu_kernel = getattr(self, "npu_block_fp8_kernel", None)
+        if npu_kernel is not None:
+            npu_input = x[0] if isinstance(x, tuple) else x
+            return npu_kernel.apply(layer, npu_input, bias)
+
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).

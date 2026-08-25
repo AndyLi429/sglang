@@ -9,8 +9,8 @@ rules as the GPU implementation:
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
 location required by the Atlas fused compressor operators. A3 uses explicit
-locations; A5 uses the same ring storage through its request-bank (cycle) ABI.
-There is no paged state allocator or ``cache_mode=1`` compatibility storage.
+locations. A5 uses SWA-owned continuous pages for C4 so Radix can preserve
+overlap state, and request-bank cycle storage for C128.
 """
 
 from __future__ import annotations
@@ -332,11 +332,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "NPU fused compressor (no online mode in the kernel)."
         )
         ring_size = self.get_ring_size(ratio)
-        # A5 cache_mode=2 addresses one ring bank per request.  The A3
-        # explicit-location path can share the smaller flat pool, but the A5
-        # cycle ABI needs enough physical banks for every req_pool_idx.
+        # A5 C4 uses cache_mode=1 with SWA-owned state pages so Radix prefix
+        # matches retain their overlap history. C128 remains request-cycle mode.
         size = self._state_pool_size(ratio)
-        if _is_atlas_a5():
+        if _is_atlas_a5() and ratio == 128:
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
@@ -357,8 +356,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # slot_dim (indexer_head_dim vs attention head_dim).
         ring_size = self.get_ring_size(ratio)
         size = self.c4_state_pool_size
-        if _is_atlas_a5():
-            size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,

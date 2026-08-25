@@ -12,7 +12,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8_row_padded,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -49,7 +48,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_musa,
-    is_npu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -69,7 +67,6 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
-_is_npu = is_npu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -788,8 +785,7 @@ def _dispatch_auto_backend() -> Callable:
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. NPU (Atlas A5)
-    # 6. Triton (fallback)
+    # 5. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -799,12 +795,6 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif _is_npu and has_npu_a5_support():
-        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            npu_w8a8_block_fp8_linear,
-        )
-
-        return npu_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 

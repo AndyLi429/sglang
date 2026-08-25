@@ -166,6 +166,8 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     MXFP8 matmul (block_size=32).
     """
 
+    weight_scale_name = "weight_scale_inv"
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -245,6 +247,10 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # physically reorders to [in, out] row-major, making the inner-loop stride
         # equal to out and tanking HBM bandwidth.
 
+        self._cache_bias(layer)
+
+    @staticmethod
+    def _cache_bias(layer: torch.nn.Module) -> None:
         # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
         if (
             getattr(layer, "bias", None) is not None
@@ -293,7 +299,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         output = torch.ops.npu.npu_quant_matmul(
             qx,
             layer.weight,
-            layer.weight_scale_inv,
+            getattr(layer, self.weight_scale_name),
             scale_dtype=e8m0_dtype,
             pertoken_scale=input_scale,
             pertoken_scale_dtype=e8m0_dtype,
@@ -307,58 +313,100 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
-def npu_w8a8_block_fp8_linear(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    block_size: List[int],
-    weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Block-FP8 linear on Atlas A5, used as the ``w8a8_block_fp8_linear``
-    backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
+class NPUW8A8BlockFP8LinearMethod(NPUMXFP8LinearMethod):
+    """Atlas A5 block-FP8 weights with dynamic MXFP8 activations."""
 
-    The loading path requantizes block-FP8 weights into the A5 MXFP8 layout;
-    activations are quantized per call. ``block_size`` is retained for the shared
-    block-FP8 backend interface and ``input_scale`` is unused because activation
-    scales are always dynamic here.
-    """
-    if weight.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            f"npu_w8a8_block_fp8_linear expects float8_e4m3fn weights, "
-            f"got {weight.dtype}"
+    def __init__(
+        self,
+        weight_block_size: List[int],
+        weight_scale_name: str = "weight_scale_inv",
+    ) -> None:
+        super().__init__()
+        self.weight_block_size = weight_block_size
+        self.weight_scale_name = weight_scale_name
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Requantize checkpoint block-FP8 weights to the A5 MXFP8 layout."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            block_quant_dequant,
+            ceil_to_ue8m0,
         )
 
-    original_dtype = input.dtype
-    if original_dtype not in (torch.float16, torch.bfloat16):
-        input = input.to(torch.bfloat16)
-        original_dtype = torch.bfloat16
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "NPUW8A8BlockFP8LinearMethod expects float8_e4m3fn weights, "
+                f"got {layer.weight.dtype}"
+            )
 
-    orig_shape = input.shape
-    input_2d = input.reshape(-1, orig_shape[-1]).contiguous()
+        weight_scale = getattr(layer, self.weight_scale_name)
+        weight = block_quant_dequant(
+            layer.weight.data,
+            weight_scale.data,
+            self.weight_block_size,
+            torch.bfloat16,
+        )
+        n_dim, k_dim = weight.shape
+        if k_dim % (2 * MXFP8_BLOCK_SIZE) != 0:
+            raise ValueError(
+                "A5 MXFP8 linear requires K to be divisible by "
+                f"{2 * MXFP8_BLOCK_SIZE}, got {k_dim}."
+            )
 
-    x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-        input_2d, dst_type=torch.float8_e4m3fn
-    )
-    e8m0_dtype = _get_float8_e8m0fnu_dtype()
-    quant_bias = (
-        bias.to(torch.float32)
-        if bias is not None and bias.dtype != torch.float32
-        else bias
-    )
-    output_2d = torch.ops.npu.npu_quant_matmul(
-        x_fp8,
-        weight,
-        scale=weight_scale,
-        scale_dtype=e8m0_dtype,
-        pertoken_scale=x_scale,
-        pertoken_scale_dtype=e8m0_dtype,
-        bias=quant_bias,
-        output_dtype=original_dtype,
-        group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
-    )
+        weight_groups = weight.float().reshape(
+            n_dim, k_dim // MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE
+        )
+        scale = ceil_to_ue8m0(weight_groups.abs().amax(dim=-1, keepdim=True) / 448.0)
+        qweight = (weight_groups / scale).to(torch.float8_e4m3fn).reshape(n_dim, k_dim)
+        scale_u8 = (scale.squeeze(-1).view(torch.int32) >> 23).to(torch.uint8)
 
-    return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+        layer.weight.data = qweight.transpose(0, 1)
+        weight_scale.data = scale_u8.reshape(
+            n_dim, k_dim // (2 * MXFP8_BLOCK_SIZE), 2
+        ).transpose(0, 1)
+        weight_scale.format_ue8m0 = True
+
+        if getattr(layer, "_dsv4_a5_mxfp8_wo_a", False):
+            self._batch_wo_a_weights(layer)
+        self._cache_bias(layer)
+
+    def _batch_wo_a_weights(self, layer: torch.nn.Module) -> None:
+        """Convert DSV4 ``wo_a`` to the grouped batch-matmul layout."""
+        weight_scale = getattr(layer, self.weight_scale_name)
+        num_groups = layer._dsv4_num_groups
+        rank = layer._dsv4_o_lora_rank
+        hidden_dim = layer.weight.shape[0]
+        scale_k64 = weight_scale.shape[0]
+        output_dim = num_groups * rank
+
+        if layer.weight.shape != (hidden_dim, output_dim):
+            raise ValueError(
+                "Unexpected A5 wo_a weight layout after FP8 post-processing: "
+                f"got {tuple(layer.weight.shape)}, expected "
+                f"({hidden_dim}, {output_dim})."
+            )
+        if weight_scale.shape != (scale_k64, output_dim, 2):
+            raise ValueError(
+                "Unexpected A5 wo_a scale layout after FP8 post-processing: "
+                f"got {tuple(weight_scale.shape)}, expected "
+                f"({scale_k64}, {output_dim}, 2)."
+            )
+        if scale_k64 * 64 != hidden_dim:
+            raise ValueError(
+                "Unexpected A5 wo_a scale K dimension: "
+                f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
+            )
+
+        layer.weight.data = (
+            layer.weight.data.T.reshape(num_groups, rank, hidden_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        weight_scale.data = (
+            weight_scale.data.transpose(0, 1)
+            .reshape(num_groups, rank, scale_k64, 2)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
