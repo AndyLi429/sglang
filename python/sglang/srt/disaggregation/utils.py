@@ -1124,6 +1124,18 @@ def setup_state_kv_args(
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
 
+        cycle_ptrs, cycle_lens, cycle_item_lens = (
+            token_to_kv_pool.get_c4_cycle_state_buf_infos()
+        )
+        if cycle_ptrs:
+            append_state_component(
+                kv_args,
+                AscendStateType.DSV4_C4_CYCLE,
+                cycle_ptrs,
+                cycle_lens,
+                cycle_item_lens,
+            )
+
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
         if c128_ptrs:
             append_state_component(

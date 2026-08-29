@@ -24,6 +24,7 @@ class AscendStateType(str, enum.Enum):
     """DSV4-on-NPU PD components without a cross-hardware equivalent."""
 
     DSV4_C128 = "dsv4_c128"
+    DSV4_C4_CYCLE = "dsv4_c4_cycle"
 
 
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
@@ -80,6 +81,12 @@ class AscendKVManager(MooncakeKVManager):
 
             if state_type == AscendStateType.DSV4_C128:
                 dst = dst_kv_ptrs[c128_start:c128_end]
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            if state_type == AscendStateType.DSV4_C4_CYCLE:
+                dst = []
+                for offset in (0, c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             # NPU main KV layout: [C4 KV, index K, index scale].

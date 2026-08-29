@@ -412,8 +412,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        SWA KV, C4 attention state and C4 indexer state retain separate buffers
-        but share the same SWA page/state index.
+        SWA KV and pre-Arch35 C4 state share the SWA page index. Arch35 C4
+        state is request-banked and is exposed separately for PD transfer.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -424,6 +424,29 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
+        if not _is_npu_arch35():
+            for pools in (
+                self.compress_state_pools,
+                self.indexer_compress_state_pools,
+            ):
+                for pool in pools:
+                    if pool is None or pool.ratio != 4:
+                        continue
+                    state = pool.kv_score_buffer.kv_score
+                    data_ptrs.append(state.data_ptr())
+                    data_lens.append(state.nbytes)
+                    item_lens.append(state[0].nbytes * pool.ring_size)
+
+        return data_ptrs, data_lens, item_lens
+
+    def get_c4_cycle_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Arch35 C4 state addressed by one cycle bank per request slot."""
+        if not _is_npu_arch35():
+            return [], [], []
+
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
         for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
             for pool in pools:
                 if pool is None or pool.ratio != 4:

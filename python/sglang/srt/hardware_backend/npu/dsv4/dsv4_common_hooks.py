@@ -71,7 +71,7 @@ def dsv4_state_payloads(
     *,
     prefix_len: int = 0,
 ):
-    """Build the only NPU-specific DSV4 PD payload: C128 KV pages."""
+    """Build NPU-specific DSV4 PD state payloads."""
 
     import numpy as np
 
@@ -94,7 +94,15 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    return {AscendStateType.DSV4_C128: c128_kv_pages}
+    def c4_cycle_state_bank():
+        if seq_len == 0:
+            return np.empty((0,), dtype=np.int32)
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    return {
+        AscendStateType.DSV4_C4_CYCLE: c4_cycle_state_bank,
+        AscendStateType.DSV4_C128: c128_kv_pages,
+    }
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):

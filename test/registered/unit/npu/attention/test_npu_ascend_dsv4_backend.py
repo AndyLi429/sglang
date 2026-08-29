@@ -55,6 +55,7 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
+from sglang.srt.disaggregation.ascend.conn import AscendKVManager, AscendStateType
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -66,6 +67,12 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    dsv4_state_payloads,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+    DSV4NPUTokenToKVPool,
 )
 
 
@@ -83,6 +90,85 @@ class TestC4IndexerInitialization(unittest.TestCase):
         backend._ensure_npu_c4_indexer(indexer, torch.device("cpu"))
 
         self.assertEqual(indexer.compressor.li_kv_dtype, "float8")
+
+
+class TestArch35PDStatePayload(unittest.TestCase):
+    def test_cycle_state_uses_the_local_request_bank(self):
+        prefill = dsv4_state_payloads(
+            SimpleNamespace(), req_pool_idx=7, seq_len=1, page_size=128
+        )
+        decode = dsv4_state_payloads(
+            SimpleNamespace(), req_pool_idx=3, seq_len=1, page_size=128
+        )
+
+        self.assertEqual(prefill[AscendStateType.DSV4_C4_CYCLE]().tolist(), [7])
+        self.assertEqual(decode[AscendStateType.DSV4_C4_CYCLE]().tolist(), [3])
+
+
+class TestArch35PDStateBuffers(unittest.TestCase):
+    @staticmethod
+    def _make_pool():
+        pool = object.__new__(DSV4NPUTokenToKVPool)
+        pool.swa_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.empty((2, 1), dtype=torch.float32)]
+        )
+        state = SimpleNamespace(
+            ratio=4,
+            ring_size=2,
+            kv_score_buffer=SimpleNamespace(
+                kv_score=torch.empty((4, 1), dtype=torch.float32)
+            ),
+        )
+        pool.compress_state_pools = [state]
+        pool.indexer_compress_state_pools = [state]
+        return pool
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_separates_cycle_state_from_swa(self, _):
+        pool = self._make_pool()
+
+        swa_ptrs, _, _ = pool.get_state_buf_infos()
+        cycle_ptrs, _, cycle_item_lens = pool.get_c4_cycle_state_buf_infos()
+
+        self.assertEqual(len(swa_ptrs), 1)
+        self.assertEqual(len(cycle_ptrs), 2)
+        self.assertEqual(cycle_item_lens, [8, 8])
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool._is_npu_arch35",
+        return_value=False,
+    )
+    def test_pre_arch35_keeps_c4_state_in_swa_component(self, _):
+        pool = self._make_pool()
+
+        swa_ptrs, _, _ = pool.get_state_buf_infos()
+        cycle_ptrs, _, _ = pool.get_c4_cycle_state_buf_infos()
+
+        self.assertEqual(len(swa_ptrs), 3)
+        self.assertEqual(cycle_ptrs, [])
+
+
+class TestArch35PDStatePPSlicing(unittest.TestCase):
+    def test_cycle_state_slices_attention_and_indexer_groups(self):
+        manager = AscendKVManager.__new__(AscendKVManager)
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=[4, 128, 4, 4],
+            prefill_start_layer=1,
+            prefill_end_layer=3,
+        )
+
+        src, dst, count = manager.get_mla_kv_ptrs_with_pp(
+            [20, 120],
+            [10, 11, 12, 110, 111, 112],
+            AscendStateType.DSV4_C4_CYCLE,
+        )
+
+        self.assertEqual(src, [20, 120])
+        self.assertEqual(dst, [11, 111])
+        self.assertEqual(count, 2)
 
 
 class TestWalshHadamardMatrix(unittest.TestCase):
