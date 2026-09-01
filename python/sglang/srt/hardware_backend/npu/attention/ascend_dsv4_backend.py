@@ -34,6 +34,32 @@ logger = logging.getLogger(__name__)
 # stored unquantized, so the kernels need both dimensions spelled out.
 _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
+_NPU_ARCH35_EXTERNAL_SPARSE_ATTN_OPS = (
+    "npu_kv_quant_sparse_attn_sharedkv_metadata",
+    "npu_kv_quant_sparse_attn_sharedkv",
+)
+
+
+def _external_arch35_sparse_attn_ops():
+    namespace = getattr(torch.ops, "_C_ascend", None)
+    if namespace is None or not all(
+        hasattr(namespace, op_name) for op_name in _NPU_ARCH35_EXTERNAL_SPARSE_ATTN_OPS
+    ):
+        return None
+    return tuple(
+        getattr(namespace, op_name) for op_name in _NPU_ARCH35_EXTERNAL_SPARSE_ATTN_OPS
+    )
+
+
+def _dspark_draft_arch35_sparse_attn_ops():
+    ops = _external_arch35_sparse_attn_ops()
+    if ops is None:
+        raise RuntimeError(
+            "The A5 DSpark draft attention operators are not registered under "
+            "torch.ops._C_ascend. Set SGLANG_DSPARK_A5_EXTRA_OPS_SO to the "
+            "standalone extension containing both KV-quant sparse-attention ops."
+        )
+    return ops
 
 
 def _sparse_attn_ops():
@@ -1784,6 +1810,7 @@ class DeepseekV4AscendAttnBackend(
             "layout_q": "TND",
             "layout_kv": "PA_ND",
         }
+        use_external_draft_ops = self._is_dspark_draft_worker and is_npu_arch35()
         base_kwargs = {
             "batch_size": bs,
             "num_heads_q": self._dsv4_q_head_num,
@@ -1793,7 +1820,14 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        if self._is_dspark_draft_worker:
+        if use_external_draft_ops:
+            c1a_kwargs = c1a_kwargs | {
+                "cu_seqlens_q": actual_seq_lengths_q_pa,
+                "seqused_kv": actual_seq_lengths_kv,
+                "device": str(actual_seq_lengths_kv.device),
+            }
+            metadata_op, _ = _dspark_draft_arch35_sparse_attn_ops()
+        elif self._is_dspark_draft_worker:
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
@@ -1892,6 +1926,7 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        use_external_draft_ops = self._is_dspark_draft_worker and is_npu_arch35()
 
         attn_kwargs = dict(
             **_sparse_attn_kv_quant_kwargs(),
@@ -1918,8 +1953,14 @@ class DeepseekV4AscendAttnBackend(
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
-        _, attn_op = _sparse_attn_ops()
-        out, _ = attn_op(q_arg, **attn_kwargs)
+        if use_external_draft_ops:
+            _, attn_op = _dspark_draft_arch35_sparse_attn_ops()
+            out, _ = attn_op(q_arg, **attn_kwargs)
+        elif self._is_dspark_draft_worker:
+            out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        else:
+            _, attn_op = _sparse_attn_ops()
+            out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(
