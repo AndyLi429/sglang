@@ -134,6 +134,22 @@ class Dsv4NpuRoPE:
         # Position-gathered tensors are forward-local; do not cache across forwards
         # or MTP decode reuses the previous step's RoPE when only positions change.
         cache_dtype = dtype if cache_dtype is None else cache_dtype
+        if positions.numel() == 0:
+            rope_dim = self.freqs_cis.shape[-1] * 2
+            empty = positions.new_empty((0, rope_dim), dtype=dtype)
+            if view_4d:
+                empty = empty.view(0, 1, 1, rope_dim)
+            return empty, empty
+        memo = getattr(_CURRENT_FB, _ROPE_MEMO_ATTR, None)
+        key = (id(self.freqs_cis), id(positions), cache_dtype, inverse)
+        if memo is not None:
+            hit = memo.get(key)
+            if hit is not None:
+                cos, sin = hit
+                if view_4d:
+                    cos = cos.view(-1, 1, 1, cos.shape[-1])
+                    sin = sin.view(-1, 1, 1, sin.shape[-1])
+                return cos, sin
         cos_cache, sin_cache = self.ensure_tables(cache_dtype, allow_build=allow_build)
         cos = cos_cache.index_select(0, positions)
         sin = sin_cache.index_select(0, positions)
@@ -142,6 +158,8 @@ class Dsv4NpuRoPE:
         if cos.dtype != dtype:
             cos = cos.to(dtype)
             sin = sin.to(dtype)
+        if memo is not None:
+            memo[key] = (cos, sin)
         if view_4d:
             rope_dim = cos.shape[-1]
             cos = cos.view(-1, 1, 1, rope_dim)
@@ -182,54 +200,29 @@ class Dsv4NpuRoPE:
 
 
 # Per-forward memo of position-gathered (cos, sin), stashed on the ForwardBatch
-# under this attribute by prime_rope_cos_sin (the single writer).
 _ROPE_MEMO_ATTR = "_dsv4_npu_rope_memo"
+_CURRENT_FB = None
 
 
 def prime_rope_cos_sin(attn_modules, forward_batch, positions) -> None:
+    global _CURRENT_FB
+    _CURRENT_FB = forward_batch
     memo: dict = {}
+    setattr(forward_batch, _ROPE_MEMO_ATTR, memo)
     for attn in attn_modules:
         freqs_cis = attn.freqs_cis
-        fwd_key = (id(freqs_cis), torch.bfloat16, False)
-        if fwd_key in memo:
+        key = (id(freqs_cis), id(positions), torch.bfloat16, False)
+        if key in memo:
             continue
         cos, sin = Dsv4NpuRoPE.for_freqs(
             freqs_cis, getattr(attn, "rotary_emb", None)
         ).get_cos_sin(
             positions,
             torch.bfloat16,
-            view_4d=True,
+            view_4d=False,
             inverse=False,
             allow_build=False,
-            cache_dtype=torch.bfloat16,
         )
-        memo[fwd_key] = (positions, cos, sin)
-        memo[(id(freqs_cis), torch.bfloat16, True)] = (positions, cos, -sin)
-    setattr(forward_batch, _ROPE_MEMO_ATTR, memo)
-
-
-def rope_cos_sin(
-    freqs_cis: torch.Tensor,
-    rotary_emb,
-    forward_batch,
-    positions: torch.Tensor,
-    dtype: torch.dtype,
-    *,
-    inverse: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    memo = getattr(forward_batch, _ROPE_MEMO_ATTR, None)
-    entry = memo.get((id(freqs_cis), dtype, inverse)) if memo is not None else None
-    if entry is not None and entry[0] is positions:
-        return entry[1], entry[2]
-    # bf16 tables are ensured at layer init; gathering in the activation dtype
-    # skips the fp32-gather + cast pair. Bit-identical values: rounding the
-    # table once equals rounding each gathered element.
-    cache_dtype = dtype if dtype == torch.bfloat16 else torch.float32
-    return Dsv4NpuRoPE.for_freqs(freqs_cis, rotary_emb).get_cos_sin(
-        positions,
-        dtype,
-        view_4d=True,
-        inverse=inverse,
-        allow_build=False,
-        cache_dtype=cache_dtype,
-    )
+        # get_cos_sin's lazy write-back stored the forward pair already; prime
+        # the inverse pair so the per-layer output rope hits from layer one.
+        memo[(id(freqs_cis), id(positions), torch.bfloat16, True)] = (cos, -sin)

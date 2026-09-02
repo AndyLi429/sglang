@@ -47,7 +47,6 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     Dsv4NpuRoPE,
     prime_rope_cos_sin,
-    rope_cos_sin,
 )
 from sglang.srt.hardware_backend.npu.utils import (
     is_npu_arch35,
@@ -953,16 +952,18 @@ class MQALayer(MqaAttentionBase):
         # ``rotary_emb`` is shared by layers with the same RoPE configuration and
         # can also be shared by the target and NextN models.  Only the immutable
         # full table is cached on it; position-gathered tensors are memoized per
-        # forward (prime_rope_cos_sin / rope_cos_sin), never across forwards --
-        # reusing them based on shape alone gives MTP decode the previous step's
-        # RoPE values when positions change but batch size does not.
-        return rope_cos_sin(
-            self.freqs_cis,
-            getattr(self, "rotary_emb", None),
-            forward_batch,
+        # forward inside get_cos_sin (see prime_rope_cos_sin), never across
+        # forwards -- reusing them based on shape alone gives MTP decode the
+        # previous step's RoPE values when positions change but batch size does
+        # not.
+        return Dsv4NpuRoPE.for_freqs(
+            self.freqs_cis, getattr(self, "rotary_emb", None)
+        ).get_cos_sin(
             positions,
             dtype,
+            view_4d=True,
             inverse=inverse,
+            allow_build=False,
         )
 
     def _compute_q_a(
