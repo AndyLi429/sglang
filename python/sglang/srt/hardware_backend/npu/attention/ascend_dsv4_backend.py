@@ -17,7 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -829,14 +829,15 @@ class C4IndexerAscendBackendMixin:
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
         qk_nope = c4_indexer.head_dim - c4_indexer.rope_head_dim
-        # Per-forward memo keyed on the c4 layers' freqs_cis (the indexer
-        # shares it), so every c4 layer reads one gather instead of its own.
-        cos4, sin4 = rope_cos_sin(
-            c4_indexer.freqs_cis,
-            getattr(c4_indexer, "rotary_emb", None),
-            forward_batch,
+        # get_cos_sin memoizes per forward on (freqs, positions) identity, so
+        # every c4 layer reads one gather instead of its own.
+        cos4, sin4 = Dsv4NpuRoPE.for_freqs(
+            c4_indexer.freqs_cis, getattr(c4_indexer, "rotary_emb", None)
+        ).get_cos_sin(
             positions,
             q.dtype,
+            view_4d=True,
+            allow_build=False,
         )
         Dsv4NpuRoPE.apply_rotary_mul_inplace(
             q,
