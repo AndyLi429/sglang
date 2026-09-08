@@ -688,8 +688,11 @@ class MqaAttentionBase(nn.Module):
             else wo_b_reduce_results
         )
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
-        # but it needs the same quantized weights.
-        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        # but it needs the same quantized weights. An explicit False is used by
+        # DSpark, whose loader dequantizes wo_a to BF16 before loading.
+        self.use_npu_arch35_mxfp8_wo_a = (
+            wo_a_fp8 is not False and use_npu_arch35_mxfp8_wo_a(quant_config)
+        )
         quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
