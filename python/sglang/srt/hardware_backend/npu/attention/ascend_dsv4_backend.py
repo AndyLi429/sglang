@@ -171,7 +171,15 @@ class CompressorAscendBackendMixin:
                     self._ensure_fused_caches(compressor)
                     warmed_fused.add(compressor_id)
 
-            if hasattr(module, "head_dim") and hasattr(module, "wq_b"):
+            # Some model modules expose the same projection attributes but are
+            # not DSV4 C4 indexers.  The Ascend indexer path always owns a
+            # compressor; without this guard a non-indexer reaches
+            # _ensure_npu_c4_indexer with compressor=None.
+            if (
+                hasattr(module, "head_dim")
+                and hasattr(module, "wq_b")
+                and getattr(module, "compressor", None) is not None
+            ):
                 indexer_id = id(module)
                 if indexer_id not in warmed_indexers:
                     self._ensure_npu_c4_indexer(module, device)
