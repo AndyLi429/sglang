@@ -148,6 +148,35 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
 
 
 class CompressorAscendBackendMixin:
+    def warmup_lazy_caches(self, model: torch.nn.Module) -> None:
+        """Materialize Ascend DSV4 caches before the first model forward.
+
+        These objects are invariant for a loaded model, so creating them from
+        the first request adds an avoidable latency spike (and can happen
+        inside graph preparation).  Keep the forward-time ensure calls as a
+        fallback for unusual/custom model layouts.
+        """
+        device = self.device
+        warmed_hadamard: set[int] = set()
+        warmed_fused: set[int] = set()
+        warmed_indexers: set[int] = set()
+        for module in model.modules():
+            compressor = getattr(module, "compressor", None)
+            if compressor is not None:
+                compressor_id = id(compressor)
+                if compressor_id not in warmed_hadamard:
+                    self._ensure_compressor_hadamard(compressor, device)
+                    warmed_hadamard.add(compressor_id)
+                if compressor_id not in warmed_fused:
+                    self._ensure_fused_caches(compressor)
+                    warmed_fused.add(compressor_id)
+
+            if hasattr(module, "head_dim") and hasattr(module, "wq_b"):
+                indexer_id = id(module)
+                if indexer_id not in warmed_indexers:
+                    self._ensure_npu_c4_indexer(module, device)
+                    warmed_indexers.add(indexer_id)
+
     @staticmethod
     def _to_cpu_int_list(values) -> Optional[list[int]]:
         if values is None:
@@ -941,6 +970,7 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+        self.warmup_lazy_caches(model_runner.model)
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
