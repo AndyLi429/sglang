@@ -5,10 +5,12 @@ scales. This module adapts those checkpoint weights to the shared Ascend MoE
 runner and A5 grouped-matmul kernels.
 """
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     prepare_w4a8_mxfp_weight,
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
 
 # MXFP4 group size, fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
+
+logger = logging.getLogger(__name__)
 
 
 def _wrap_mxfp4_scale_weight_loader(weight_loader):
@@ -44,8 +48,17 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         # ``None`` selects the full MX dynamic-quant defaults used by the
         # original DeepSeek-V4 path; the shared ModelSlim path keeps its
         # historical explicit ``dst_type`` behavior.
-        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        fuse_gmm1 = envs.SGLANG_NPU_EXPERIMENTAL_FUSED_V4_GMM1.get()
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, fuse_gmm1_swiglu_quant=fuse_gmm1
+        )
         self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        if fuse_gmm1:
+            logger.warning(
+                "Experimental DeepSeek-V4 fused GMM1 is enabled. "
+                "npu_grouped_matmul_swiglu_quant_v2 uses standard SwiGLU and "
+                "does not preserve swiglu_limit clamp semantics."
+            )
         self.runner = None
 
     def create_weights(

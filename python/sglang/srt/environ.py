@@ -922,6 +922,9 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # Experimental DeepSeek-V4 path: fuse W4A8 GMM1, standard SwiGLU, and
+    # MXFP8 requantization. The CANN op does not implement swiglu_limit clamps.
+    SGLANG_NPU_EXPERIMENTAL_FUSED_V4_GMM1 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)

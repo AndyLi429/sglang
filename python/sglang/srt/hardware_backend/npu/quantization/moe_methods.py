@@ -279,9 +279,17 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
 
-    def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
+    def __init__(
+        self,
+        dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT,
+        fuse_gmm1_swiglu_quant: bool = False,
+    ):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
+        self.fuse_gmm1_swiglu_quant = fuse_gmm1_swiglu_quant
+        self.fused_matmul = (
+            GroupedMatmulSwigluQuant() if fuse_gmm1_swiglu_quant else None
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -331,6 +339,56 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             group_list=expert_tokens,
             output_dtype=output_dtype,
             dynamic_quant_kwargs=dynamic_quant_kwargs,
+        )
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Experimentally fuse W4A8 GMM1, standard SwiGLU, and MXFP8 quant."""
+        if not self.fuse_gmm1_swiglu_quant or self.fused_matmul is None:
+            raise RuntimeError("The experimental fused W4A8 GMM1 path is disabled")
+
+        if pertoken_scale is None:
+            dynamic_quant_kwargs = self.dynamic_quant_kwargs
+            if dynamic_quant_kwargs is None:
+                dynamic_quant_kwargs = {
+                    "axis": 1,
+                    "round_mode": "rint",
+                    "dst_type": torch.float8_e4m3fn,
+                    "block_size": 32,
+                    "scale_alg": None,
+                }
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states, **dynamic_quant_kwargs
+            )
+
+        if pertoken_scale.dim() == 2:
+            pertoken_scale = _pair_pack_mxfp_act_scale(pertoken_scale)
+
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        return self.fused_matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            dequant_dtype=torch.float32,
+            quant_mode=2,
+            quant_dtype=torch.float8_e4m3fn,
+            x_dtype=torch.float8_e4m3fn,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
         )
 
 

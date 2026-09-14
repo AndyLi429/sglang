@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A8MXFP4FusedMoEMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW4A8MXFP4MoEMethod,
     _pair_pack_mxfp_act_scale,
     prepare_w4a8_mxfp_weight,
     reshape_w4a8_mxfp_weight_scale_for_npu,
@@ -251,6 +253,65 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         self.assertIs(
             grouped_matmul.call_args.kwargs["per_token_scale"][0], quantized_scale
         )
+
+
+class TestW4A8FusedGmm1SwigluQuant(unittest.TestCase):
+    def test_fuses_dynamic_quant_gmm1_swiglu_and_mxfp8_requant(self):
+        method = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, fuse_gmm1_swiglu_quant=True
+        )
+        hidden_states = torch.randn(2, 64)
+        quantized = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
+        input_scale = torch.ones(2, 1, 2, dtype=torch.float8_e8m0fnu)
+        weight = torch.empty(2, 64, 128, dtype=torch.uint8)
+        weight_scale = torch.ones(2, 1, 128, 2, dtype=torch.uint8)
+        output = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
+        output_scale = torch.ones(2, 1, 2, dtype=torch.float8_e8m0fnu)
+        group_counts = torch.tensor([1, 1], dtype=torch.int32)
+        quant_info = SimpleNamespace(w13_weight=weight, w13_weight_scale=weight_scale)
+
+        with (
+            patch.object(
+                torch.ops.npu,
+                "npu_dynamic_mx_quant",
+                return_value=(quantized, input_scale),
+                create=True,
+            ),
+            patch.object(
+                torch.ops.npu,
+                "npu_grouped_matmul_swiglu_quant_v2",
+                return_value=(output, output_scale),
+                create=True,
+            ) as fused_op,
+        ):
+            actual_output, actual_scale = method.apply_fused_gmm1_swiglu(
+                quant_info,
+                hidden_states,
+                group_counts,
+                pertoken_scale=None,
+                group_list_type=1,
+            )
+
+        self.assertIs(actual_output, output)
+        self.assertIs(actual_scale, output_scale)
+        kwargs = fused_op.call_args.kwargs
+        self.assertIs(kwargs["x"], quantized)
+        self.assertIs(kwargs["weight"][0], weight)
+        self.assertIs(kwargs["weight_scale"][0], weight_scale)
+        self.assertIs(kwargs["x_scale"], input_scale)
+        self.assertTrue(
+            torch.equal(kwargs["group_list"], torch.tensor([1, 2], dtype=torch.int64))
+        )
+        self.assertEqual(kwargs["dequant_mode"], 2)
+        self.assertEqual(kwargs["quant_mode"], 2)
+        self.assertEqual(kwargs["quant_dtype"], torch.float8_e4m3fn)
+
+    def test_experimental_env_only_fuses_w13(self):
+        with patch.dict(os.environ, {"SGLANG_NPU_EXPERIMENTAL_FUSED_V4_GMM1": "1"}):
+            method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+
+        self.assertTrue(method.w13_kernel.fuse_gmm1_swiglu_quant)
+        self.assertFalse(method.w2_kernel.fuse_gmm1_swiglu_quant)
 
 
 class TestRunnerDelegation(unittest.TestCase):

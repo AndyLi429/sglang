@@ -90,10 +90,13 @@ class AscendRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
+        w13_kernel = config.layer.w13_kernel
 
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
-            # separate activation step — run() skips it. Left None on purpose so
+        if isinstance(kernel, NPUMXFP8MoEMethod) or getattr(
+            w13_kernel, "fuse_gmm1_swiglu_quant", False
+        ):
+            # The selected kernel fuses gate/up + swiglu + requant into gmm1,
+            # so run() skips the separate activation step. Left None on purpose so
             # that reaching for it fails loudly instead of silently applying an
             # unfused swiglu to already-requantised activations. This holds for
             # both dispatchers: ascend_tp gets its activation quant fused into
@@ -167,9 +170,11 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
+        if isinstance(w13_kernel, NPUMXFP8MoEMethod) or getattr(
+            w13_kernel, "fuse_gmm1_swiglu_quant", False
+        ):
             # --- w13 projection + activation, fused into one kernel ---
-            # MXFP8 gmm1 returns activations already requantised for gmm2, so
+            # Fused gmm1 returns activations already requantised for gmm2, so
             # there is no separate activation step to run.
             hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
                 quant_info,
