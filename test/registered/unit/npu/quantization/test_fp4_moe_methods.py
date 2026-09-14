@@ -305,6 +305,9 @@ class TestW4A8FusedGmm1SwigluQuant(unittest.TestCase):
         self.assertEqual(kwargs["dequant_mode"], 2)
         self.assertEqual(kwargs["quant_mode"], 2)
         self.assertEqual(kwargs["quant_dtype"], torch.float8_e4m3fn)
+        # Native FP8 tensors already carry their dtype. Passing it again through
+        # x_dtype is rejected by torch_npu, whose override accepts packed dtypes only.
+        self.assertIsNone(kwargs["x_dtype"])
 
     def test_experimental_env_only_fuses_w13(self):
         with patch.dict(os.environ, {"SGLANG_NPU_EXPERIMENTAL_FUSED_V4_GMM1": "1"}):

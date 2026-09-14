@@ -385,7 +385,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             dequant_dtype=torch.float32,
             quant_mode=2,
             quant_dtype=torch.float8_e4m3fn,
-            x_dtype=torch.float8_e4m3fn,
+            x_dtype=None,
             weight_dtype=fp4_dtype,
             weight_scale_dtype=e8m0_dtype,
             x_scale_dtype=e8m0_dtype,
