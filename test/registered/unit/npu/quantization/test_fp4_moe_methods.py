@@ -262,7 +262,9 @@ class TestW4A8FusedGmm1SwigluQuant(unittest.TestCase):
         )
         hidden_states = torch.randn(2, 64)
         quantized = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
-        input_scale = torch.ones(2, 1, 2, dtype=torch.float8_e8m0fnu)
+        # CUDA graph capture supplies the dynamic MX scale as a flat buffer.
+        # ACLNN GroupedMatmulSwigluQuantV2 requires [M, K/64, 2].
+        input_scale = torch.ones(4, dtype=torch.float8_e8m0fnu)
         weight = torch.empty(2, 64, 128, dtype=torch.uint8)
         weight_scale = torch.ones(2, 1, 128, 2, dtype=torch.uint8)
         output = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
@@ -298,7 +300,7 @@ class TestW4A8FusedGmm1SwigluQuant(unittest.TestCase):
         self.assertIs(kwargs["x"], quantized)
         self.assertIs(kwargs["weight"][0], weight)
         self.assertIs(kwargs["weight_scale"][0], weight_scale)
-        self.assertIs(kwargs["x_scale"], input_scale)
+        self.assertEqual(tuple(kwargs["x_scale"].shape), (2, 1, 2))
         self.assertTrue(
             torch.equal(kwargs["group_list"], torch.tensor([1, 2], dtype=torch.int64))
         )

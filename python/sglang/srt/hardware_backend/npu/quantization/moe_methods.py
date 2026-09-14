@@ -367,8 +367,12 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
                 hidden_states, **dynamic_quant_kwargs
             )
 
-        if pertoken_scale.dim() == 2:
-            pertoken_scale = _pair_pack_mxfp_act_scale(pertoken_scale)
+        # npu_dynamic_mx_quant may return the E8M0 scales as either a flat
+        # capture buffer or [M, K/32]. GroupedMatmulSwigluQuantV2 requires its
+        # pair-packed [M, K/64, 2] layout in both cases.
+        pertoken_scale = pertoken_scale.reshape(
+            hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+        )
 
         e8m0_dtype = _require_e8m0_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
