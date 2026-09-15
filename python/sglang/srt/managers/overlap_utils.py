@@ -286,9 +286,7 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
+        # D2H pulls. CUDA starts this at resolve; NPU EAGLE starts it at publish.
         if _is_cuda:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
@@ -303,6 +301,24 @@ class FutureMap:
         self.topk_index_buf = None
         self.hidden_states_buf = None
         self.draft_probs_buf = None
+
+        self.npu_seq_lens_d2h_stream = None
+        self.npu_seq_lens_d2h_done = None
+        self._npu_seq_lens_publish_generation = 0
+        self._npu_seq_lens_consumed_generation = 0
+        if (
+            _is_npu
+            and self.needs_cpu_seq_lens
+            and self.spec_algo.is_eagle()
+            and not self.spec_algo.is_frozen_kv_mtp()
+        ):
+            # Start the copy at publish so it can overlap draft_extend.
+            self.new_seq_lens_cpu_pinned = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, pin_memory=True
+            )
+            device_module = torch.get_device_module(self.device)
+            self.npu_seq_lens_d2h_stream = device_module.Stream()
+            self.npu_seq_lens_d2h_done = device_module.Event()
         self.dsa_topk_indices_buf = None
 
         # ngram-only relay bufs
@@ -521,6 +537,28 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        if self.npu_seq_lens_d2h_done is not None and fi.shape[0] == 0:
+            # Drain the full-pool read before a later publish reuses its buffers.
+            if (
+                self._npu_seq_lens_publish_generation
+                > self._npu_seq_lens_consumed_generation
+            ):
+                self.npu_seq_lens_d2h_done.synchronize()
+            batch.seq_lens = self.new_seq_lens_buf[fi]
+            if self.needs_cpu_seq_lens:
+                batch.seq_lens_cpu = torch.empty(
+                    (0,), dtype=self.new_seq_lens_buf.dtype
+                )
+                batch.seq_lens_sum = 0
+            else:
+                batch.seq_lens_cpu = None
+                batch.seq_lens_sum = None
+            self._npu_seq_lens_consumed_generation = (
+                self._npu_seq_lens_publish_generation
+            )
+            if _DEBUG_ASSERT:
+                self._publish_fresh = False
+            return
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
@@ -543,6 +581,24 @@ class FutureMap:
                 # Poison consumed rows: each row must be re-published/seeded
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
+        if (
+            _is_npu
+            and self.npu_seq_lens_d2h_done is not None
+            and self._npu_seq_lens_publish_generation
+            > self._npu_seq_lens_consumed_generation
+        ):
+            self.npu_seq_lens_d2h_done.synchronize()
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[
+                batch.req_pool_indices_cpu
+            ]
+            self._npu_seq_lens_consumed_generation = (
+                self._npu_seq_lens_publish_generation
+            )
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
@@ -577,16 +633,39 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
+        if (
+            self.npu_seq_lens_d2h_done is not None
+            and self._npu_seq_lens_publish_generation
+            > self._npu_seq_lens_consumed_generation
+        ):
+            # The prior full-pool D2H may still be reading this device buffer.
+            self.npu_seq_lens_d2h_done.wait()
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
+            device_module = torch.get_device_module(self.device)
             if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
+                self.publish_ready = device_module.Event()
+            else:
+                # Chain the records: event fire implies every prior publish is
+                # visible, so an off-forward-stream publish (PD-decode prebuilt
+                # seeding) cannot drop the in-flight forward's fence.
+                device_module.current_stream().wait_event(self.publish_ready)
             self.publish_ready.record()
             self._publish_fresh = True
+            if self.npu_seq_lens_d2h_stream is not None:
+                self.npu_seq_lens_d2h_stream.wait_event(self.publish_ready)
+                with torch.get_device_module(self.device).stream(
+                    self.npu_seq_lens_d2h_stream
+                ):
+                    self.new_seq_lens_cpu_pinned.copy_(
+                        self.new_seq_lens_buf, non_blocking=True
+                    )
+                    self.npu_seq_lens_d2h_done.record()
+                self._npu_seq_lens_publish_generation += 1
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
