@@ -531,3 +531,76 @@ def test_fused_moe_propagates_strict_failure(monkeypatch, fused_layer):
     with pytest.raises(RuntimeError, match="cann_ops_transformer"):
         fused_layer.forward(_hidden_states(1), _topk_output())
     fused_layer.forward_impl.assert_not_called()
+
+
+def test_opt_in_w8a8_post_load_to_operator(monkeypatch, fused_layer):
+    from sglang.srt import runtime_context
+    from sglang.srt.hardware_backend.npu.quantization import moe_methods
+    from sglang.srt.layers import moe
+
+    monkeypatch.setenv("SGLANG_NPU_ENABLE_MEGAMOE", "1")
+    monkeypatch.setattr(
+        moe, "get_moe_a2a_backend", lambda: MoeA2ABackend.ASCEND_MEGAMOE
+    )
+    monkeypatch.setattr(megamoe, "_format_weight_for_megamoe", lambda weight: weight)
+    monkeypatch.setattr(moe_methods, "npu_format_cast", lambda weight: weight)
+    monkeypatch.setattr(
+        runtime_context,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+    )
+    layer = torch.nn.Module()
+    for name, value in vars(fused_layer).items():
+        if name not in ("_megamoe_w8a8_payload", "forward"):
+            setattr(layer, name, value)
+    for prefix, shape in (("w13", (4, 32, 8)), ("w2", (4, 8, 16))):
+        layer.register_parameter(
+            f"{prefix}_weight",
+            torch.nn.Parameter(
+                torch.ones(shape, dtype=torch.int8), requires_grad=False
+            ),
+        )
+        layer.register_parameter(
+            f"{prefix}_weight_scale",
+            torch.nn.Parameter(torch.ones((*shape[:2], 1)), requires_grad=False),
+        )
+    method = moe_methods.NPUW8A8Int8MoEMethod.__new__(moe_methods.NPUW8A8Int8MoEMethod)
+    method.process_weights_after_loading(layer, "w13")
+    method.process_weights_after_loading(layer, "w2")
+    calls = {}
+    monkeypatch.setattr(megamoe, "_load_ops", lambda: _fake_ops(calls))
+
+    output = fused_layer.forward.__func__(layer, _hidden_states(2), _topk_output(2))
+
+    assert output.shape == (2, layer.hidden_size)
+    assert torch.equal(output, _hidden_states(2) + 1)
+    assert len(calls["buffer"]) == 1
+    assert len(calls["mega_moe"]) == 1
+    args, kwargs = calls["mega_moe"][0]
+    assert args[3][0] is layer._megamoe_w8a8_payload.w13[0]
+    assert args[4][0] is layer._megamoe_w8a8_payload.w2[0]
+    assert kwargs["activation_clamp"] == 10.0
+    layer.forward_impl.assert_not_called()
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_disabled_forward_never_loads_operator(monkeypatch, fused_layer, selected):
+    monkeypatch.setenv("SGLANG_NPU_ENABLE_MEGAMOE", "0")
+    fused_layer._use_ascend_megamoe = selected
+    load_ops = Mock(side_effect=AssertionError("disabled MegaMOE must not load ops"))
+    monkeypatch.setattr(megamoe, "_load_ops", load_ops)
+    hidden_states, topk = _hidden_states(2), _topk_output(2)
+
+    if selected:
+        with pytest.raises(RuntimeError, match="--moe-a2a-backend deepep"):
+            fused_layer.forward(hidden_states, topk)
+        fused_layer.forward_impl.assert_not_called()
+    else:
+        assert (
+            fused_layer.forward(hidden_states, topk)
+            is fused_layer.forward_impl.return_value
+        )
+        fused_layer.forward_impl.assert_called_once_with(
+            hidden_states, topk, pre_quant_input=None
+        )
+    load_ops.assert_not_called()

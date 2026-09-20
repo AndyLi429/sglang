@@ -235,6 +235,89 @@ throughput for high-concurrency scenarios. This scenario is already covered in t
 deployment commands and benchmark data, see
 [DeepSeek-V4-Flash Best Practice — PD Disaggregation On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash#pd-disaggregation).
 
+### Experimental MegaMOE routed experts (W8A8)
+
+Source builds containing the `ascend_megamoe` backend can opt into the CANN
+MegaMOE operator for W8A8 routed experts. MegaMOE performs EP dispatch, expert
+computation, and combine in one operator; shared experts keep the model's existing
+path. This is a separate backend, not a DeepEP mode. The release images and
+benchmark results above do not validate this experimental path.
+
+Install a `cann_ops_transformer` build that provides both APIs below and supports
+your Ascend hardware and CANN version. Run this probe on the target NPU host:
+
+```bash
+python -c "from cann_ops_transformer.ops import get_symm_buffer_for_mega_moe, mega_moe; print('MegaMOE API import passed')"
+```
+
+Use a ModelSlim W8A8 checkpoint with EP size greater than one and an expert count
+divisible by EP size. The initial configuration uses TP = EP = DP and DP attention.
+Start from the single-node environment setup above, then use these overrides and
+launch arguments (replace `MODEL_PATH` with your W8A8 checkpoint):
+
+```bash
+export SGLANG_DSV4_FP4_EXPERTS=False
+export SGLANG_NPU_ENABLE_MEGAMOE=1
+export SGLANG_NPU_MEGAMOE_STRICT=1
+# 0 derives the receive capacity from the rank-invariant scheduler ceiling.
+export SGLANG_NPU_MEGAMOE_MAX_RECV_TOKENS=0
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+
+python -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --device npu --trust-remote-code \
+    --quantization modelslim --attention-backend dsv4 \
+    --tp-size 8 --ep-size 8 --dp-size 8 --enable-dp-attention \
+    --enable-dp-lm-head --moe-a2a-backend ascend_megamoe \
+    --page-size 128 --kv-cache-dtype bfloat16 \
+    --max-running-requests 16 --chunked-prefill-size 1024 \
+    --mem-fraction-static 0.8 --disable-cuda-graph \
+    --host 127.0.0.1 --port 6688
+```
+
+Set the backend and environment variables identically on every EP rank before
+loading weights. MegaMOE retains additional per-expert weights and scales alongside
+the ordinary runner's weights, so allow extra device memory. These arguments are a
+validation starting point, not a measured capacity or performance recommendation.
+
+`SGLANG_NPU_ENABLE_MEGAMOE` defaults to `0`. Selecting `ascend_megamoe` requires
+setting it to `1`; changing the variable alone does not switch backends.
+`SGLANG_NPU_MEGAMOE_STRICT=1` reports the failed capability check directly. With
+the default strict setting (`0`), the wrapper logs the reason, but the selected
+backend still raises if MegaMOE cannot execute: its placeholder dispatcher cannot
+provide a correct EP fallback. To return to the existing path, restart with
+`SGLANG_NPU_ENABLE_MEGAMOE=0 --moe-a2a-backend deepep` (set the environment variable
+before the launch command and replace the backend argument).
+
+A positive `SGLANG_NPU_MEGAMOE_MAX_RECV_TOKENS` caps received expert-token entries
+per rank, not input tokens. For per-rank send ceiling `C`, EP size `P`, top-k `K`,
+and total expert count `E`, the automatic worst-case capacity is
+`C * P * min(K, E / P)`. A smaller receive cap also limits admitted input tokens
+to `floor(cap / (P * min(K, E / P)))`; exceeding it raises before the operator
+launch. The buffer size never depends on one rank's live batch. When scheduler
+global token counts are unavailable, admission uses an EP-group CPU MAX collective,
+which may add latency.
+
+W4A8/MXFP4, LoRA, and EPLB (`--enable-eplb`) are unsupported. Keep graph capture,
+MTP/speculative decoding, and overlap optimizations disabled for initial validation;
+their interaction with this backend has not been validated.
+
+Before production use, run the focused tests in a Linux SGLang environment:
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+    test/registered/unit/npu/test_ascend_megamoe.py \
+    test/registered/unit/npu/quantization/test_fp4_moe_methods.py
+```
+
+Then compare W8A8 EP outputs against the DeepEP baseline with MegaMOE disabled,
+including prefill, decode, unequal rank batches, and the configured capacity
+boundary. Record the accuracy metric and acceptance threshold, hardware, exact
+CANN/TorchNPU/ops-transformer versions, topology, and workload. Benchmark throughput
+and latency with identical topology, batch sizes, and package versions. Host mocks
+do not establish kernel accuracy, HCCL correctness, or end-to-end speedup; these
+real-NPU checks remain required.
+
 ## Functional verification
 
 After the service is started, you can invoke the model by sending a prompt:
