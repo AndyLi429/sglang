@@ -53,7 +53,7 @@ def _fake_ops(calls):
 
 @pytest.fixture
 def fake_group():
-    return SimpleNamespace(device_group=object(), world_size=4)
+    return SimpleNamespace(device_group=object(), cpu_group=object(), world_size=4)
 
 
 @pytest.fixture
@@ -101,7 +101,7 @@ def supported_megamoe(monkeypatch, fake_group, fake_resources):
     monkeypatch.setattr(megamoe, "_lora_enabled", lambda _layer: False)
     monkeypatch.setattr(megamoe, "_max_tokens_per_rank", lambda _layer: 128)
     monkeypatch.setattr(
-        megamoe, "get_dp_global_num_tokens", lambda: None, raising=False
+        megamoe, "get_dp_global_num_tokens", lambda: [128, 128, 128, 128]
     )
 
 
@@ -183,6 +183,54 @@ def test_unequal_rank_token_counts_make_same_capacity_decision(monkeypatch, fake
     load_ops.assert_not_called()
     get_buffer.assert_not_called()
     op.assert_not_called()
+
+
+def test_ep_max_rejects_129_and_128_tokens_before_loading_ops(
+    monkeypatch, fake_layer, fake_group
+):
+    monkeypatch.setattr(megamoe, "_max_tokens_per_rank", lambda _layer: 128)
+    monkeypatch.setattr(megamoe, "get_dp_global_num_tokens", lambda: None)
+    local_counts = []
+
+    def set_ep_max(token_count, *, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is fake_group.cpu_group
+        local_counts.append(token_count.item())
+        token_count.fill_(129)
+
+    ep_all_reduce = Mock(side_effect=set_ep_max)
+    monkeypatch.setattr(torch.distributed, "all_reduce", ep_all_reduce)
+    get_buffer = Mock()
+    op = Mock()
+    load_ops = Mock(return_value=(get_buffer, op))
+    monkeypatch.setattr(megamoe, "_load_ops", load_ops)
+
+    outputs = [
+        megamoe.forward_megamoe_or_none(
+            fake_layer, _hidden_states(tokens), _topk_output(tokens)
+        )
+        for tokens in (129, 128)
+    ]
+
+    assert outputs == [None, None]
+    assert ep_all_reduce.call_count == 2
+    assert local_counts == [129, 128]
+    load_ops.assert_not_called()
+    get_buffer.assert_not_called()
+    op.assert_not_called()
+
+
+def test_scheduler_token_metadata_skips_ep_max_all_reduce(monkeypatch, fake_layer):
+    calls = {}
+    monkeypatch.setattr(megamoe, "get_dp_global_num_tokens", lambda: [7, 3, 4, 1])
+    ep_all_reduce = Mock()
+    monkeypatch.setattr(torch.distributed, "all_reduce", ep_all_reduce)
+    monkeypatch.setattr(megamoe, "_load_ops", lambda: _fake_ops(calls))
+
+    output = megamoe.forward_megamoe(fake_layer, _hidden_states(7), _topk_output(7))
+
+    assert torch.equal(output, _hidden_states(7) + 1)
+    ep_all_reduce.assert_not_called()
 
 
 def test_generic_megamoe_backend_never_loads_ascend_ops(monkeypatch, fake_layer):

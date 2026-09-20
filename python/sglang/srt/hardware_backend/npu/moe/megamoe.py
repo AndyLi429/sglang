@@ -157,19 +157,24 @@ def _payload_is_valid(layer: FusedMoE, experts_per_rank: int) -> bool:
     return True
 
 
-def _rank_invariant_admission_tokens(capacity: int) -> int:
+def _rank_invariant_admission_tokens(num_tokens: int) -> int:
     """Return the maximum live token count known identically by all ranks."""
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens:
         return max(int(tokens) for tokens in global_num_tokens)
 
-    # Outside DP-attention forwards there is no gathered live count. Treat the
-    # scheduler/graph ceiling as the admission count instead of branching on a
-    # rank-local tensor shape. The scheduler guarantees that ceiling at runtime.
-    return capacity
+    # All EP ranks must make the same admission decision before buffer creation.
+    # This live count is used only for admission, never for allocation sizing.
+    token_count = torch.tensor([num_tokens], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(
+        token_count,
+        op=torch.distributed.ReduceOp.MAX,
+        group=get_moe_ep_group().cpu_group,
+    )
+    return int(token_count.item())
 
 
-def _check_availability(layer: FusedMoE, _num_tokens: int) -> _Availability:
+def _check_availability(layer: FusedMoE, num_tokens: int) -> _Availability:
     # Keep all cheap, non-collective gates ahead of the optional import and
     # symmetric-buffer allocation. In particular, generic GPU ``megamoe`` must
     # never attempt to load the Ascend extension.
@@ -210,7 +215,7 @@ def _check_availability(layer: FusedMoE, _num_tokens: int) -> _Availability:
             "a rank-invariant MegaMOE token capacity is unavailable",
         )
 
-    admission_tokens = _rank_invariant_admission_tokens(capacity)
+    admission_tokens = _rank_invariant_admission_tokens(num_tokens)
     if admission_tokens < 0 or admission_tokens > capacity:
         return _Availability(
             False,
