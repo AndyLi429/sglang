@@ -153,11 +153,13 @@ def handle_shared_experts_tp(server_args: Any):
         "megamoe",
         "mooncake",
         "ascend_fuseep",
+        "ascend_megamoe",
         "mori",
     ):
         raise ValueError(
             "--shared-experts-tp-size requires an expert-parallel all-to-all "
-            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+            "backend (deepep, megamoe, mooncake, ascend_fuseep, "
+            "ascend_megamoe or mori)."
         )
 
 

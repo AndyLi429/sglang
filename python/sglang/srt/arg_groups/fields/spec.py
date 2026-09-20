@@ -181,6 +181,7 @@ class Spec(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
+                "ascend_megamoe",
                 "flashinfer",
                 "megamoe",
                 "deepep_v2",

@@ -964,6 +964,11 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Opt in to the Ascend MegaMOE operator path. A zero receive capacity is
+    # derived from the global, rank-invariant scheduling capacity by its caller.
+    SGLANG_NPU_ENABLE_MEGAMOE = EnvBool(False)
+    SGLANG_NPU_MEGAMOE_STRICT = EnvBool(False)
+    SGLANG_NPU_MEGAMOE_MAX_RECV_TOKENS = EnvInt(0)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
