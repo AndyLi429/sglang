@@ -1528,6 +1528,13 @@ class FusedMoE(torch.nn.Module):
 
             return forward_fuseep(self, hidden_states, topk_output)
         if self._use_ascend_megamoe:
+            if get_exec().moe.enable_eplb:
+                raise RuntimeError(
+                    "Ascend MegaMOE does not support EPLB because its cached "
+                    "expert weights are not updated during rebalancing. Remove "
+                    "--enable-eplb or use --moe-a2a-backend deepep with "
+                    "SGLANG_NPU_ENABLE_MEGAMOE=0."
+                )
             from sglang.srt.hardware_backend.npu.moe.megamoe import (
                 forward_megamoe_or_none,
             )

@@ -661,6 +661,15 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
             from sglang.srt.hardware_backend.npu.moe.megamoe import (
                 cache_megamoe_w8a8_payload,
             )
+            from sglang.srt.runtime_context import get_exec
+
+            if get_exec().moe.enable_eplb:
+                raise RuntimeError(
+                    "Ascend MegaMOE does not support EPLB because its cached "
+                    "expert weights are not updated during rebalancing. Remove "
+                    "--enable-eplb or use --moe-a2a-backend deepep with "
+                    "SGLANG_NPU_ENABLE_MEGAMOE=0."
+                )
 
             # Cache both native expert layouts before either prefix is
             # transposed or its FP32 scales are converted for ordinary GMM.

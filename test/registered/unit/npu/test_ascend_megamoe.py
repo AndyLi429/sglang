@@ -386,6 +386,7 @@ def test_w8a8_post_load_preserves_payload_before_normal_conversion(
     monkeypatch, enabled
 ):
     import sglang.srt.layers.quantization  # noqa: F401
+    from sglang.srt import runtime_context
     from sglang.srt.hardware_backend.npu.quantization import moe_methods
     from sglang.srt.layers import moe
 
@@ -395,6 +396,11 @@ def test_w8a8_post_load_preserves_payload_before_normal_conversion(
     )
     monkeypatch.setattr(megamoe, "_format_weight_for_megamoe", lambda weight: weight)
     monkeypatch.setattr(moe_methods, "npu_format_cast", lambda weight: weight)
+    monkeypatch.setattr(
+        runtime_context,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+    )
     layer = torch.nn.Module()
     for prefix, shape in (("w13", (2, 32, 8)), ("w2", (2, 8, 16))):
         layer.register_parameter(
@@ -428,12 +434,39 @@ def test_w8a8_post_load_preserves_payload_before_normal_conversion(
     assert payload.w2_scale[0].dtype == torch.float32
 
 
+def test_w8a8_post_load_rejects_eplb_before_caching(monkeypatch):
+    import sglang.srt.layers.quantization  # noqa: F401
+    from sglang.srt import runtime_context
+    from sglang.srt.hardware_backend.npu.quantization import moe_methods
+    from sglang.srt.layers import moe
+
+    monkeypatch.setattr(
+        moe, "get_moe_a2a_backend", lambda: MoeA2ABackend.ASCEND_MEGAMOE
+    )
+    monkeypatch.setattr(
+        runtime_context,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(enable_eplb=True)),
+    )
+    cache = Mock()
+    monkeypatch.setattr(megamoe, "cache_megamoe_w8a8_payload", cache)
+    method = moe_methods.NPUW8A8Int8MoEMethod.__new__(moe_methods.NPUW8A8Int8MoEMethod)
+    with pytest.raises(RuntimeError, match="--enable-eplb"):
+        method.process_weights_after_loading(torch.nn.Module(), "w13")
+    cache.assert_not_called()
+
+
 @pytest.fixture
 def fused_layer(fake_layer, monkeypatch):
     import sglang.srt.layers.quantization  # noqa: F401
     from sglang.srt.layers.moe.fused_moe_triton import layer as layer_module
 
     monkeypatch.setattr(layer_module, "is_in_tc_piecewise_cuda_graph", lambda: False)
+    monkeypatch.setattr(
+        layer_module,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+    )
     fake_layer._use_ascend_fuseep = False
     fake_layer._use_ascend_megamoe = True
     fake_layer.forward_impl = Mock()
@@ -457,6 +490,22 @@ def test_fused_moe_rejects_unsafe_ep_fallback(monkeypatch, fused_layer):
     pre_quant_input = (object(), object())
     with pytest.raises(RuntimeError, match="--moe-a2a-backend deepep"):
         fused_layer.forward(hidden_states, topk, pre_quant_input=pre_quant_input)
+    fused_layer.forward_impl.assert_not_called()
+
+
+def test_fused_moe_rejects_eplb_before_operator_launch(monkeypatch, fused_layer):
+    from sglang.srt.layers.moe.fused_moe_triton import layer as layer_module
+
+    monkeypatch.setattr(
+        layer_module,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(enable_eplb=True)),
+    )
+    call = Mock()
+    monkeypatch.setattr(megamoe, "forward_megamoe_or_none", call)
+    with pytest.raises(RuntimeError, match="--enable-eplb"):
+        fused_layer.forward(_hidden_states(1), _topk_output())
+    call.assert_not_called()
     fused_layer.forward_impl.assert_not_called()
 
 
