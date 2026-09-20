@@ -652,6 +652,20 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         if self.maybe_process_fuseep_weights(layer):
             return
 
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if (
+            get_moe_a2a_backend().is_ascend_megamoe()
+            and envs.SGLANG_NPU_ENABLE_MEGAMOE.get()
+        ):
+            from sglang.srt.hardware_backend.npu.moe.megamoe import (
+                cache_megamoe_w8a8_payload,
+            )
+
+            # Cache both native expert layouts before either prefix is
+            # transposed or its FP32 scales are converted for ordinary GMM.
+            cache_megamoe_w8a8_payload(layer)
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         # Process scale

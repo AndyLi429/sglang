@@ -379,3 +379,106 @@ def test_cache_megamoe_w8a8_payload_clones_per_expert_weights(monkeypatch):
     assert payload.w13_scale[0].shape == (4,)
     layer.w13_weight.zero_()
     assert torch.equal(payload.w13[0], original_w13[0])
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_w8a8_post_load_preserves_payload_before_normal_conversion(
+    monkeypatch, enabled
+):
+    import sglang.srt.layers.quantization  # noqa: F401
+    from sglang.srt.hardware_backend.npu.quantization import moe_methods
+    from sglang.srt.layers import moe
+
+    monkeypatch.setenv("SGLANG_NPU_ENABLE_MEGAMOE", "1" if enabled else "0")
+    monkeypatch.setattr(
+        moe, "get_moe_a2a_backend", lambda: MoeA2ABackend.ASCEND_MEGAMOE
+    )
+    monkeypatch.setattr(megamoe, "_format_weight_for_megamoe", lambda weight: weight)
+    monkeypatch.setattr(moe_methods, "npu_format_cast", lambda weight: weight)
+    layer = torch.nn.Module()
+    for prefix, shape in (("w13", (2, 32, 8)), ("w2", (2, 8, 16))):
+        layer.register_parameter(
+            f"{prefix}_weight",
+            torch.nn.Parameter(
+                torch.ones(shape, dtype=torch.int8), requires_grad=False
+            ),
+        )
+        layer.register_parameter(
+            f"{prefix}_weight_scale",
+            torch.nn.Parameter(torch.ones((*shape[:2], 1)), requires_grad=False),
+        )
+    original_w13 = layer.w13_weight
+    method = moe_methods.NPUW8A8Int8MoEMethod.__new__(moe_methods.NPUW8A8Int8MoEMethod)
+    method.process_weights_after_loading(layer, "w13")
+    payload = getattr(layer, "_megamoe_w8a8_payload", None)
+    method.process_weights_after_loading(layer, "w2")
+
+    assert layer.w13_weight is original_w13
+    assert layer.w13_weight.shape == (2, 8, 32)
+    assert layer.w2_weight.shape == (2, 16, 8)
+    assert layer.w13_weight_scale.dtype == torch.bfloat16
+    if not enabled:
+        assert payload is None
+        assert not hasattr(layer, "_megamoe_w8a8_payload")
+        return
+    assert layer._megamoe_w8a8_payload is payload
+    assert payload.w13[0].shape == (32, 8)
+    assert payload.w2[0].shape == (8, 16)
+    assert payload.w13_scale[0].dtype == torch.float32
+    assert payload.w2_scale[0].dtype == torch.float32
+
+
+@pytest.fixture
+def fused_layer(fake_layer, monkeypatch):
+    import sglang.srt.layers.quantization  # noqa: F401
+    from sglang.srt.layers.moe.fused_moe_triton import layer as layer_module
+
+    monkeypatch.setattr(layer_module, "is_in_tc_piecewise_cuda_graph", lambda: False)
+    fake_layer._use_ascend_fuseep = False
+    fake_layer._use_ascend_megamoe = True
+    fake_layer.forward_impl = Mock()
+    fake_layer.forward = layer_module.FusedMoE.forward.__get__(fake_layer)
+    return fake_layer
+
+
+def test_fused_moe_forward_passes_clipped_swiglu(monkeypatch, fused_layer):
+    calls = {}
+    monkeypatch.setattr(megamoe, "_load_ops", lambda: _fake_ops(calls))
+    output = fused_layer.forward(_hidden_states(2), _topk_output(2))
+    assert torch.equal(output, _hidden_states(2) + 1)
+    assert calls["mega_moe"][0][1]["activation"] == "swiglu"
+    assert calls["mega_moe"][0][1]["activation_clamp"] == 10.0
+    fused_layer.forward_impl.assert_not_called()
+
+
+def test_fused_moe_rejects_unsafe_ep_fallback(monkeypatch, fused_layer):
+    monkeypatch.setattr(megamoe, "forward_megamoe_or_none", lambda *_: None)
+    hidden_states, topk = _hidden_states(1), _topk_output()
+    pre_quant_input = (object(), object())
+    with pytest.raises(RuntimeError, match="--moe-a2a-backend deepep"):
+        fused_layer.forward(hidden_states, topk, pre_quant_input=pre_quant_input)
+    fused_layer.forward_impl.assert_not_called()
+
+
+def test_fused_moe_other_backend_keeps_existing_forward(monkeypatch, fused_layer):
+    fused_layer._use_ascend_megamoe = False
+    call = Mock(side_effect=AssertionError("MegaMOE must not be called"))
+    monkeypatch.setattr(megamoe, "forward_megamoe_or_none", call)
+    hidden_states, topk = _hidden_states(1), _topk_output()
+    pre_quant_input = (object(), object())
+    assert (
+        fused_layer.forward(hidden_states, topk, pre_quant_input)
+        is fused_layer.forward_impl.return_value
+    )
+    fused_layer.forward_impl.assert_called_once_with(
+        hidden_states, topk, pre_quant_input=pre_quant_input
+    )
+    call.assert_not_called()
+
+
+def test_fused_moe_propagates_strict_failure(monkeypatch, fused_layer):
+    monkeypatch.setenv("SGLANG_NPU_MEGAMOE_STRICT", "1")
+    monkeypatch.setattr(megamoe, "_load_ops", lambda: None)
+    with pytest.raises(RuntimeError, match="cann_ops_transformer"):
+        fused_layer.forward(_hidden_states(1), _topk_output())
+    fused_layer.forward_impl.assert_not_called()

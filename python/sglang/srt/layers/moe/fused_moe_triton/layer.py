@@ -171,8 +171,9 @@ def create_moe_dispatcher(
         or a2a_backend.is_megamoe()
         or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
+        or a2a_backend.is_ascend_megamoe()
     ):
-        # ascend_fuseep bypasses the dispatcher abstraction (see
+        # ascend_fuseep and ascend_megamoe bypass the dispatcher abstraction (see
         # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
@@ -540,6 +541,7 @@ class FusedMoE(torch.nn.Module):
         if expert_mask is not None:
             self.register_buffer("expert_mask_gpu", expert_mask, persistent=False)
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
+        self._use_ascend_megamoe = get_moe_a2a_backend().is_ascend_megamoe()
         # Expose swigluoai alpha/clamp on the layer so deepep's W8A8 apply
         # (apply_without_routing_weights) picks swiglu_oai_quant instead of plain
         # npu_swiglu. fuseep injects these via fuseep_activation (aclnnFusedDeepMoe
@@ -1525,6 +1527,22 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if self._use_ascend_megamoe:
+            from sglang.srt.hardware_backend.npu.moe.megamoe import (
+                forward_megamoe_or_none,
+            )
+
+            output = forward_megamoe_or_none(self, hidden_states, topk_output)
+            if output is not None:
+                return output
+            # StandardDispatcher neither exchanges EP tokens nor provides an
+            # input format supported by the Ascend runner. Running forward_impl
+            # here would therefore not be a valid fallback for sharded experts.
+            raise RuntimeError(
+                "Ascend MegaMOE cannot execute this forward and has no safe EP "
+                "fallback. Restart with --moe-a2a-backend deepep and "
+                "SGLANG_NPU_ENABLE_MEGAMOE=0 to use the existing EP path."
+            )
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
