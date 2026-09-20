@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_ep_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
@@ -133,13 +134,42 @@ def _payload_is_valid(layer: FusedMoE, experts_per_rank: int) -> bool:
     payload = getattr(layer, "_megamoe_w8a8_payload", None)
     if payload is None:
         return False
-    return all(
-        hasattr(payload, name) and len(getattr(payload, name)) == experts_per_rank
-        for name in ("w13", "w2", "w13_scale", "w2_scale")
-    )
+
+    hidden_size = int(layer.hidden_size)
+    intermediate_size = int(layer.intermediate_size_per_partition)
+    expected = {
+        "w13": (torch.int8, (2 * intermediate_size, hidden_size)),
+        "w2": (torch.int8, (hidden_size, intermediate_size)),
+        "w13_scale": (torch.float32, (2 * intermediate_size,)),
+        "w2_scale": (torch.float32, (hidden_size,)),
+    }
+    for name, (dtype, shape) in expected.items():
+        tensors = getattr(payload, name, None)
+        if not isinstance(tensors, (list, tuple)) or len(tensors) != experts_per_rank:
+            return False
+        if any(
+            not isinstance(tensor, torch.Tensor)
+            or tensor.dtype != dtype
+            or tuple(tensor.shape) != shape
+            for tensor in tensors
+        ):
+            return False
+    return True
 
 
-def _check_availability(layer: FusedMoE, num_tokens: int) -> _Availability:
+def _rank_invariant_admission_tokens(capacity: int) -> int:
+    """Return the maximum live token count known identically by all ranks."""
+    global_num_tokens = get_dp_global_num_tokens()
+    if global_num_tokens:
+        return max(int(tokens) for tokens in global_num_tokens)
+
+    # Outside DP-attention forwards there is no gathered live count. Treat the
+    # scheduler/graph ceiling as the admission count instead of branching on a
+    # rank-local tensor shape. The scheduler guarantees that ceiling at runtime.
+    return capacity
+
+
+def _check_availability(layer: FusedMoE, _num_tokens: int) -> _Availability:
     # Keep all cheap, non-collective gates ahead of the optional import and
     # symmetric-buffer allocation. In particular, generic GPU ``megamoe`` must
     # never attempt to load the Ascend extension.
@@ -179,10 +209,12 @@ def _check_availability(layer: FusedMoE, num_tokens: int) -> _Availability:
             False,
             "a rank-invariant MegaMOE token capacity is unavailable",
         )
-    if num_tokens < 0 or num_tokens > capacity:
+
+    admission_tokens = _rank_invariant_admission_tokens(capacity)
+    if admission_tokens < 0 or admission_tokens > capacity:
         return _Availability(
             False,
-            f"MegaMOE token capacity exceeded: {num_tokens} > {capacity}",
+            f"MegaMOE token capacity exceeded: {admission_tokens} > {capacity}",
         )
 
     configured_recv = envs.SGLANG_NPU_MEGAMOE_MAX_RECV_TOKENS.get()
@@ -190,6 +222,16 @@ def _check_availability(layer: FusedMoE, num_tokens: int) -> _Availability:
         return _Availability(
             False,
             "SGLANG_NPU_MEGAMOE_MAX_RECV_TOKENS must be non-negative",
+        )
+
+    experts_per_rank = num_experts // ep_world_size
+    routing_fanout = ep_world_size * min(top_k, experts_per_rank)
+    send_capacity = _max_recv_tokens(layer, capacity, ep_world_size) // routing_fanout
+    if admission_tokens > send_capacity:
+        return _Availability(
+            False,
+            "MegaMOE receive capacity cannot safely admit the scheduled token count: "
+            f"{admission_tokens} > {send_capacity}",
         )
 
     ops = _load_ops()

@@ -58,7 +58,10 @@ def fake_group():
 
 @pytest.fixture
 def fake_layer():
-    tensor = torch.ones(1)
+    w13 = tuple(torch.ones((32, 8), dtype=torch.int8) for _ in range(4))
+    w2 = tuple(torch.ones((8, 16), dtype=torch.int8) for _ in range(4))
+    w13_scale = tuple(torch.ones(32, dtype=torch.float32) for _ in range(4))
+    w2_scale = tuple(torch.ones(8, dtype=torch.float32) for _ in range(4))
     return SimpleNamespace(
         hidden_size=8,
         intermediate_size_per_partition=16,
@@ -69,10 +72,10 @@ def fake_layer():
             activation="silu", is_gated=True, swiglu_limit=10.0
         ),
         _megamoe_w8a8_payload=SimpleNamespace(
-            w13=(tensor,) * 4,
-            w2=(tensor,) * 4,
-            w13_scale=(tensor,) * 4,
-            w2_scale=(tensor,) * 4,
+            w13=w13,
+            w2=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
         ),
     )
 
@@ -97,6 +100,9 @@ def supported_megamoe(monkeypatch, fake_group, fake_resources):
     monkeypatch.setattr(megamoe, "is_npu", lambda: True)
     monkeypatch.setattr(megamoe, "_lora_enabled", lambda _layer: False)
     monkeypatch.setattr(megamoe, "_max_tokens_per_rank", lambda _layer: 128)
+    monkeypatch.setattr(
+        megamoe, "get_dp_global_num_tokens", lambda: None, raising=False
+    )
 
 
 def test_ascend_megamoe_is_distinct_backend(monkeypatch):
@@ -154,19 +160,26 @@ def test_unavailable_ops_falls_back_or_raises_in_strict_mode(monkeypatch, fake_l
         megamoe.forward_megamoe(fake_layer, _hidden_states(1), _topk_output(1))
 
 
-def test_capacity_overflow_does_not_initialize_collective_or_call_operator(
-    monkeypatch, fake_layer
-):
+def test_unequal_rank_token_counts_make_same_capacity_decision(monkeypatch, fake_layer):
     monkeypatch.setattr(megamoe, "_max_tokens_per_rank", lambda _layer: 4)
+    monkeypatch.setattr(megamoe, "get_dp_global_num_tokens", lambda: [5, 4])
     get_buffer = Mock()
     op = Mock()
     load_ops = Mock(return_value=(get_buffer, op))
     monkeypatch.setattr(megamoe, "_load_ops", load_ops)
 
-    assert (
-        megamoe.forward_megamoe_or_none(fake_layer, _hidden_states(5), _topk_output(5))
-        is None
-    )
+    decisions = [megamoe.is_megamoe_available(fake_layer, tokens) for tokens in (5, 4)]
+    outputs = [
+        megamoe.forward_megamoe_or_none(
+            fake_layer, _hidden_states(tokens), _topk_output(tokens)
+        )
+        for tokens in (5, 4)
+    ]
+
+    assert decisions[0] == decisions[1]
+    assert decisions[0][0] is False
+    assert "5 > 4" in decisions[0][1]
+    assert outputs == [None, None]
     load_ops.assert_not_called()
     get_buffer.assert_not_called()
     op.assert_not_called()
@@ -251,6 +264,52 @@ def test_configured_receive_capacity_is_clamped_to_safe_bound(monkeypatch, fake_
     megamoe.forward_megamoe(fake_layer, _hidden_states(1), _topk_output(1))
 
     assert calls["buffer"][0]["max_recv_token_num"] == 1024
+
+
+def test_receive_capacity_below_safe_bound_constrains_send_admission(
+    monkeypatch, fake_layer
+):
+    monkeypatch.setenv("SGLANG_NPU_MEGAMOE_MAX_RECV_TOKENS", "1")
+    monkeypatch.setattr(megamoe, "get_dp_global_num_tokens", lambda: [1, 1, 1, 1])
+    get_buffer = Mock()
+    op = Mock()
+    load_ops = Mock(return_value=(get_buffer, op))
+    monkeypatch.setattr(megamoe, "_load_ops", load_ops)
+
+    available, reason = megamoe.is_megamoe_available(fake_layer, 1)
+
+    assert available is False
+    assert "receive capacity" in reason
+    load_ops.assert_not_called()
+    get_buffer.assert_not_called()
+    op.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invalid_w13",
+    [
+        torch.ones((32, 8), dtype=torch.float32),
+        torch.ones(32, dtype=torch.int8),
+    ],
+)
+def test_invalid_w8a8_payload_is_rejected_before_collective(
+    monkeypatch, fake_layer, invalid_w13
+):
+    payload = fake_layer._megamoe_w8a8_payload
+    fake_layer._megamoe_w8a8_payload = SimpleNamespace(
+        w13=(invalid_w13, *payload.w13[1:]),
+        w2=payload.w2,
+        w13_scale=payload.w13_scale,
+        w2_scale=payload.w2_scale,
+    )
+    load_ops = Mock()
+    monkeypatch.setattr(megamoe, "_load_ops", load_ops)
+
+    available, reason = megamoe.is_megamoe_available(fake_layer, 1)
+
+    assert available is False
+    assert "W8A8" in reason
+    load_ops.assert_not_called()
 
 
 def test_cache_megamoe_w8a8_payload_clones_per_expert_weights(monkeypatch):
