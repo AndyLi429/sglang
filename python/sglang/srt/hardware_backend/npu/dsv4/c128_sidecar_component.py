@@ -6,6 +6,8 @@ radix tree; partial tail pages remain request-owned.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -41,6 +43,10 @@ if TYPE_CHECKING:
         ComponentAction,
     )
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+
+
+logger = logging.getLogger(__name__)
+_CACHE_DEBUG = os.getenv("SGLANG_NPU_C128_CACHE_DEBUG", "0") == "1"
 
 
 class C128SidecarComponent(TreeComponent):
@@ -102,17 +108,52 @@ class C128SidecarComponent(TreeComponent):
         value = pages.clone()
         self.tree_core.set_component_device_value(node.id, ct, value)
         self.allocator.retain_c128_pages(value)
+        if _CACHE_DEBUG:
+            logger.info(
+                "[NPU-C128-CACHE] attach node=%s depth=%s pages=%s",
+                node.id,
+                self._node_depth(node),
+                value.numel(),
+            )
 
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         # Pages attach only to full-group endpoints. A host-backed endpoint is a
         # valid match unless match_device_only requires device residency.
+        depth = 0
+        # Match SWA's validator: coverage is unconstrained until a tombstone.
+        swa_run = float("inf")
+
         def _valid(node: UnifiedTreeNode) -> bool:
+            nonlocal depth, swa_run
             cd = node.component_data[self.component_type]
-            if match_device_only:
-                return cd.value is not None
-            return cd.value is not None or cd.host_value is not None
+            valid = cd.value is not None or (
+                not match_device_only and cd.host_value is not None
+            )
+            if _CACHE_DEBUG:
+                depth += len(node.key)
+                swa = node.component_data[ComponentType.SWA]
+                swa_present = swa.value is not None or (
+                    not match_device_only and swa.host_value is not None
+                )
+                swa_run = swa_run + len(node.key) if swa_present else 0
+                logger.info(
+                    "[NPU-C128-CACHE] walk device_only=%s node=%s depth=%s "
+                    "key_len=%s c128_device=%s c128_host=%s c128_valid=%s "
+                    "swa_device=%s swa_host=%s swa_run=%s",
+                    match_device_only,
+                    node.id,
+                    depth,
+                    len(node.key),
+                    None if cd.value is None else cd.value.numel(),
+                    None if cd.host_value is None else cd.host_value.numel(),
+                    valid,
+                    None if swa.value is None else swa.value.numel(),
+                    None if swa.host_value is None else swa.host_value.numel(),
+                    swa_run,
+                )
+            return valid
 
         return _valid
 
@@ -140,6 +181,24 @@ class C128SidecarComponent(TreeComponent):
             return result
 
         pages = self._collect_device_pages(result.best_match_node)
+        if _CACHE_DEBUG:
+            logger.info(
+                "[NPU-C128-CACHE] match rid=%s req_pool_idx=%s key_len=%s "
+                "matched=%s full_hit=%s host_hit=%s best_node=%s "
+                "device_node=%s branching=%s pages=%s protected=%s swa_evicted=%s",
+                req.rid,
+                req.kv.req_pool_idx,
+                len(params.key),
+                len(result.device_indices),
+                result.full_kv_hit_length,
+                result.host_hit_length,
+                result.best_match_node,
+                result.last_device_node,
+                result.swa_branching_seqlen,
+                pages.numel(),
+                req.kv.cache_protected_len,
+                req.kv.swa_evicted_seqlen,
+            )
         self.cache.req_to_token_pool.set_c128_prefix_pages(req, pages)
         return result
 
@@ -255,6 +314,23 @@ class C128SidecarComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        if _CACHE_DEBUG:
+            logger.info(
+                "[NPU-C128-CACHE] insert node=%s depth=%s new_leaf=%s "
+                "key_len=%s overlap=%s prev_prefix=%s swa_evicted=%s "
+                "branching=%s group_tokens=%s pages=%s pending_actions=%s",
+                node.id,
+                self._node_depth(node),
+                is_new_leaf,
+                len(params.key),
+                result.prefix_len,
+                params.prev_prefix_len,
+                params.swa_evicted_seqlen,
+                params.swa_branching_seqlen,
+                128 * self.allocator.c128_attn_allocator.page_size,
+                None if params.c128_value is None else params.c128_value.numel(),
+                [type(action).__name__ for action in cache_actions],
+            )
         if not is_new_leaf:
             return
         assert params.key is not None
@@ -327,6 +403,23 @@ class C128SidecarComponent(TreeComponent):
         insert_params.c128_value = self.cache.req_to_token_pool.req_to_c128_sidecar[
             int(req.kv.req_pool_idx), :num_pages
         ].clone()
+        if _CACHE_DEBUG:
+            logger.info(
+                "[NPU-C128-CACHE] prepare rid=%s req_pool_idx=%s finished=%s "
+                "tokens=%s cache_len=%s group_tokens=%s eagle=%s protected=%s "
+                "swa_evicted=%s branching=%s window=%s",
+                req.rid,
+                req.kv.req_pool_idx,
+                is_finished,
+                token_ids_len,
+                cache_len,
+                group_tokens,
+                self.tree_core.is_eagle,
+                req.kv.cache_protected_len,
+                req.kv.swa_evicted_seqlen,
+                req.swa_branching_seqlen,
+                self.cache.sliding_window_size,
+            )
         return cache_len + 1 if self.tree_core.is_eagle and cache_len > 0 else cache_len
 
     def floor_cache_len(self, cache_len: int) -> int:
