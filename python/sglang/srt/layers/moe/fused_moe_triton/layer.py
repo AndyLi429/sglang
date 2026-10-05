@@ -543,6 +543,12 @@ class FusedMoE(torch.nn.Module):
         if expert_mask is not None:
             self.register_buffer("expert_mask_gpu", expert_mask, persistent=False)
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
+        if self._use_ascend_fuseep and get_exec().moe.fuseep_mode == 3:
+            from sglang.srt.hardware_backend.npu.moe.mega_moe import (
+                validate_mega_moe_layer,
+            )
+
+            validate_mega_moe_layer(self)
         # Expose swigluoai alpha/clamp on the layer so deepep's W8A8 apply
         # (apply_without_routing_weights) picks swiglu_oai_quant instead of plain
         # npu_swiglu. fuseep injects these via fuseep_activation (aclnnFusedDeepMoe

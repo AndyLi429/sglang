@@ -1486,6 +1486,8 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 @register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """Set shared-expert fusion requirements for the selected A2A backend."""
+    if view.moe_a2a_backend == "ascend_fuseep" and view.fuseep_mode == 3:
+        return {"disable_shared_experts_fusion": True}
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(

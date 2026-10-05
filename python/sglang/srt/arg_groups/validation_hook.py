@@ -93,6 +93,13 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.fuseep_mode == 3:
+        from sglang.srt.hardware_backend.npu.moe.mega_moe import (
+            validate_mega_moe_server_args,
+        )
+
+        validate_mega_moe_server_args(cfg)
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (

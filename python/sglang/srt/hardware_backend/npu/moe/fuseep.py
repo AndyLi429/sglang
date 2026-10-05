@@ -43,6 +43,11 @@ def forward_fuseep(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
 ) -> torch.Tensor:
+    if get_exec().moe.fuseep_mode == 3:
+        from sglang.srt.hardware_backend.npu.moe.mega_moe import forward_mega_moe
+
+        return forward_mega_moe(layer, hidden_states, topk_output)
+
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
