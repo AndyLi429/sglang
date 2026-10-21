@@ -662,9 +662,16 @@ class DSparkDraftMixin:
 
         bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:
-            from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
-                fused_kv_norm_rope_write,
-            )
+            from sglang.srt.utils import is_npu
+
+            if is_npu():
+                from sgl_kernel_npu.attention.dspark_kv_write import (
+                    fused_kv_norm_rope_write as fused_kv_norm_rope_write,
+                )
+            else:
+                from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
+                    fused_kv_norm_rope_write,
+                )
 
             w_all, meta, knw, cos_sin, eps, num_layers, kv_size, head_dim = bundle
             kv_all = F.linear(ctx_hidden, w_all)

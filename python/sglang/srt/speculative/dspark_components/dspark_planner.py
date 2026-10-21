@@ -7,7 +7,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
-    ScheduleVerifyLensTopk,
     compute_sort_survival,
 )
 from sglang.srt.distributed.utils import all_gather_single
@@ -41,6 +40,7 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
@@ -534,6 +534,14 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        if is_npu():
+            from sgl_kernel_npu.sample.dspark_schedule import (
+                ScheduleVerifyLensTopk as ScheduleVerifyLensTopk,
+            )
+        else:
+            from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+                ScheduleVerifyLensTopk as ScheduleVerifyLensTopk,
+            )
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,

@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_npu
 
 
 class RaggedVerifyMode(str, Enum):
@@ -99,9 +100,14 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         total_verify_tokens: Optional[int] = None,
         cap: Optional[int] = None,
     ) -> RaggedVerifyLayout:
-        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
-            BuildQoIndptr,
-        )
+        if is_npu():
+            from sgl_kernel_npu.sample.dspark_ragged import (
+                BuildQoIndptr as BuildQoIndptr,
+            )
+        else:
+            from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+                BuildQoIndptr,
+            )
 
         verify_lens = verify_lens.to(torch.int32)
         indptr = BuildQoIndptr.execute(verify_lens=verify_lens)
@@ -174,9 +180,14 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         clamped to N and the layout no longer covers the tier's leftover
         tokens -- those collapse into the consumer's ghost slot. Real tokens
         map identically under both variants."""
-        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
-            PaddedToBucket,
-        )
+        if is_npu():
+            from sgl_kernel_npu.sample.dspark_ragged import (
+                PaddedToBucket as PaddedToBucket,
+            )
+        else:
+            from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+                PaddedToBucket,
+            )
 
         padded = PaddedToBucket.execute(
             verify_lens=self.verify_lens,

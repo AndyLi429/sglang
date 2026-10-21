@@ -80,6 +80,10 @@ _PAD_NUM_HEADS = 64
 _is_npu = is_npu()
 
 
+if is_npu():
+    from sgl_kernel_npu.sample.dspark_draft import CommitKvProj as CommitKvProj
+
+
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:

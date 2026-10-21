@@ -9,12 +9,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 import torch_npu
-
-from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
-    BuildBlockSeqLensCausal,
-    BuildDsparkSwaPageIndices,
-    ComputeDsparkWindowGather,
+from sgl_kernel_npu.attention.dspark_metadata import (
+    BuildBlockSeqLensCausal as BuildBlockSeqLensCausal,
 )
+from sgl_kernel_npu.attention.dspark_metadata import (
+    BuildDsparkSwaPageIndices as BuildDsparkSwaPageIndices,
+)
+from sgl_kernel_npu.attention.dspark_metadata import (
+    ComputeDsparkWindowGather as ComputeDsparkWindowGather,
+)
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin

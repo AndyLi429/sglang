@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    MarkovGreedyStep,
-)
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -30,13 +27,6 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_npu, is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
-
-if is_npu():
-    from sgl_kernel_npu.sample import markov_sample_step
-else:
-    from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
-
-    markov_sample_step = MarkovSampleStep.execute
 
 if TYPE_CHECKING:
     from sglang.srt.models.dspark import BaseDSparkMarkovHead
@@ -202,6 +192,21 @@ def _draft_step(
     step: int,
     logits_out: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    # Keep helper-only imports (e.g. DFlash's resolve_greedy_mask) independent
+    # of the optional DSPark NPU operator package.
+    if is_npu():
+        from sgl_kernel_npu.sample import markov_sample_step as markov_sample_step
+        from sgl_kernel_npu.sample.dspark_draft import (
+            MarkovGreedyStep as MarkovGreedyStep,
+        )
+    else:
+        from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+            MarkovGreedyStep as MarkovGreedyStep,
+        )
+        from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+
+        markov_sample_step = MarkovSampleStep.execute
+
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()

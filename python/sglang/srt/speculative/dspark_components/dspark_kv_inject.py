@@ -10,6 +10,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    from sgl_kernel_npu.sample.dspark_verify_window import (
+        BuildCommitInjectLayout as BuildCommitInjectLayout,
+    )
 
 
 class TargetHiddenKvInjector:
@@ -140,9 +146,14 @@ class TargetHiddenKvInjector:
             and commit_lens.is_contiguous()
             and cache_loc.numel() == cache_loc_2d.numel()
         ):
-            from sglang.kernels.ops.speculative.dspark.commit_swa import (
-                committed_swa_locations,
-            )
+            if is_npu():
+                from sgl_kernel_npu.attention.dspark_commit_swa import (
+                    committed_swa_locations as committed_swa_locations,
+                )
+            else:
+                from sglang.kernels.ops.speculative.dspark.commit_swa import (
+                    committed_swa_locations,
+                )
 
             swa_loc = committed_swa_locations(
                 cache_loc,

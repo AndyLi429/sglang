@@ -56,6 +56,42 @@ _is_npu = is_npu()
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
 
+if _is_npu:
+    from sgl_kernel_npu.sample.dspark_accept import AcceptGreedy as AcceptGreedy
+    from sgl_kernel_npu.sample.dspark_accept import (
+        FinalizeAcceptLens as FinalizeAcceptLens,
+    )
+    from sgl_kernel_npu.sample.dspark_accept import (
+        SelectMixedAccept as SelectMixedAccept,
+    )
+    from sgl_kernel_npu.sample.dspark_accept import SoftmaxTemp as SoftmaxTemp
+    from sgl_kernel_npu.sample.dspark_simulated_bonus import (
+        simulated_bonus_sample as simulated_bonus_sample,
+    )
+    from sgl_kernel_npu.sample.dspark_simulated_bonus import (
+        simulated_bonus_sample_graph as simulated_bonus_sample_graph,
+    )
+    from sgl_kernel_npu.sample.dspark_verify_window import (
+        BuildCommitInjectLayout as BuildCommitInjectLayout,
+    )
+    from sgl_kernel_npu.sample.dspark_verify_window import (
+        BuildOutTokens as BuildOutTokens,
+    )
+    from sgl_kernel_npu.sample.dspark_verify_window import (
+        BuildRaggedVerifyWindow as BuildRaggedVerifyWindow,
+    )
+    from sgl_kernel_npu.sample.dspark_verify_window import (
+        ScatterCompactToStrided as ScatterCompactToStrided,
+    )
+    from sgl_kernel_npu.sample.dspark_verify_window import (
+        scatter_compact_to_strided_into as scatter_compact_to_strided_into,
+    )
+
+    from sglang.srt.hardware_backend.npu.dspark_sampling import (
+        AcceptSampling as AcceptSampling,
+    )
+
+
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
         return True
