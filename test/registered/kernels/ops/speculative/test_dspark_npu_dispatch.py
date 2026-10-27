@@ -1,6 +1,7 @@
 """Numerical coverage for DSpark's SGLang-to-NPU dispatch boundary."""
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -21,6 +22,14 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreed
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import BuildOutTokens
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.kernels.ops.speculative.row_argmax import row_argmax
+from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockProposer,
+    DraftNoise,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    DsparkDraftSampler,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -200,8 +209,9 @@ class TestDSparkNpuDispatch(CustomTestCase):
         self.assertTrue(torch.equal(actual.cpu(), score.argmax(-1)))
         self.assertTrue(torch.equal(kept.cpu(), value.to(base.dtype)))
 
-    def test_sampling_graph_replay_advances_native_rng(self):
+    def test_sampling_graph_replay_reads_refreshed_native_noise(self):
         base = torch.zeros(32, 257, device="npu")
+        noise = torch.empty_like(base).exponential_()
         kwargs = dict(
             base_logits=base,
             bias=base,
@@ -210,6 +220,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
             offset=torch.tensor([7], device="npu"),
             step=2,
             step_dtype=base.dtype,
+            exp_noise=noise,
         )
         MarkovSampleStep.execute(**kwargs)
         stream = torch.npu.Stream()
@@ -221,11 +232,111 @@ class TestDSparkNpuDispatch(CustomTestCase):
         torch.npu.current_stream().wait_stream(stream)
         previous = None
         for _ in range(3):
+            noise.exponential_()
             graph.replay()
             current = output.cpu()
+            self.assertTrue(torch.equal(current, (-noise.cpu().log()).argmax(-1)))
             if previous is not None:
                 self.assertFalse(torch.equal(current, previous))
             previous = current
+
+
+class TestDSparkNpuDraftGraph(CustomTestCase):
+    def test_replay_refreshes_noise_even_when_sampling_params_are_cached(self):
+        torch.manual_seed(42)
+        bs, gamma, vocab, hidden = 4, 3, 257, 8
+        head = VanillaMarkov(vocab_size=vocab, markov_rank=8).to(
+            device="npu", dtype=torch.bfloat16
+        )
+        weight = torch.randn(vocab, hidden, device="npu", dtype=torch.bfloat16)
+        model = SimpleNamespace(
+            markov_head=head,
+            confidence_head=None,
+            sample_from_anchor=True,
+            lm_head=SimpleNamespace(org_vocab_size=vocab),
+            compute_base_logits=lambda h: (h @ weight.T, h),
+        )
+        sampler = DsparkDraftSampler(
+            model=model,
+            gamma=gamma,
+            max_bs=2 * bs,
+            device="npu",
+            noise=DraftNoise(
+                key=5, offset=torch.zeros(1, dtype=torch.int64, device="npu")
+            ),
+            tp_sync=SimpleNamespace(sync=lambda site, value: value),
+            greedy_draft=False,
+        )
+        # Allocate before capture, as the real runner's warmup does.
+        sampler.step_logits = torch.empty(
+            2 * bs, gamma, vocab, device="npu", dtype=torch.bfloat16
+        )
+        features = torch.randn(bs * gamma, hidden, device="npu", dtype=torch.bfloat16)
+        input_ids = torch.randint(vocab, (bs * gamma,), device="npu")
+        info = SimpleNamespace(
+            is_all_greedy=False,
+            temperatures=torch.full((bs, 1), 0.7, device="npu"),
+            top_ks=torch.tensor([1, 50, 1, 50], device="npu"),
+        )
+        proposer = SimpleNamespace(
+            _staged_params_key=None,
+            num_staged_params_calls=0,
+            num_staged_params_skips=0,
+        )
+        DraftBlockProposer._stage_sampling_params(
+            proposer, sampler, bs=bs, sampling_info=info
+        )
+        stream = torch.npu.Stream()
+        stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(stream):
+            for _ in range(3):
+                sampler(features, input_ids)
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                sampler(features, input_ids)
+        torch.npu.current_stream().wait_stream(stream)
+        base = model.compute_base_logits(features)[0].view(bs, gamma, vocab)
+        for _ in range(3):
+            before = torch.npu.get_rng_state()
+            DraftBlockProposer._stage_sampling_params(
+                proposer, sampler, bs=bs, sampling_info=info
+            )
+            self.assertFalse(torch.equal(before, torch.npu.get_rng_state()))
+            graph.replay()
+            tokens = sampler.out[: bs * gamma].view(bs, gamma).cpu()
+            kept = sampler.step_logits[:bs].cpu()
+            noise = sampler.exp_noise[:, :bs].cpu()
+            prev = input_ids.view(bs, gamma)[:, 0]
+            temps = sampler.params.step_temperatures[:bs].cpu()
+            for step in range(gamma):
+                bias, _ = head.step_bias(prev, hidden_states=None, state=None)
+                value = (base[:, step].float() + bias.float()).to(torch.bfloat16).cpu()
+                score = (
+                    value.float() / temps.clamp_min(1e-5)[:, None] - noise[step].log()
+                )
+                score[temps == 0] = value[temps == 0].float()
+                expected = score.argmax(-1)
+                self.assertTrue(torch.equal(tokens[:, step], expected))
+                self.assertTrue(torch.equal(kept[:, step], value))
+                prev = expected.npu()
+        self.assertEqual(proposer.num_staged_params_skips, 3)
+        greedy = SimpleNamespace(
+            is_all_greedy=True,
+            temperatures=info.temperatures,
+            top_ks=torch.ones(bs, device="npu", dtype=torch.int64),
+        )
+        before = torch.npu.get_rng_state()
+        DraftBlockProposer._stage_sampling_params(
+            proposer, sampler, bs=bs, sampling_info=greedy
+        )
+        self.assertTrue(torch.equal(before, torch.npu.get_rng_state()))
+        graph.replay()
+        self.assertTrue(
+            torch.equal(
+                sampler.out[: bs * gamma].view(bs, gamma),
+                sampler.step_logits[:bs].float().argmax(-1),
+            )
+        )
 
 
 if __name__ == "__main__":

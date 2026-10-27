@@ -78,6 +78,17 @@ class DsparkDraftSampler:
         self.greedy_draft = greedy_draft
         self._noise = noise
         self._tp_sync = tp_sync
+        # Filled before replay, not inside capture (native RNG is not graph-safe
+        # on every torch-npu build). Greedy rows do not read these values.
+        self.exp_noise = (
+            torch.ones(
+                (self.gamma, self.max_bs, _step_logits_width(self.model)),
+                dtype=torch.float32,
+                device=device,
+            )
+            if torch.device(device).type == "npu" and not greedy_draft
+            else None
+        )
         # Staged before each replay.
         self.params = DraftParams(
             temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
@@ -140,6 +151,14 @@ class DsparkDraftSampler:
         """Must run before the draft graph replay that reads these buffers."""
         resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
 
+    def refresh_sampling_noise(self, sampling_info) -> None:
+        if (
+            self.exp_noise is not None
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+        ):
+            self.exp_noise.exponential_()
+
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
         if self.sample_from_anchor:
@@ -185,10 +204,11 @@ class DsparkDraftSampler:
             step_temperatures=self.params.step_temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            logits_out=None
-            if self.greedy_draft
-            else self._step_logits(base_logits)[:bs],
+            logits_out=(
+                None if self.greedy_draft else self._step_logits(base_logits)[:bs]
+            ),
             greedy_draft=self.greedy_draft,
+            exp_noise=None if self.exp_noise is None else self.exp_noise[:, :bs],
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features

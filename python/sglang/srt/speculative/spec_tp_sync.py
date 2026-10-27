@@ -6,7 +6,7 @@ from enum import IntEnum
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.utils import get_available_gpu_memory, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,11 @@ assert not _RETIRED.keys() & (_BY_SLUG.keys() | _BY_NUMBER.keys())
 
 def _resolve(name: str) -> frozenset[SpecTpSyncSite]:
     if name in _PRESETS:
-        return _PRESETS[name]
+        sites = _PRESETS[name]
+        if name == "rng" and is_npu():
+            # Native draft RNG need not agree across TP ranks, unlike Philox.
+            sites = sites | {SpecTpSyncSite.DSPARK_DRAFT}
+        return sites
     if name in _RETIRED:
         site = _RETIRED[name]
         logger.warning(

@@ -202,6 +202,8 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
+    exp_noise: Optional[torch.Tensor] = None,
+    has_sampled_rows: Optional[bool] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
@@ -227,6 +229,8 @@ def _draft_step(
             gather_logits=shard.gather,
         )
     )
+    if exp_noise is not None:
+        sharded["exp_noise"] = exp_noise
     tokens = MarkovSampleStep.execute(
         base_logits=base_logits,
         bias=bias,
@@ -237,7 +241,7 @@ def _draft_step(
         step_dtype=markov_head.step_logits_dtype(base_logits.dtype),
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
-        has_sampled_rows=None if logits_out is not None else False,
+        has_sampled_rows=has_sampled_rows if logits_out is not None else False,
         **sharded,
     )
     return tokens, state
@@ -254,6 +258,8 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    exp_noise: Optional[torch.Tensor] = None,
+    has_sampled_rows: Optional[bool] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
     written to ``logits_out`` or allocated here; a greedy draft keeps none."""
@@ -278,6 +284,8 @@ def draft_markov_block(
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
+            exp_noise=None if exp_noise is None else exp_noise[step],
+            has_sampled_rows=has_sampled_rows,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -311,6 +319,12 @@ def sample_draft_block(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        has_sampled_rows=(
+            False
+            if base_logits.device.type == "npu"
+            and (sampling_info is None or sampling_info.is_all_greedy)
+            else None
+        ),
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
@@ -385,6 +399,8 @@ class DraftBlockProposer:
     def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
         """The draft graph's sampling params, restaged only when the sampler, bs or
         the batch's temperature / top-k tensors changed since the last stage."""
+        # Parameter copies can be skipped; random draws must still advance.
+        draft_sampler.refresh_sampling_noise(sampling_info)
         key = (
             draft_sampler,
             bs,

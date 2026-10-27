@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite, parse_spec_tp_sync
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,9 +21,13 @@ class TestParseSpecTpSync(CustomTestCase):
         self.assertNotIn(DRAFT, sites)
         self.assertEqual(sites, frozenset(SpecTpSyncSite) - {DRAFT})
 
-    def test_draft_noise_is_not_an_rng_site(self):
-        # Ranks with the same logits draw the same draft noise.
-        self.assertNotIn(DRAFT, parse_spec_tp_sync("rng"))
+    def test_only_native_npu_draft_noise_needs_rng_sync(self):
+        for npu in (False, True):
+            with (
+                self.subTest(npu=npu),
+                patch("sglang.srt.speculative.spec_tp_sync.is_npu", return_value=npu),
+            ):
+                self.assertEqual(DRAFT in parse_spec_tp_sync("rng"), npu)
         self.assertIn(DRAFT, parse_spec_tp_sync("dspark-draft"))
 
 

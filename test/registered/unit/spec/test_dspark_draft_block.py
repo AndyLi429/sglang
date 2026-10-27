@@ -216,13 +216,25 @@ class TestDraftParamsRestage(CustomTestCase):
         sampler = SimpleNamespace(
             stage_sampling_params=lambda **kw: staged.append(
                 (kw["bs"], kw["sampling_info"])
-            )
+            ),
+            exp_noise=torch.ones(2, 4, 17),
         )
-        info = SimpleNamespace(temperatures=torch.ones(4), top_ks=torch.ones(4))
+
+        def refresh(sampling_info):
+            ds.DsparkDraftSampler.refresh_sampling_noise(sampler, sampling_info)
+
+        sampler.refresh_sampling_noise = refresh
+        info = SimpleNamespace(
+            temperatures=torch.ones(4), top_ks=torch.ones(4), is_all_greedy=False
+        )
 
         def stage(sampler, bs, sampling_info):
+            previous = sampler.exp_noise.clone()
             DraftBlockProposer._stage_sampling_params(
                 proposer, sampler, bs=bs, sampling_info=sampling_info
+            )
+            self.assertEqual(
+                torch.equal(previous, sampler.exp_noise), sampling_info is None
             )
 
         stage(sampler, 4, info)
@@ -230,7 +242,11 @@ class TestDraftParamsRestage(CustomTestCase):
         info.temperatures = info.temperatures[:3]  # rebound, as filter_batch does
         stage(sampler, 3, info)
         stage(sampler, 2, info)  # another bs
-        other = SimpleNamespace(stage_sampling_params=sampler.stage_sampling_params)
+        other = SimpleNamespace(
+            stage_sampling_params=sampler.stage_sampling_params,
+            refresh_sampling_noise=refresh,
+            exp_noise=sampler.exp_noise,
+        )
         stage(other, 2, info)  # another sampler
         stage(other, 2, None)
         stage(other, 2, None)  # no sampling info twice: skipped
