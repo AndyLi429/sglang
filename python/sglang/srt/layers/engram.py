@@ -1474,6 +1474,7 @@ def engram_gate(
     clamp_value: float,
     input_ids: Optional[torch.Tensor] = None,
     image_token_id: Optional[int] = None,
+    gate_basis: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy, except in rows
@@ -1481,7 +1482,8 @@ def engram_gate(
     # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
     # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
-        _cuda_kernels(x)
+        gate_basis is None
+        and _cuda_kernels(x)
         and x.ndim == 3
         and x.dtype == kv.dtype
         and x.dtype in (torch.bfloat16, torch.float32)
@@ -1496,7 +1498,10 @@ def engram_gate(
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
     weight = q_weight.float() * k_weight.float()
-    h = x.float()
+    residual = x.float()
+    # ModelSlim QuaRot exports keep key/gate in the original basis, but
+    # already rotate value. Undo the rotation only for the gate's query.
+    h = residual if gate_basis is None else residual @ gate_basis.T
     # Normalized per (token, hc copy) over dim, not jointly over the copies.
     rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
         key.square().mean(-1) + eps
@@ -1504,7 +1509,7 @@ def engram_gate(
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
-    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (residual + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
     if input_ids is not None:
         out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
     return out
@@ -1562,6 +1567,7 @@ class Engram(nn.Module):
         *,
         input_ids: torch.Tensor,
         cp_all_tokens: bool = False,
+        gate_basis: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
         layer."""
@@ -1593,6 +1599,7 @@ class Engram(nn.Module):
             self.clamp_value,
             image_ids,
             self.image_token_id,
+            gate_basis,
         )
 
     def embed_rows(
