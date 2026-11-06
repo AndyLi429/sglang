@@ -1325,11 +1325,13 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu", "xpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu", "npu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, XPU, or NPU devices."
         )
 
+    if cfg.device == "npu":
+        _handle_npu_ngram(server_args)
     _disable_overlap_schedule_for_cpu(server_args)
 
     if cfg.max_running_requests is None:
@@ -1410,6 +1412,67 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."
         )
+
+
+def _handle_npu_ngram(server_args: ServerArgs) -> None:
+    from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+
+    cfg = resolving_view(server_args)
+    model = model_config_of(server_args)
+    if (
+        model.attention_arch != AttentionArch.MLA
+        or is_deepseek_dsa(model.hf_config)
+        or model.hf_config.architectures[0]
+        not in ("DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM")
+        or set(attention_backends_of(cfg)) != {"ascend"}
+    ):
+        raise ValueError("NPU NGRAM requires dense DeepSeek MLA with ascend attention.")
+    if (
+        cfg.speculative_ngram_min_bfs_breadth != 1
+        or cfg.speculative_ngram_max_bfs_breadth != 1
+        or cfg.speculative_ngram_external_corpus_path is not None
+    ):
+        raise ValueError(
+            "NPU NGRAM requires a single chain (both BFS breadths = 1), without external corpus."
+        )
+    if (
+        attn_dp_enabled_of(cfg)
+        or cfg.attn_cp_size != 1
+        or cfg.attn_dcp_size != 1
+        or cfg.pp_size != 1
+        or cfg.disaggregation_mode != "null"
+    ):
+        raise ValueError(
+            "NPU NGRAM does not support DP attention, CP, PP, or PD disaggregation."
+        )
+    if (
+        cfg.enable_torch_compile
+        or cfg.speculative_adaptive
+        or cfg.enable_two_batch_overlap
+        or cfg.speculative_use_rejection_sampling
+    ):
+        raise ValueError(
+            "NPU NGRAM requires eager execution without adaptive speculation."
+        )
+    if cfg.enable_unified_memory or envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+        raise ValueError(
+            "NPU NGRAM requires the native MLA KV pool without sparse KV offload."
+        )
+    if envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
+        raise ValueError("NPU NGRAM does not support simulated acceptance.")
+    graph_config = cfg.cuda_graph_config
+    for phase in Phase.ALL:
+        graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
+    declare_resolution(
+        server_args,
+        "_handle_npu_ngram",
+        disable_overlap_schedule=True,
+        cuda_graph_config=graph_config,
+    )
+    logger.warning(
+        "NPU NGRAM uses greedy single-chain verification; overlap and graphs are disabled."
+    )
 
 
 def _maybe_disable_adaptive(server_args: ServerArgs) -> None:

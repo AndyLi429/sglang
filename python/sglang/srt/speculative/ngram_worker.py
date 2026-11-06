@@ -7,9 +7,6 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
-from sglang.kernels.ops.speculative.reconstruct_tree import (
-    reconstruct_indices_from_tree_mask_func,
-)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -25,6 +22,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.ngram_chain import (
+    bound_chain_acceptance,
+    chain_lengths,
+    prepare_chain_metadata,
+)
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -34,10 +36,16 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
+_is_npu = is_npu()
+
+if not _is_npu:
+    from sglang.kernels.ops.speculative.reconstruct_tree import (
+        reconstruct_indices_from_tree_mask_func,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +327,7 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if USE_FULL_MASK and not _is_cpu:
+        if USE_FULL_MASK and not (_is_cpu or _is_npu):
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -334,21 +342,34 @@ class NGRAMWorker(BaseSpecWorker):
         # Staged for the grammar bitmask, derived after the verify launch below.
         self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
 
-        # generate positions and some indices using tree_mask
-        reconstruct_indices_from_tree_mask_func(
-            tree_mask,
-            batch.seq_lens,
-            positions,  # mutable
-            retrieve_index,  # mutable
-            retrieve_next_token,  # mutable
-            retrieve_next_sibling,  # mutable
-            bs,
-            self.draft_token_num,
-        )
+        if _is_npu:
+            self.chain_lengths = torch.from_numpy(
+                chain_lengths(req_drafts, mask, self.draft_token_num)
+            ).to(self.device)
+            metadata = prepare_chain_metadata(
+                batch.seq_lens, self.chain_lengths, self.draft_token_num
+            )
+            for dst, src in zip(
+                (positions, retrieve_index, retrieve_next_token, retrieve_next_sibling),
+                metadata,
+            ):
+                dst.copy_(src)
+        else:
+            # generate positions and some indices using tree_mask
+            reconstruct_indices_from_tree_mask_func(
+                tree_mask,
+                batch.seq_lens,
+                positions,  # mutable
+                retrieve_index,  # mutable
+                retrieve_next_token,  # mutable
+                retrieve_next_sibling,  # mutable
+                bs,
+                self.draft_token_num,
+            )
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK and not _is_cpu:
+        if USE_FULL_MASK and not (_is_cpu or _is_npu):
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -413,6 +434,10 @@ class NGRAMWorker(BaseSpecWorker):
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
+        if _is_npu and not batch.sampling_info.is_all_greedy:
+            raise ValueError("NPU NGRAM only supports greedy sampling (temperature=0).")
+        if _is_npu and (batch.has_grammar or batch.return_logprob):
+            raise ValueError("NPU NGRAM does not yet support grammar or logprobs.")
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
@@ -474,6 +499,10 @@ class NGRAMWorker(BaseSpecWorker):
                 grammar_mask,
                 watermark_state=self.model_runner.watermark_state,
             )
+            if _is_npu:
+                accept_lens, accept_index = bound_chain_acceptance(
+                    accept_lens, accept_index, self.chain_lengths
+                )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -498,12 +527,15 @@ class NGRAMWorker(BaseSpecWorker):
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
             num_correct_drafts_per_req = accept_lens - 1
-            move_accept_tokens_to_target_kvcache(
-                batch,
-                accept_index,
-                num_correct_drafts_per_req,
-                self.token_to_kv_pool_allocator,
-            )
+            # NPU chains already occupy the committed prefix of the verify
+            # window, exactly as MTP topk=1. The scheduler owns tail reclamation.
+            if not _is_npu:
+                move_accept_tokens_to_target_kvcache(
+                    batch,
+                    accept_index,
+                    num_correct_drafts_per_req,
+                    self.token_to_kv_pool_allocator,
+                )
             if batch.return_logprob:
                 compute_spec_logprobs(
                     batch,

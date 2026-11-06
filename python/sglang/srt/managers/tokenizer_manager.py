@@ -1627,6 +1627,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            if (
+                get_device().device == "npu"
+                and get_spec().speculative_algorithm == "NGRAM"
+            ):
+                from sglang.srt.speculative.ngram_chain import (
+                    validate_npu_ngram_request,
+                )
+
+                validate_npu_ngram_request(sampling_params, obj.return_logprob)
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
