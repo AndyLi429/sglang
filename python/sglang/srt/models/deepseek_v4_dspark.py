@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
+_is_npu_a3 = _is_npu and not is_npu_arch35()
 
 
 def apply_rotary_emb(
@@ -139,7 +140,8 @@ class DSparkAttention(MqaAttentionBase):
             prefix=add_prefix("attn", prefix),
         )
 
-        self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
+        # A3 uses the same BF16 NPU RoPE/projection path as the target model.
+        self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get() and not _is_npu_a3
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
@@ -196,7 +198,7 @@ class DSparkAttention(MqaAttentionBase):
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if not self.q_head_norm:
+        if not self.q_head_norm and not _is_npu_a3:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
@@ -228,7 +230,8 @@ class DSparkAttention(MqaAttentionBase):
                     Dsv4NpuRoPE,
                 )
 
-                q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
+                if self.q_head_norm:
+                    q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
                 cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
                     positions,
                     q.dtype,
@@ -293,7 +296,7 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS:
+        elif self.n_local_heads < _PAD_NUM_HEADS and not _is_npu_a3:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -327,7 +330,7 @@ class DSparkAttention(MqaAttentionBase):
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink()
+        attn_sink = self._local_attn_sink(self.n_local_heads if _is_npu_a3 else None)
 
         o = attn_backend.forward(
             q=q,
@@ -969,10 +972,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import mhc_combine
+            if _is_npu_a3:
+                x = mhc.combine_premix(x, pre)
+            else:
+                from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            # The kernel widens each element to fp32 as it loads it.
-            x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
+                # The kernel widens each element to fp32 as it loads it.
+                x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
