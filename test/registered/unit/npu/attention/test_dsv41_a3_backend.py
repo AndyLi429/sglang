@@ -7,15 +7,21 @@ the numerical correctness of the external kernels.
 
 import ast
 import builtins
+import concurrent.futures
 import functools
 import os
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, stage="base-a", runner_config="cpu")
 
 ROOT = Path(__file__).resolve().parents[5]
 BACKEND = (
@@ -549,7 +555,9 @@ class TestA3GraphInitContract(unittest.TestCase):
             "ForwardMetadata": SimpleNamespace,
             "is_npu_arch35": lambda: False,
         }
-        exec(compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace)  # noqa: S102
+        exec(
+            compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace
+        )  # noqa: S102
         backend_type = type(
             "GraphInitBackend", (), {name: namespace[name] for name in names}
         )
@@ -580,7 +588,9 @@ class TestA3GraphInitContract(unittest.TestCase):
                 for name in ("c1a", "c4a", "c128a", "li_quant")
             }
         )
-        b.graph_metadata["c4_topk_indices"] = torch.full((2, 512), -1, dtype=torch.int32)
+        b.graph_metadata["c4_topk_indices"] = torch.full(
+            (2, 512), -1, dtype=torch.int32
+        )
         self.forward_batch = SimpleNamespace(
             batch_size=2,
             seq_lens=torch.tensor([129, 128], dtype=torch.int32),
@@ -706,6 +716,180 @@ class TestA3OpLoading(unittest.TestCase):
                 self.assertIn("sgl_kernel_npu", imports)
                 self.assertIn("custom_ops", imports)
                 self.assertEqual("cann_ops_transformer" in imports, arch35)
+
+
+class TestModelSlimProjectionLoading(unittest.TestCase):
+    def setUp(self):
+        self.config = SimpleNamespace(
+            model_type="deepseek_v41",
+            hidden_size=4,
+            head_dim=2,
+            qk_rope_head_dim=2,
+            num_attention_heads=64,
+            num_key_value_heads=1,
+            o_groups=8,
+            q_lora_rank=2,
+            o_lora_rank=2,
+            rms_norm_eps=1e-6,
+            q_head_norm=False,
+            compress_ratios=[1],
+            n_routed_experts=1,
+            num_hidden_layers=1,
+        )
+        self.prefix = "model.layers.0.self_attn"
+        self.quant = SimpleNamespace(
+            get_name=lambda: "modelslim",
+            quant_description={
+                f"{self.prefix}.{name}.weight": "W8A8_DYNAMIC"
+                for name in ("wq_a", "wkv")
+            },
+        )
+
+        def linear(input_size, output_size, *, quant_config, prefix, **kwargs):
+            module = torch.nn.Module()
+            quantized = (
+                quant_config is not None
+                and prefix + ".weight" in quant_config.quant_description
+            )
+            module.weight = torch.nn.Parameter(
+                torch.zeros(
+                    output_size,
+                    input_size,
+                    dtype=torch.int8 if quantized else torch.float32,
+                ),
+                requires_grad=False,
+            )
+            if quantized:
+                module.weight_scale = torch.nn.Parameter(torch.ones(output_size, 1))
+            return module
+
+        self.ns = _definitions(
+            MODEL,
+            {"MqaAttentionBase", "_fuse_deepseek_v4_wqkv_a_pair"},
+            {
+                "torch": torch,
+                "nn": torch.nn,
+                "functools": functools,
+                "contextmanager": contextmanager,
+                "envs": SimpleNamespace(SGLANG_OPT_FUSE_WQA_WKV=Mock(get=lambda: True)),
+                "get_parallel": lambda: SimpleNamespace(
+                    attn_tp_rank=0, attn_tp_size=2, tp_size=16
+                ),
+                "wo_a_fp8_gemm_enabled": lambda quant: False,
+                "use_npu_arch35_mxfp8_wo_a": lambda *args: False,
+                "ReplicatedLinear": linear,
+                "add_prefix": lambda name, prefix: f"{prefix}.{name}",
+                # Only initialize the projections; the rest is unrelated to loading.
+                "RMSNorm": Mock(side_effect=StopIteration),
+            },
+        )
+        model_class = next(
+            node
+            for node in ast.parse(MODEL.read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepseekV4ForCausalLM"
+        )
+        model_class.body = [
+            node
+            for node in model_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("load_weights", "remap_weight_name_to_dpsk_hf_format")
+        ]
+        self.ns.update(
+            concurrent=concurrent,
+            _is_npu=True,
+            FusedMoE=SimpleNamespace(make_expert_params_mapping=lambda **kwargs: []),
+            _prepare_deepseek_v4_weights=lambda weights, quant: weights,
+            is_wint4afp8_or_wint4a16_config=lambda quant: False,
+            DEEPSEEK_V4_STACKED_PARAMS_MAPPING=[],
+            should_async_load=lambda weight: False,
+            get_layer_id=lambda name: 0,
+            default_weight_loader=lambda param, value: param.data.copy_(value),
+            maybe_executor_submit=lambda **kwargs: kwargs["func"](*kwargs["func_args"]),
+            _clone_if_runai_streamed_tensor=lambda value: value,
+            logger=Mock(),
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias("annotations")], level=0
+                ),
+                model_class,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(MODEL), "exec"), self.ns)
+
+    def _projections(self, quant):
+        cls = self.ns["MqaAttentionBase"]
+        attention = cls.__new__(cls)
+        with self.assertRaises(StopIteration):
+            cls.__init__(attention, self.config, 0, quant, self.prefix)
+        return attention
+
+    def test_modelslim_preserves_separate_quantized_projections(self):
+        attention = self._projections(self.quant)
+        self.assertFalse(attention.fuse_wqa_wkv)
+        self.assertEqual(attention.wq_a.weight.dtype, torch.int8)
+        self.assertEqual(attention.wkv.weight.dtype, torch.int8)
+        self.assertTrue(hasattr(attention.wq_a, "weight_scale"))
+        self.assertTrue(hasattr(attention.wkv, "weight_scale"))
+
+    def test_modelslim_loader_keeps_scales_and_projection_values(self):
+        attention = self._projections(self.quant)
+        model = self.ns["DeepseekV4ForCausalLM"]()
+        model.config = self.config
+        model.quant_config = self.quant
+        model.wo_a_fp8 = model.use_npu_arch35_mxfp8_wo_a = False
+        model.num_fused_shared_experts = 0
+        model.vision = None
+        model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        model.model.layers[0].self_attn = attention
+        model.post_load_weights = model._prewarm_mhc_kernels = Mock()
+        weight = torch.tensor([[1, 2, -3, 4], [-4, 3, 2, 1]], dtype=torch.int8)
+        q_scale = torch.tensor([[0.125], [0.25]])
+        kv_scale = torch.tensor([[0.5], [0.0625]])
+        model.load_weights(
+            [
+                ("layers.0.attn.wq_a.weight", weight),
+                ("layers.0.attn.wkv.weight", -weight),
+                ("layers.0.attn.wq_a.weight_scale", q_scale),
+                ("layers.0.attn.wkv.weight_scale", kv_scale),
+                ("layers.0.attn.attn_sink", torch.zeros(64)),
+            ]
+        )
+        x = torch.tensor([[1.0, -2.0, 3.0, -1.0]])
+        if attention.fuse_wqa_wkv:
+            actual = F.linear(x, attention.wqkv_a.weight.float())
+        else:
+            actual = torch.cat(
+                [
+                    F.linear(x, layer.weight.float() * layer.weight_scale)
+                    for layer in (attention.wq_a, attention.wkv)
+                ],
+                dim=-1,
+            )
+        expected = torch.cat(
+            [
+                F.linear(x, weight.float() * q_scale),
+                F.linear(x, -weight.float() * kv_scale),
+            ],
+            dim=-1,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.ns["logger"].warning.assert_not_called()
+
+    def test_native_fp8_fusion_is_preserved(self):
+        quant = SimpleNamespace(get_name=lambda: "fp8", quant_description={})
+        self.assertTrue(self._projections(quant).fuse_wqa_wkv)
+        self.assertTrue(self._projections(None).fuse_wqa_wkv)
+
+    def test_explicitly_fused_modelslim_export_is_preserved(self):
+        self.quant.quant_description[f"{self.prefix}.wqkv_a.weight"] = "W8A8_DYNAMIC"
+        attention = self._projections(self.quant)
+        self.assertTrue(attention.fuse_wqa_wkv)
+        self.assertEqual(attention.wqkv_a.weight.dtype, torch.int8)
 
 
 class TestA3CompressorContract(unittest.TestCase):
