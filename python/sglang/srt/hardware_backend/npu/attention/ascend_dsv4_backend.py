@@ -92,27 +92,6 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
     }
 
 
-def _ensure_dsv41_static_verify_mode() -> None:
-    """Require fixed-width low-ratio verification on both NPU generations.
-
-    The low-ratio verify metadata pipeline assumes the STATIC request-major
-    rectangle (``bs * (num_draft_tokens + 1)`` rows of contiguous positions
-    per request), which COMPACT's ragged variable-length layout breaks.
-    CAP_ACCEPT only changes the accept-length accounting, so it rides the
-    STATIC execution path for free.  Failing at startup -- instead of at the
-    first verify step -- keeps the misconfiguration visible before any
-    compressed state is written.
-    """
-    if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
-        return
-    raise RuntimeError(
-        "DeepSeek-V4.1 on NPU does not support "
-        "SGLANG_RAGGED_VERIFY_MODE=compact: the low-ratio verify metadata "
-        "requires the STATIC request-major verify layout. Unset "
-        "SGLANG_RAGGED_VERIFY_MODE (or set it to 'static' or 'cap-accept')."
-    )
-
-
 @functools.cache
 def _ds41_ops():
     """Resolve seven migrated DSL functions and the ops-transformer compressor
@@ -2947,6 +2926,8 @@ class DeepseekV4AscendAttnBackend(
         # QSLI's 544B/8-token K records, allocated on first write; see
         # _dsv41_qsli_cache.
         self._dsv41_qsli_caches: dict = {}
+        # Preserve the model generation before a draft worker clears its ratios.
+        self._dsv4_is_v41_model = any(ratio in (1, 2) for ratio in hf.compress_ratios)
         if getattr(model_runner, "is_draft_worker", False):
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
@@ -2964,9 +2945,6 @@ class DeepseekV4AscendAttnBackend(
                 f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
                 "the attention TP size."
             )
-        if self._dsv4_has_low_ratio:
-            # Both A3 indexers and the A5 metadata path require fixed Q blocks.
-            _ensure_dsv41_static_verify_mode()
         if self._dsv4_has_low_ratio and not is_npu_arch35():
             _dsv41_a3_ops()
             # Resolve the public API here; graph warmup loads the lazy binding.
@@ -2990,6 +2968,7 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
+        self._validate_spec_support(model_runner.spec_algorithm)
         if getattr(model_runner, "is_draft_worker", False):
             self._validate_draft_window_rows()
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
@@ -3001,6 +2980,39 @@ class DeepseekV4AscendAttnBackend(
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
+
+    def _validate_spec_support(self, spec_algorithm) -> None:
+        """The gate for every speculative-decoding constraint of this backend.
+
+        DeepSeek-V4.1 (ratios 1/2) runs DSpark on the STATIC verify layout only.
+        Its low-ratio rows assume the STATIC request-major rectangle, so another
+        spec algorithm, or a ragged mode (CAP_ACCEPT / COMPACT), would scatter
+        this step's compressed rows to stale slots; both are rejected at startup.
+        The generation is read from ``_dsv4_is_v41_model`` rather than the ratio
+        list, which a draft worker empties.
+
+        DSV4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH. A DFLASH verify
+        batch's ``seq_lens`` already carry the draft block, so the graph max_len
+        skips the draft add for it (``_is_dflash_verify``).
+        """
+        if spec_algorithm is None or spec_algorithm.is_none():
+            return
+        if not self._dsv4_is_v41_model:
+            return
+        # ``is_dflash_family()`` also covers DSpark (the family shares
+        # DFlashVerifyInfo); gate on ``is_dspark()`` so DSpark passes.
+        if not spec_algorithm.is_dspark():
+            raise ValueError(
+                "DeepSeek-V4.1 on NPU supports only DSpark speculative "
+                f"decoding (static mode), got {spec_algorithm!r}."
+            )
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "DeepSeek-V4.1 on NPU supports only DSpark speculative "
+                "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
+                f"got SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value!r}."
+            )
 
     def _validate_draft_window_rows(self) -> None:
         """A draft worker's window rows must match the V4 sparse-attention op.
