@@ -1970,6 +1970,9 @@ class KVCacheConfigurator:
 
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
+            if self.is_draft_worker:
+                # The draft forward reads V4 rows even with a V4.1 target.
+                kv_layout_kwargs = {"npu_window_generation": "v4"}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()

@@ -26,6 +26,10 @@ for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.indexer",
+    "sgl_kernel_npu.operators.mem_cache",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -50,11 +54,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     LowRatioCompressAscendBackendMixin,
 )
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
-from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
@@ -66,7 +70,7 @@ from sglang.srt.mem_cache.registry import create_unified_radix_cache
 class _Ds41Stub(ModuleType):
     """Stand-in for the entry points ``_ds41_ops`` returns.
 
-    Only the two metadata entry points are exercised by these tests; both return
+    Only the metadata entry points are exercised by these tests; each returns
     a real int32 tensor so the graph-buffer ``torch.zeros_like`` probe works.
     """
 
@@ -292,29 +296,24 @@ class TestPoolFactory(unittest.TestCase):
         # One row per slot: the window page is the global page.
         self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 128)
 
-    def test_ratio1_compressed_pool_is_fp4_despite_the_global_page(self):
-        out, calls = self._make(
-            page_size=128,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-
-    def test_ratio2_compressed_pool_is_fp4(self):
-        out, calls = self._make(
-            page_size=64,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-        # A ratio-2 compressed page holds global // 2 rows.
-        self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 64)
+    def test_compressed_pools_are_fp4(self):
+        # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
+        # global // 2 rows. Both take the compressed row format.
+        for page_size in (128, 64):
+            with self.subTest(page_size=page_size):
+                out, calls = self._make(
+                    page_size=page_size,
+                    global_page_size=128,
+                    kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(out, "DSV41NPUSingleKVPool")
+                self.assertIs(
+                    calls["DSV41NPUSingleKVPool"]["layout"],
+                    NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(
+                    calls["DSV41NPUSingleKVPool"]["kernel_page_size"], page_size
+                )
 
     def test_v4_window_pool_arrives_pre_tagged(self):
         out, calls = self._make(
@@ -2167,7 +2166,8 @@ class TestQliKvLens(unittest.TestCase):
             batch_size=2,
             draft_token_num=3,
         )
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # ratio 1 first, then ratio 2; the bound is the final length:
         # 9//2 == 4 covers the group pos 7 closes.
         self.assertIsNone(seen[0]["cmp_residual_k"])
@@ -2193,7 +2193,8 @@ class TestQliKvLens(unittest.TestCase):
             positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2
         )
         batch.forward_mode = _Mode("decode")
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # Decode ignores the final mirror.
         self.assertEqual(seen[1]["seqused_k"].tolist(), [3, 2])
 

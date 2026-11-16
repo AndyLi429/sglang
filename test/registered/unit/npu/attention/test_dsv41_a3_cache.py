@@ -9,6 +9,7 @@ import ast
 import dataclasses
 import math
 import runpy
+import sys
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -25,7 +26,7 @@ register_cpu_ci(est_time=8, stage="base-a", runner_config="cpu")
 ROOT = Path(__file__).resolve().parents[5]
 POOL_FILE = ROOT / "python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py"
 BUDGET_FILE = ROOT / "python/sglang/srt/model_executor/pool_configurator.py"
-LAYOUT_FILE = ROOT / "python/sglang/srt/hardware_backend/npu/dsv4/npu_kv_layout.py"
+LAYOUT_FILE = ROOT / "python/sglang/srt/hardware_backend/npu/dsv4/dsv4_kv_layout.py"
 NPUDSV4KVLayout = runpy.run_path(str(LAYOUT_FILE))["NPUDSV4KVLayout"]
 STATE_FILE = ROOT / "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py"
 
@@ -123,6 +124,104 @@ def _index_pool(classes, size=256):
     pool.memory_saver_adapter = SimpleNamespace(region=lambda _: nullcontext())
     pool._create_buffer()
     return pool
+
+
+class TestV4RuntimeKVLayout(unittest.TestCase):
+    def test_runtime_width_sizes_the_pool_and_its_descriptor(self):
+        classes = _pool_classes(arch35=True)
+        pool = object.__new__(classes["NPUDeepSeekV4SingleKVPool"])
+        pool.qk_nope_head_dim = 448
+        pool.qk_rope_head_dim = 64
+        pool.layout = NPUDSV4KVLayout.V4_FP8
+        pool.store_dtype = torch.bfloat16
+        pool.kernel_page_size = 128
+        pool.size = 256
+        pool.device = "cpu"
+        stub = ModuleType("sgl_kernel_npu.operators.mem_cache")
+        for width in (608, 640):
+            with self.subTest(width=width):
+                packed_dim = Mock(return_value=width)
+                stub.get_npu_kv_quant_path = lambda: SimpleNamespace(
+                    packed_dim=packed_dim
+                )
+                with patch.dict(sys.modules, {stub.__name__: stub}):
+                    buf = pool.create_buffer(num_pages=0)
+                    self.assertEqual(pool.dsv4_arch35_packed_kv_dim, width)
+                self.assertEqual(buf.shape[-1], width)
+                self.assertEqual(pool.kv_cache_total_dim, width)
+                self.assertEqual(pool.bytes_per_page_padded, 128 * width)
+                self.assertEqual(packed_dim.call_args.args, (448, 64))
+
+    def test_draft_pin_overrides_the_target_compression_ratios(self):
+        for arch35 in (False, True):
+            with self.subTest(arch35=arch35):
+                classes = _pool_classes(arch35=arch35)
+                pool = object.__new__(classes["DSV4NPUTokenToKVPool"])
+                pool.compression_ratios = [1, 2]
+                pool._npu_window_generation = "v4"
+                self.assertFalse(pool._is_v41_model())
+                self.assertIs(
+                    pool._window_kv_layout(),
+                    NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16,
+                )
+
+    def test_draft_validation_uses_the_pool_width_and_raises_value_error(self):
+        path = (
+            ROOT
+            / "python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py"
+        )
+        cls = next(
+            node
+            for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DeepseekV4AscendAttnBackend"
+        )
+        method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validate_draft_window_rows"
+        )
+        namespace = {"is_npu_arch35": lambda: True}
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+            namespace,
+        )
+        stub = ModuleType("sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout")
+        stub.NPUDSV4KVLayout = NPUDSV4KVLayout
+        swa = SimpleNamespace(
+            dsv4_arch35_packed_kv_dim=608,
+            layout=NPUDSV4KVLayout.V4_FP8,
+            kv_cache_total_dim=608,
+        )
+        backend = SimpleNamespace(token_to_kv_pool=SimpleNamespace(swa_kv_pool=swa))
+        with patch.dict(sys.modules, {stub.__name__: stub}):
+            namespace["_validate_draft_window_rows"](backend)
+            swa.kv_cache_total_dim = 544
+            with self.assertRaisesRegex(ValueError, "V4_FP8/608B"):
+                namespace["_validate_draft_window_rows"](backend)
+            swa.kv_cache_total_dim = 608
+            swa.layout = NPUDSV4KVLayout.V41_SWA_FP8
+            with self.assertRaises(ValueError):
+                namespace["_validate_draft_window_rows"](backend)
+
+    def test_writer_delegates_the_encoding_to_the_runtime(self):
+        classes = _pool_classes(arch35=True)
+        pool = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64)
+        stub = ModuleType("sgl_kernel_npu.operators.mem_cache")
+        stub.kv_compress_epilog = Mock()
+        buf = torch.empty(2, 128, 1, 608, dtype=torch.float8_e4m3fn)
+        cache = torch.randn(2, 512, dtype=torch.bfloat16)
+        loc = torch.tensor([1, 2], dtype=torch.int64)
+        with patch.dict(sys.modules, {stub.__name__: stub}):
+            classes["DSV4NPUTokenToKVPool"]._write_arch35_packed_kv(
+                pool, buf=buf, loc=loc, cache=cache
+            )
+        args, kwargs = stub.kv_compress_epilog.call_args
+        self.assertIs(args[0], buf)
+        torch.testing.assert_close(args[1], cache)
+        torch.testing.assert_close(args[2], loc)
+        self.assertEqual(kwargs, {})
 
 
 class TestA3PairStatePool(unittest.TestCase):
