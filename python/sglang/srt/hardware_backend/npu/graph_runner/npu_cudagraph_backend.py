@@ -66,6 +66,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
         self._tp_group = get_parallel().tp_group
+        if (
+            is_deepseek_v4(cuda_graph_runner.model_runner.model_config.hf_config)
+            and self._tp_group.world_size > 1
+        ):
+            # Initialize HCCP before the first custom AICPU metadata kernel.
+            # On affected CANN/driver stacks, starting HCCP afterwards can
+            # invalidate custom AICPU dispatch and fail with 507018.
+            warmup = torch.zeros(1, device=f"npu:{self._device_id}")
+            torch.distributed.all_reduce(warmup, group=self._tp_group.device_group)
+            self._device_module.synchronize()
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
