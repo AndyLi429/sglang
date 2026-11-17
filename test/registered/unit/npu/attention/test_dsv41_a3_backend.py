@@ -387,6 +387,30 @@ class TestA3Backend(unittest.TestCase):
         )
         self.assertEqual(selected.tolist(), [[0, 1, -1, -1], [0, 1, 2, -1]])
 
+    def test_int8_topk_preserves_indices_above_fp32_integer_range(self):
+        self.backend._dsv4_index_topk = 4
+        # A metadata-only tensor exercises the large-cache fallback without
+        # allocating its storage. These adjacent indices collide in FP32.
+        self.pool.get_index_k.return_value = torch.empty(
+            (262145, 64, 1, 128), device="meta", dtype=torch.int8
+        )
+        self.a3.indexer.return_value = (
+            torch.tensor([[[16777217, 16777216, -1, 16777219]]], dtype=torch.int32),
+            torch.empty(0),
+            self.blocks[:1],
+        )
+        selected, _ = self.backend._dsv41_a3_select(
+            self.layer,
+            self.index_q[:1].to(torch.int8),
+            torch.ones(1, 32, dtype=torch.float16),
+            self.w[:1].half(),
+            torch.tensor([16777218]),
+            self.fb,
+            mode=3,
+        )
+        self.assertEqual(selected.dtype, torch.int32)
+        self.assertEqual(selected.tolist(), [[16777216, 16777217, -1, -1]])
+
     def test_int8_metadata_refresh_preserves_captured_address_and_new_lengths(self):
         ptrs = {
             r: self.fm.kernel_metadata[f"c{r}a_qli_metadata"].data_ptr() for r in (1, 2)

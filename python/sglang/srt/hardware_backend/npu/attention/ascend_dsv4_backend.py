@@ -1749,9 +1749,10 @@ class LowRatioCompressAscendBackendMixin:
                 ),
             )
         metadata = self.forward_metadata.kernel_metadata[f"c{ratio}a_qli_metadata"]
+        k = self.token_to_kv_pool.get_index_k(layer.layer_id)
         indices, _, blocks = _dsv41_a3_ops().indexer(
             q,
-            self.token_to_kv_pool.get_index_k(layer.layer_id),
+            k,
             weights,
             q_scale,
             self.token_to_kv_pool.get_index_scale(layer.layer_id).squeeze(-1),
@@ -1771,9 +1772,15 @@ class LowRatioCompressAscendBackendMixin:
         selected = indices.view(q.shape[0], topk)
         visible = ((positions[: q.shape[0]] + 1) // ratio).unsqueeze(-1)
         valid = (selected >= 0) & (selected < visible)
-        sentinel = torch.iinfo(torch.int32).max
+        # INT32 sort runs on AICPU on A3. FP32 sort uses AICore and preserves
+        # integer indices exactly while the physical cache fits in 24 bits.
+        if k.shape[0] * k.shape[1] <= 1 << 24:
+            selected = selected.to(torch.float32)
+            sentinel = torch.finfo(torch.float32).max
+        else:
+            sentinel = torch.iinfo(torch.int32).max
         selected = torch.where(valid, selected, sentinel).sort(dim=-1).values
-        selected = torch.where(selected == sentinel, -1, selected)
+        selected = torch.where(selected == sentinel, -1, selected).to(torch.int32)
         return selected, blocks
 
     def _dsv41_a3_index_kwargs(self, forward_batch, ratio):
