@@ -138,7 +138,6 @@ def _validate_migration_weights(
     weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
 ) -> list[bool]:
     """Validate chunk compatibility and return its ND staging requirements."""
-    import torch_npu
 
     def specification(weights):
         return [
@@ -146,7 +145,7 @@ def _validate_migration_weights(
                 tuple(t.shape),
                 t.dtype,
                 t.device,
-                torch_npu.get_npu_format(t) not in (0, 2) or not t.is_contiguous(),
+                torch.ops.npu.get_npu_format(t) not in (0, 2) or not t.is_contiguous(),
             )
             for t in weights
         ]
@@ -184,12 +183,34 @@ class _ExpertWeightStaging:
         self._needs_staging = _validate_migration_weights(
             weights_by_layer, layer_ids, rank
         )
+        # ModelSlim packs NZ int8 storage through an int32 dtype view. CANN
+        # TransData cannot convert that packed int32 layout to/from ND. Migrate
+        # each expert's physical bytes instead, including its NZ padding.
+        sample = weights_by_layer[layer_ids[0]]
+        self._packed_nz = [
+            weight.ndim == 3
+            and weight.dtype == torch.int32
+            and torch.ops.npu.get_npu_format(weight) == 29
+            for weight in sample
+        ]
         self._completion_events = deque(maxlen=2)
+
+    @staticmethod
+    def _packed_shape(weight: torch.Tensor) -> tuple[int, int]:
+        # INT8 NZ uses 16 rows by 32 bytes per tile. The leading view may
+        # exclude fused shared experts, whose storage must remain untouched.
+        rows, packed_cols = weight.shape[-2:]
+        slot_bytes = ((rows + 15) // 16) * ((packed_cols * 4 + 31) // 32) * 512
+        return weight.shape[0], slot_bytes
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
-            torch.empty(weight.shape, dtype=weight.dtype, device=weight.device)
-            for weight in weights
+            torch.empty(
+                self._packed_shape(weight) if packed else weight.shape,
+                dtype=torch.int8 if packed else weight.dtype,
+                device=weight.device,
+            )
+            for weight, packed in zip(weights, self._packed_nz)
         ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -203,17 +224,42 @@ class _ExpertWeightStaging:
         previous_layer_done.record()
         self._completion_events.append(previous_layer_done)
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
-        return [
-            torch.ops.npu.npu_format_cast(weight, 2).contiguous() if needed else weight
-            for weight, needed in zip(weights, self._needs_staging)
-        ]
+        migration_weights = []
+        for weight, needed, packed in zip(
+            weights, self._needs_staging, self._packed_nz
+        ):
+            if packed:
+                num_experts, slot_bytes = self._packed_shape(weight)
+                buffer = torch.empty(
+                    (weight.untyped_storage().nbytes() // slot_bytes, slot_bytes),
+                    dtype=torch.int8,
+                    device=weight.device,
+                )
+                torch.ops.npu.copy_memory_(buffer, weight.view(torch.int8), True)
+                # Retain the full backing buffer for the physical writeback;
+                # only routed slots participate in expert migration.
+                buffer = buffer[:num_experts]
+            else:
+                buffer = (
+                    torch.ops.npu.npu_format_cast(weight, 2).contiguous()
+                    if needed
+                    else weight
+                )
+            migration_weights.append(buffer)
+        return migration_weights
 
     def store(
         self, weights: list[torch.Tensor], migration_weights: list[torch.Tensor]
     ) -> None:
-        for weight, buffer, needed in zip(
-            weights, migration_weights, self._needs_staging
+        for weight, buffer, needed, packed in zip(
+            weights, migration_weights, self._needs_staging, self._packed_nz
         ):
+            if packed:
+                full_buffer = buffer.as_strided(
+                    (buffer.untyped_storage().nbytes(),), (1,)
+                )
+                torch.ops.npu.copy_memory_(weight.view(torch.int8), full_buffer, True)
+                continue
             if not needed:
                 continue
             restored = torch.ops.npu.npu_format_cast(
