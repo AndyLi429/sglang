@@ -331,15 +331,23 @@ class TestA3Cache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one slot"):
             write(buf, torch.tensor([1]), values)
 
-    def test_a3_indexer_has_no_packed_copy_or_scale_payload(self):
+    def test_a3_int8_keys_and_scales_share_valid_slot_mask(self):
         pool = _index_pool(_pool_classes())
         self.assertFalse(hasattr(pool, "base_allocation_count"))
         self.assertIsNone(pool.index_k_with_scale_buffer)
         self.assertEqual(pool.get_index_k(0).shape, (5, 64, 1, 128))
-        self.assertEqual(pool.get_index_k(0).dtype, torch.bfloat16)
-        self.assertEqual(pool.get_index_scale(0).numel(), 0)
-        self.assertEqual(pool.contiguous_page_row_buffers()[0].shape, (5, 64 * 128 * 2))
-        pool.set_index_k_scale(0, torch.tensor([-1, 64]), torch.ones(2, 128), None)
+        self.assertEqual(pool.get_index_k(0).dtype, torch.int8)
+        self.assertEqual(pool.get_index_scale(0).dtype, torch.float16)
+        self.assertEqual(pool.get_index_scale(0).shape, (5, 64, 1, 1))
+        self.assertEqual(pool.contiguous_page_row_buffers()[0].shape, (5, 64 * 128))
+        pool.set_index_k_scale(
+            0,
+            torch.tensor([-1, 64]),
+            torch.ones(2, 128, dtype=torch.int8),
+            torch.tensor([3.0, 0.5]),
+        )
+        self.assertEqual(pool.get_index_scale(0)[0, 0].item(), 0)
+        self.assertEqual(pool.get_index_scale(0)[1, 0].item(), 0.5)
         self.assertEqual(pool.get_index_k(0)[0, 0].sum(), 0)
         self.assertEqual(pool.get_index_k(0)[1, 0].sum(), 128)
 
@@ -359,14 +367,11 @@ class TestA3Cache(unittest.TestCase):
                 self.assertIs(info.key.buffers[0], pool.get_index_k(0))
                 self.assertEqual(info.key.page_slots, 64)
                 self.assertEqual(info.key.layout, "pa_nd")
-                self.assertEqual(info.key.page_bytes, 64 * (64 if arch35 else 256))
-                if arch35:
-                    self.assertIs(info.scale.buffers[0], pool.get_index_scale(0))
-                    self.assertEqual(info.scale.page_bytes, 64 * 4)
-                    self.assertEqual(info.scale.page_slots, 64)
-                    self.assertEqual(info.scale.layout, "pa_nd")
-                else:
-                    self.assertIsNone(info.scale)
+                self.assertEqual(info.key.page_bytes, 64 * (64 if arch35 else 128))
+                self.assertIs(info.scale.buffers[0], pool.get_index_scale(0))
+                self.assertEqual(info.scale.page_bytes, 64 * (4 if arch35 else 2))
+                self.assertEqual(info.scale.page_slots, 64)
+                self.assertEqual(info.scale.layout, "pa_nd")
 
     def test_owner_mapping_routes_a3_writes_without_a5_ops(self):
         classes = _pool_classes()
@@ -385,7 +390,11 @@ class TestA3Cache(unittest.TestCase):
         )
         self.assertEqual(wrapper.get_compress_buffer(5)[1, 0].sum(), 512)
         wrapper.set_compress_buffer(
-            2, torch.tensor([64, -1]), torch.ones(2, 128), None, True
+            2,
+            torch.tensor([64, -1]),
+            torch.ones(2, 128, dtype=torch.int8),
+            torch.ones(2, dtype=torch.float16),
+            True,
         )
         self.assertEqual(wrapper.get_index_k(5)[1, 0].sum(), 128)
 
@@ -414,16 +423,17 @@ class TestA3Cache(unittest.TestCase):
                 for ratio in (1, 2):
                     buffers.extend(owner.kv_pools[ratio].kv_buffer)
                     buffers.extend(indexers[ratio].index_k_buffer)
-                    if arch35:
-                        buffers.extend(indexers[ratio].index_scale_buffer)
+                    buffers.extend(indexers[ratio].index_scale_buffer)
                 ptrs, lengths, strides = owner.get_contiguous_buf_infos()
                 self.assertEqual(ptrs, [buf.data_ptr() for buf in buffers])
                 self.assertEqual(lengths, [buf.nbytes for buf in buffers])
                 self.assertEqual(
                     strides,
-                    [40960, 8192, 512, 20480, 4096, 256]
-                    if arch35
-                    else [131072, 32768, 65536, 16384],
+                    (
+                        [40960, 8192, 512, 20480, 4096, 256]
+                        if arch35
+                        else [131072, 16384, 256, 65536, 8192, 128]
+                    ),
                 )
                 self.assertEqual(
                     owner.get_contiguous_buf_infos(), (ptrs, lengths, strides)
@@ -459,7 +469,7 @@ class TestA3Budget(unittest.TestCase):
         pool.kv_bytes = 584
         pool.attn_head_dim = 512
         pool.indexer_head_dim = 128
-        pool.low_ratio_index_bytes = 256 if a3 else 68
+        pool.low_ratio_index_bytes = 130 if a3 else 68
         pool.page_size = 128
         pool.num_layers_total = 40
         pool.stage_owner_layers = {1: [20], 2: [2, 8, 14]}
@@ -471,8 +481,8 @@ class TestA3Budget(unittest.TestCase):
         budget = self._budget()
         for ratio in (0, 1, 2):
             self.assertEqual(budget._get_paged_kv_bytes_per_token(ratio), 1024)
-        self.assertEqual(budget._compressed_bytes_per_full_token(1), 1280)
-        self.assertEqual(budget._compressed_bytes_per_full_token(2), 640)
+        self.assertEqual(budget._compressed_bytes_per_full_token(1), 1154)
+        self.assertEqual(budget._compressed_bytes_per_full_token(2), 577)
 
     def test_padding_matches_actual_physical_allocations(self):
         budget = self._budget()
@@ -485,10 +495,12 @@ class TestA3Budget(unittest.TestCase):
                 kv = _single_pool(classes, ratio, size=tokens // ratio)
                 index = _index_pool(classes, size=(tokens + 128) // ratio)
                 allocated += len(owners) * (
-                    kv.kv_buffer[0].nbytes + index.get_index_k(0).nbytes
+                    kv.kv_buffer[0].nbytes
+                    + index.get_index_k(0).nbytes
+                    + index.get_index_scale(0).nbytes
                 )
             allocated += 128 * 1024 * 40  # SWA reserved pages only
-            nominal = tokens * (1280 + 3 * 640)
+            nominal = tokens * (1154 + 3 * 577)
             with patch.dict("sys.modules", {fake_module.__name__: fake_module}):
                 self.assertEqual(
                     budget._get_low_ratio_kv_padding_bytes(tokens), allocated - nominal
@@ -550,7 +562,7 @@ class TestA3Budget(unittest.TestCase):
                 self.assertEqual(budget.bytes_per_swa_token, (40 + stages) * 1024)
                 self.assertEqual(
                     budget.bytes_per_full_token,
-                    3200 + (0.1 * (40 + stages) * 1024 if cap is None else 0),
+                    2885 + (0.1 * (40 + stages) * 1024 if cap is None else 0),
                 )
                 self.assertEqual(budget._spec_infl, 1.0)
 

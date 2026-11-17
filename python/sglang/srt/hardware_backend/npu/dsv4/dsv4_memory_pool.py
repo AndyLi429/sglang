@@ -321,14 +321,16 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 page_slots=self._kernel_page_size,
                 layout="pa_nd",
             ),
-            scale=DSV4PagedBufferInfo.from_buffers(
-                self.index_scale_buffer,
-                page_slots=self._kernel_page_size,
-                layout="pa_nd",
-            )
-            # A3 V4.1 BF16 index K has no scale payload to transfer.
-            if self.index_scale_buffer[0].numel()
-            else None,
+            scale=(
+                DSV4PagedBufferInfo.from_buffers(
+                    self.index_scale_buffer,
+                    page_slots=self._kernel_page_size,
+                    layout="pa_nd",
+                )
+                # Include the A3 FP16 and A5 E8M0 scale payloads.
+                if self.index_scale_buffer[0].numel()
+                else None
+            ),
         )
 
     @property
@@ -380,7 +382,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
 
 
 class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
-    """NPU DeepSeek-V4.1 index K: BF16 on A3, packed FP4 on A5.
+    """NPU DeepSeek-V4.1 index K: INT8/FP16 scale on A3, packed FP4 on A5.
 
     ``indexer_prologue_k`` consumes two separate PA_ND buffers
     (vendor operator design notes, ``indexer_prologue_k_dsl`` README)::
@@ -403,20 +405,18 @@ class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
     def _npu_index_row_dims(self) -> Tuple[int, int, torch.dtype, torch.dtype]:
         assert self.index_head_dim > 0, self.index_head_dim
         layout = (
-            NPUDSV4KVLayout.V41_CMP_FP4 if is_npu_arch35() else NPUDSV4KVLayout.V41_BF16
+            NPUDSV4KVLayout.V41_CMP_FP4 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
         )
         return layout.indexer_kv_info(self.index_head_dim)
-
-    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
-        if is_npu_arch35():
-            return super().contiguous_page_row_buffers()
-        return [buf.view(torch.uint8).flatten(1) for buf in self.index_k_buffer]
 
     def set_index_k_scale(self, layer_id, loc, index_k, index_k_scale):
         if is_npu_arch35():
             return super().set_index_k_scale(layer_id, loc, index_k, index_k_scale)
-        assert index_k_scale is None, "A3 V4.1 index K is unquantized BF16"
+        assert index_k_scale is not None, "A3 V4.1 INT8 index K requires FP16 scales"
         _write_dsv41_bf16_rows(self.index_k_buffer[layer_id], loc, index_k)
+        _write_dsv41_bf16_rows(
+            self.index_scale_buffer[layer_id], loc, index_k_scale.reshape(-1, 1)
+        )
 
 
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
@@ -718,7 +718,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 *indexer_pool.index_scale_buffer,
             ):
                 if not buf.numel():
-                    continue  # A3 BF16 index K has no scale payload to transfer.
+                    continue
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)

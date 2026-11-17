@@ -90,6 +90,7 @@ def build_backend():
         ]
         op = SimpleNamespace(
             attention=Mock(side_effect=lambda q, **kw: (q + 1, None)),
+            indexer_metadata=Mock(return_value=torch.ones(1024, dtype=torch.int32)),
             metadata=Mock(
                 side_effect=lambda *a, **kw: torch.full((2048,), 7, dtype=torch.int32)
             ),

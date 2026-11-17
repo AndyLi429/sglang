@@ -144,24 +144,28 @@ def _ds41_ops():
 
 @functools.cache
 def _dsv41_a3_ops():
-    """Use the paired BF16 A3 operators bundled by sgl-kernel-npu."""
+    """BF16 attention and INT8 indexer, restricted to A3 + CANN 9.2."""
+    import torch_npu
     from sgl_kernel_npu.operators.attention import (
         sparse_flash_mla,
         sparse_flash_mla_metadata,
     )
     from sgl_kernel_npu.operators.indexer import (
-        lightning_indexer_v2,
-        sparse_lightning_indexer,
+        quant_lightning_indexer,
+        quant_lightning_indexer_metadata,
     )
+    from sgl_kernel_npu.operators.utils.cann import detect_cann_version
 
+    if (
+        torch_npu._C._npu_get_soc_version() // 10 * 10 != 250
+        or not detect_cann_version().startswith("9.2.")
+    ):
+        raise RuntimeError("DeepSeek-V4.1 INT8 indexer requires A3 + CANN 9.2")
     return SimpleNamespace(
         attention=sparse_flash_mla,
         metadata=sparse_flash_mla_metadata,
-        indexer=lightning_indexer_v2,
-        # The public API selects the four-output overload when candidate
-        # arguments are supplied; ordinary top-k still returns two outputs.
-        candidate=lightning_indexer_v2,
-        sparse_indexer=sparse_lightning_indexer,
+        indexer=quant_lightning_indexer,
+        indexer_metadata=quant_lightning_indexer_metadata,
     )
 
 
@@ -1523,8 +1527,7 @@ class LowRatioCompressAscendBackendMixin:
             cache_dtype=torch.float32,
         )
         if not is_npu_arch35():
-            # This checkpoint does not require FP4 rounding. Store ordinary
-            # BF16 index keys, using the same pre-RoPE compressed latent.
+            # Quantize after RoPE, from the same pre-RoPE compressed latent.
             index_k = indexer.k_norm(indexer.wk(latent)).to(torch.bfloat16)
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 index_k.view(-1, 1, indexer.index_head_dim),
@@ -1533,7 +1536,16 @@ class LowRatioCompressAscendBackendMixin:
                 sin.view(-1, 1, 1, sin.shape[-1]),
                 qk_nope_dim=indexer.index_head_dim - indexer.rope_head_dim,
             )
-            pool.set_compress_buffer(layer.layer_id, cache_index, index_k, None, True)
+            index_k, index_scale = torch_npu.npu_dynamic_quant(
+                index_k, dst_type=torch.int8
+            )
+            pool.set_compress_buffer(
+                layer.layer_id,
+                cache_index,
+                index_k,
+                index_scale.to(torch.float16),
+                True,
+            )
             return
         ds41 = _ds41_ops()
         # Keep the NZ cast inside the traced region: hoisting it into a cached
@@ -1601,7 +1613,13 @@ class LowRatioCompressAscendBackendMixin:
             qk_nope_dim=indexer.index_head_dim - indexer.rope_head_dim,
         )
         if not is_npu_arch35():
-            return q, None, indexer.head_weights(x).view(-1, indexer.n_heads).float()
+            q_int8, q_scale = torch_npu.npu_dynamic_quant(q, dst_type=torch.int8)
+            weights = (
+                (indexer.head_weights_raw(x).float() * indexer.head_weight_scale)
+                .view(-1, indexer.n_heads)
+                .to(torch.float16)
+            )
+            return q_int8, q_scale.to(torch.float16), weights
         q_packed, q_scale = torch_npu.npu_dynamic_mx_quant(
             q, dst_type=torch_npu.float4_e2m1fn_x2
         )
@@ -1629,24 +1647,20 @@ class LowRatioCompressAscendBackendMixin:
 
         k = pool.get_index_k(layer.layer_id)
         if not is_npu_arch35():
-            kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
-            if candidate:
-                indices, _, blocks, lengths = _dsv41_a3_ops().candidate(
-                    q_packed,
-                    k,
-                    w,
-                    self._dsv4_index_topk,
-                    candidate_topk_blocks=indexer.candidate_topk_blocks,
-                    candidate_block_size=indexer.candidate_block_size,
-                    **kwargs,
-                )
-                # A3 V3 reserves candidate lengths (empty tensor); consumers
-                # use -1 padded block IDs, not the A5 length array.
-                return indices.view(t, -1), (blocks, lengths)
-            indices, _ = _dsv41_a3_ops().indexer(
-                q_packed, k, w, self._dsv4_index_topk, **kwargs
+            selected, blocks = self._dsv41_a3_select(
+                layer,
+                q_packed,
+                descale_q,
+                w,
+                pos,
+                forward_batch,
+                mode=1 if candidate else 3,
             )
-            return indices.view(t, -1), None
+            return selected, (
+                (blocks, torch.empty(0, dtype=torch.int32, device=q_packed.device))
+                if candidate
+                else None
+            )
         k_scale = pool.get_index_scale(layer.layer_id)
         # PA_ND rows are [pages, page_rows, 1, dim]; both views are pure
         # reshapes of the buffers the prologue wrote.
@@ -1710,6 +1724,54 @@ class LowRatioCompressAscendBackendMixin:
         if not candidate:
             return scored, None
         return scored, (candidate_indices, candidate_lengths)
+
+    def _dsv41_a3_select(
+        self,
+        layer,
+        q,
+        q_scale,
+        weights,
+        positions,
+        forward_batch,
+        *,
+        mode,
+        candidates=None,
+    ):
+        ratio = layer.compress_ratio
+        topk = self._dsv4_index_topk
+        if q.shape[0] == 0:
+            return (
+                torch.empty((0, topk), dtype=torch.int32, device=q.device),
+                torch.empty(
+                    (0, 1, layer.indexer.candidate_topk_blocks),
+                    dtype=torch.int32,
+                    device=q.device,
+                ),
+            )
+        metadata = self.forward_metadata.kernel_metadata[f"c{ratio}a_qli_metadata"]
+        indices, _, blocks = _dsv41_a3_ops().indexer(
+            q,
+            self.token_to_kv_pool.get_index_k(layer.layer_id),
+            weights,
+            q_scale,
+            self.token_to_kv_pool.get_index_scale(layer.layer_id).squeeze(-1),
+            topk,
+            2,
+            metadata=metadata,
+            candidate_mode=mode,
+            candidate_topk_index=candidates,
+            candidate_topk_blocks=layer.indexer.candidate_topk_blocks,
+            candidate_block_size=layer.indexer.candidate_block_size,
+            **self._dsv41_a3_index_kwargs(forward_batch, ratio),
+        )
+        # QLI may return score order. SMLA consumes chronological visible rows.
+        selected = indices.view(q.shape[0], topk)
+        visible = ((positions[: q.shape[0]] + 1) // ratio).unsqueeze(-1)
+        valid = (selected >= 0) & (selected < visible)
+        sentinel = torch.iinfo(torch.int32).max
+        selected = torch.where(valid, selected, sentinel).sort(dim=-1).values
+        selected = torch.where(selected == sentinel, -1, selected)
+        return selected, blocks
 
     def _dsv41_a3_index_kwargs(self, forward_batch, ratio):
         seq_lens = self._dsv41_a3_kv_lengths(forward_batch)
@@ -1787,16 +1849,17 @@ class LowRatioCompressAscendBackendMixin:
             )
         q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
         if not is_npu_arch35():
-            indices, _ = _dsv41_a3_ops().sparse_indexer(
+            selected, _ = self._dsv41_a3_select(
+                layer,
                 q_packed,
-                self.token_to_kv_pool.get_index_k(layer.layer_id),
+                descale_q,
                 w,
-                self._dsv4_index_topk,
-                candidate_indices,
-                candidate_block_size=indexer.candidate_block_size,
-                **self._dsv41_a3_index_kwargs(forward_batch, ratio),
+                pos,
+                forward_batch,
+                mode=2,
+                candidates=candidate_indices,
             )
-            return indices.view(t, -1)
+            return selected
         page_table = getattr(fm, f"c{ratio}_index_page_table", None)
         if page_table is None:
             raise RuntimeError(
@@ -1875,8 +1938,28 @@ class LowRatioCompressAscendBackendMixin:
         first.
         """
         if not is_npu_arch35():
-            # arch22 LI V2/V3 and SLI do not consume a metadata tensor.
-            return {}
+            fm = self.forward_metadata
+            out = {}
+            for ratio in self._dsv41_low_ratios():
+                kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
+                kwargs.pop("block_table")
+                value = _dsv41_a3_ops().indexer_metadata(
+                    self._dsv4_index_n_heads,
+                    1,
+                    self._dsv4_index_head_dim,
+                    self._dsv4_index_topk,
+                    2,
+                    batch_size=forward_batch.batch_size,
+                    **kwargs,
+                )
+                key = f"c{ratio}a_qli_metadata"
+                buf = fm.kernel_metadata.get(key)
+                if buf is not None:
+                    buf.copy_(value)
+                else:
+                    buf = value
+                out[key] = buf
+            return out
         fm = self.forward_metadata
         kv_lens = self._dsv41_qli_kv_lens(forward_batch)
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
@@ -2570,8 +2653,7 @@ class LowRatioCompressAscendBackendMixin:
         if not hasattr(metadata, "kernel_metadata") or metadata.kernel_metadata is None:
             metadata.kernel_metadata = {}
         if not is_npu_arch35():
-            # BF16 SMLA and its AICPU metadata have a fixed, shared ABI. Do not
-            # probe MQSMLA/QLI or allocate packed-index metadata on A3.
+            # Both BF16 SMLA and INT8 QLI keep stable metadata addresses.
             probe_batch = (
                 forward_batch
                 if forward_batch is not None
@@ -2601,6 +2683,34 @@ class LowRatioCompressAscendBackendMixin:
                     )
                 )
                 metadata.kernel_metadata[f"{attention_type}_metadata"] = buf
+            for ratio in self._dsv41_low_ratios():
+                key = f"kernel_metadata_c{ratio}a_qli"
+                buf = self.graph_metadata.get(key)
+                if buf is None:
+                    buf = torch.zeros(1024, dtype=torch.int32, device=device)
+                    self.graph_metadata[key] = buf
+                metadata.kernel_metadata[f"c{ratio}a_qli_metadata"] = buf
+                lengths = self._dsv41_a3_kv_lengths(probe_batch, metadata=metadata)
+                kwargs = dict(
+                    cu_seqlens_q=metadata.actual_seq_lengths_q_pa,
+                    seqused_k=(lengths // ratio).int(),
+                    cmp_residual_k=(lengths % ratio).int() if ratio > 1 else None,
+                    batch_size=bs,
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                    mask_mode=3,
+                    cmp_ratio=ratio,
+                )
+                buf.copy_(
+                    _dsv41_a3_ops().indexer_metadata(
+                        self._dsv4_index_n_heads,
+                        1,
+                        self._dsv4_index_head_dim,
+                        self._dsv4_index_topk,
+                        2,
+                        **kwargs,
+                    )
+                )
             return
         # Variable-size dispatch tables: probe one tensor per attention type.
         ds41 = _ds41_ops()

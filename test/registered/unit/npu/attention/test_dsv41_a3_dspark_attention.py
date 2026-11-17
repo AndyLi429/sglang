@@ -60,7 +60,10 @@ class TestA3DsparkMetadata(unittest.TestCase):
             F=F,
             SimpleNamespace=SimpleNamespace,
             is_npu_arch35=lambda: False,
-            _dsv41_a3_ops=lambda: SimpleNamespace(metadata=self.metadata_op),
+            _dsv41_a3_ops=lambda: SimpleNamespace(
+                metadata=self.metadata_op,
+                indexer_metadata=lambda *a, **k: torch.ones(1024, dtype=torch.int32),
+            ),
         )
         cls = load_class(BACKEND, "LowRatioCompressAscendBackendMixin", self.namespace)
         backend_class = next(
@@ -87,6 +90,8 @@ class TestA3DsparkMetadata(unittest.TestCase):
         self.backend._dsv4_q_head_num = 32
         self.backend._dsv4_head_dim = 512
         self.backend._dsv4_index_topk = 512
+        self.backend._dsv4_index_n_heads = 32
+        self.backend._dsv4_index_head_dim = 128
         self.backend._dsv4_sliding_window_size = 128
         self.backend._dsv4_graph_tokens_per_req = 5
         self.backend.graph_metadata = {}

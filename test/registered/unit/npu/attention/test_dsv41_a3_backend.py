@@ -78,8 +78,7 @@ class TestA3Backend(unittest.TestCase):
                 )
             ),
             indexer=Mock(),
-            candidate=Mock(),
-            sparse_indexer=Mock(),
+            indexer_metadata=Mock(return_value=torch.ones(1024, dtype=torch.int32)),
         )
         self.a5 = SimpleNamespace(
             mixed_quant_sparse_flash_mla=Mock(
@@ -148,10 +147,10 @@ class TestA3Backend(unittest.TestCase):
             get_compress_buffer=Mock(
                 return_value=torch.zeros(5, 64, 1, 512, dtype=torch.bfloat16)
             ),
-            get_index_k=Mock(
-                return_value=torch.zeros(5, 64, 1, 128, dtype=torch.bfloat16)
+            get_index_k=Mock(return_value=torch.zeros(5, 64, 1, 128, dtype=torch.int8)),
+            get_index_scale=Mock(
+                return_value=torch.ones(5, 64, 1, 1, dtype=torch.float16)
             ),
-            get_index_scale=Mock(side_effect=AssertionError("A3 requested FP4 scale")),
         )
         b.token_to_kv_pool = self.pool
         self.layer = SimpleNamespace(
@@ -167,13 +166,20 @@ class TestA3Backend(unittest.TestCase):
         self.q = torch.zeros(4, 32, 512, dtype=torch.bfloat16)
         self.index_q = torch.zeros(4, 32, 128, dtype=torch.bfloat16)
         self.w = torch.ones(4, 32, dtype=torch.float32)
-        b._dsv41_index_q = Mock(return_value=(self.index_q, None, self.w))
+        b._dsv41_index_q = Mock(
+            return_value=(
+                self.index_q.to(torch.int8),
+                torch.ones(4, 32, dtype=torch.float16),
+                self.w.half(),
+            )
+        )
         self.indices = torch.zeros(4, 1, 512, dtype=torch.int32)
         self.blocks = torch.zeros(4, 1, 2048, dtype=torch.int32)
         self.lengths = torch.empty(0, dtype=torch.int32)
-        self.a3.indexer.return_value = (self.indices, None)
-        self.a3.candidate.return_value = (self.indices, None, self.blocks, self.lengths)
-        self.a3.sparse_indexer.return_value = (self.indices, None)
+        self.a3.indexer.return_value = (self.indices, None, self.blocks)
+        self.fm.kernel_metadata.update(
+            {f"c{r}a_qli_metadata": torch.ones(1024, dtype=torch.int32) for r in (1, 2)}
+        )
 
         expansion = _definitions(
             METADATA, {"expand_index_page_table"}, {"torch": torch}
@@ -247,7 +253,7 @@ class TestA3Backend(unittest.TestCase):
             self.assertTrue(torch.all(out[:3] == 1))
             self.assertTrue(torch.all(out[3] == 0))
 
-    def test_a3_index_default_and_candidate_keep_bf16_and_residual_lengths(self):
+    def test_a3_int8_modes_preserve_compressed_lengths_and_candidates(self):
         for ratio in (1, 2):
             self.layer.compress_ratio = ratio
             for candidate in (False, True):
@@ -259,12 +265,15 @@ class TestA3Backend(unittest.TestCase):
                     self.fb,
                     candidate=candidate,
                 )
-                op = self.a3.candidate if candidate else self.a3.indexer
+                op = self.a3.indexer
                 args, kw = op.call_args
-                self.assertEqual(args[0].dtype, torch.bfloat16)
-                self.assertEqual(args[1].dtype, torch.bfloat16)
-                self.assertEqual(args[2].dtype, torch.float32)
-                self.assertEqual(args[3], 512)
+                self.assertEqual(args[0].dtype, torch.int8)
+                self.assertEqual(args[1].dtype, torch.int8)
+                self.assertEqual(args[2].dtype, torch.float16)
+                self.assertEqual(args[3].dtype, torch.float16)
+                self.assertEqual(args[4].dtype, torch.float16)
+                self.assertEqual(args[5:7], (512, 2))
+                self.assertEqual(kw["candidate_mode"], 1 if candidate else 3)
                 self.assertEqual(topk.shape, (4, 512))
                 self.assertEqual((kw["layout_q"], kw["layout_k"]), ("TND", "PA_BBND"))
                 self.assertTensorEqual(
@@ -276,11 +285,11 @@ class TestA3Backend(unittest.TestCase):
                     )
                 else:
                     self.assertIsNone(kw["cmp_residual_k"])
-                self.assertNotIn("metadata", kw)
+                self.assertEqual(kw["metadata"].numel(), 1024)
                 self.assertNotIn("descale_q", kw)
                 if candidate:
                     self.assertIs(blocks[0], self.blocks)
-                    self.assertIs(blocks[1], self.lengths)
+                    self.assertEqual(blocks[1].numel(), 0)
                     self.assertEqual(kw["candidate_topk_blocks"], 2048)
                 else:
                     self.assertIsNone(blocks)
@@ -290,14 +299,18 @@ class TestA3Backend(unittest.TestCase):
         topk = self.backend._dsv41_index_qsli_topk(
             self.layer, self.q, self.index_q, torch.arange(4), self.fb
         )
-        args, kw = self.a3.sparse_indexer.call_args
-        self.assertIs(args[4], self.blocks)
+        args, kw = self.a3.indexer.call_args
+        self.assertIs(kw["candidate_topk_index"], self.blocks)
+        self.assertEqual(kw["candidate_mode"], 2)
         self.assertEqual(kw["candidate_block_size"], 8)
         self.assertNotIn("candidate_block_length", kw)
         self.assertNotIn("descale_k", kw)
         self.assertIsNone(kw["cmp_residual_k"])
         self.assertEqual(topk.shape, (4, 512))
-        self.assertEqual(self.backend._dsv41_index_kernel_metadata(self.fb), {})
+        self.assertEqual(
+            set(self.backend._dsv41_index_kernel_metadata(self.fb)),
+            {"c1a_qli_metadata", "c2a_qli_metadata"},
+        )
 
     def test_a3_query_and_key_prologues_do_not_call_fp4_or_nz_ops(self):
         rope = SimpleNamespace(
@@ -312,13 +325,21 @@ class TestA3Backend(unittest.TestCase):
         )
         rope_module = ModuleType("sglang.srt.hardware_backend.npu.dsv4.dsv4_rope")
         rope_module.Dsv4NpuRoPE = rope
-        # Any attribute access for quantization/format casting now fails.
         torch_npu_module = ModuleType("torch_npu")
+
+        def dynamic_quant(value, dst_type):
+            scale = value.float().abs().amax(-1).clamp_min(1e-6) / 127
+            return (value.float() / scale.unsqueeze(-1)).round().to(dst_type), scale
+
+        torch_npu_module.npu_dynamic_quant = dynamic_quant
+        self.ns["torch_npu"] = torch_npu_module
         idx = self.layer.indexer
         idx.n_heads = 32
         idx.rope_head_dim = 64
         idx.wq_b = Mock(return_value=(self.index_q.flatten(1), None))
         idx.head_weights = Mock(return_value=self.w.to(torch.bfloat16))
+        idx.head_weights_raw = Mock(return_value=self.w.to(torch.bfloat16))
+        idx.head_weight_scale = 128**-0.5 * 32**-0.5
         idx.wk = Mock(return_value=torch.ones(4, 128, dtype=torch.bfloat16))
         idx.k_norm = Mock(side_effect=lambda value: value)
         self.layer.freqs_cis = torch.ones(1024, 32)
@@ -334,18 +355,51 @@ class TestA3Backend(unittest.TestCase):
                 self.backend, self.layer, self.q, self.index_q, torch.arange(4)
             )
             self.backend._dsv41_index_k_store(self.layer, self.q[:, 0])
-        self.assertEqual(q.dtype, torch.bfloat16)
+        self.assertEqual(q.dtype, torch.int8)
         self.assertEqual(q.shape, (4, 32, 128))
-        self.assertIsNone(scale)
-        self.assertEqual(w.dtype, torch.float32)
+        self.assertEqual(scale.dtype, torch.float16)
+        self.assertEqual(w.dtype, torch.float16)
         args = self.pool.set_compress_buffer.call_args.args
         self.assertEqual(args[0], self.layer.layer_id)
         self.assertIs(args[1], self.fm.c1_loc)
-        self.assertEqual(args[2].dtype, torch.bfloat16)
+        self.assertEqual(args[2].dtype, torch.int8)
         self.assertEqual(args[2].shape, (4, 128))
-        self.assertIsNone(args[3])
+        self.assertEqual(args[3].dtype, torch.float16)
         self.assertTrue(args[4])
         self.assertEqual(rope.apply_rotary_mul_inplace.call_count, 2)
+
+    def test_int8_topk_filters_future_rows_and_sorts_chronologically(self):
+        self.backend._dsv4_index_topk = 4
+        self.layer.compress_ratio = 2
+        self.a3.indexer.return_value = (
+            torch.tensor([[[9, 1, 0, -1]], [[3, 1, 0, 2]]], dtype=torch.int32),
+            torch.empty(0),
+            self.blocks[:2],
+        )
+        selected, _ = self.backend._dsv41_a3_select(
+            self.layer,
+            self.index_q[:2].to(torch.int8),
+            torch.ones(2, 32, dtype=torch.float16),
+            self.w[:2].half(),
+            torch.tensor([3, 5]),
+            self.fb,
+            mode=3,
+        )
+        self.assertEqual(selected.tolist(), [[0, 1, -1, -1], [0, 1, 2, -1]])
+
+    def test_int8_metadata_refresh_preserves_captured_address_and_new_lengths(self):
+        ptrs = {
+            r: self.fm.kernel_metadata[f"c{r}a_qli_metadata"].data_ptr() for r in (1, 2)
+        }
+        self.a3.indexer_metadata.side_effect = lambda *args, **kw: torch.full(
+            (1024,), int(kw["seqused_k"].sum()), dtype=torch.int32
+        )
+        self.fb.seq_lens = torch.tensor([5, 8, 1, 0])
+        out = self.backend._dsv41_index_kernel_metadata(self.fb)
+        for ratio in (1, 2):
+            buf = out[f"c{ratio}a_qli_metadata"]
+            self.assertEqual(buf.data_ptr(), ptrs[ratio])
+            self.assertTrue(torch.all(buf == (self.fb.seq_lens // ratio).sum()))
 
     def _init_graph(self, bs=8):
         fm = SimpleNamespace(
@@ -370,7 +424,8 @@ class TestA3Backend(unittest.TestCase):
             self.assertTrue(torch.all(fm.kernel_metadata[key] > 0))
         self.assertEqual(fm.c1_index_page_table.shape, (8, 4))
         self.assertEqual(fm.c2_index_page_table.shape, (8, 2))
-        self.assertNotIn("c1a_qli_metadata", fm.kernel_metadata)
+        self.assertEqual(fm.kernel_metadata["c1a_qli_metadata"].shape, (1024,))
+        self.assertEqual(fm.kernel_metadata["c2a_qli_metadata"].shape, (1024,))
 
     def test_a3_capture_uses_actual_batch_lengths_instead_of_probe_ones(self):
         fm = self._init_graph()
@@ -636,11 +691,17 @@ class TestA3OpLoading(unittest.TestCase):
         self.attention.sparse_flash_mla_metadata = Mock()
         self.attention.compressor_v2 = Mock()
         self.indexer = ModuleType("sgl_kernel_npu.operators.indexer")
-        self.indexer.lightning_indexer_v2 = Mock()
-        self.indexer.sparse_lightning_indexer = Mock()
+        self.indexer.quant_lightning_indexer = Mock()
+        self.indexer.quant_lightning_indexer_metadata = Mock()
+        cann = ModuleType("sgl_kernel_npu.operators.utils.cann")
+        cann.detect_cann_version = lambda: "9.2.0"
+        npu = ModuleType("torch_npu")
+        npu._C = SimpleNamespace(_npu_get_soc_version=lambda: 250)
         self.modules = {
             self.attention.__name__: self.attention,
             self.indexer.__name__: self.indexer,
+            cann.__name__: cann,
+            "torch_npu": npu,
         }
 
     def test_loads_public_kernel_apis_and_matching_metadata(self):
@@ -648,24 +709,20 @@ class TestA3OpLoading(unittest.TestCase):
             ops = self.ns["_dsv41_a3_ops"]()
         self.assertIs(ops.attention, self.attention.sparse_flash_mla)
         self.assertIs(ops.metadata, self.attention.sparse_flash_mla_metadata)
-        self.assertIs(ops.indexer, self.indexer.lightning_indexer_v2)
-        self.assertIs(ops.candidate, ops.indexer)
-        self.assertIs(ops.sparse_indexer, self.indexer.sparse_lightning_indexer)
-
-    def test_public_indexer_preserves_two_and_four_output_modes(self):
-        ordinary = (object(), object())
-        candidates = (*ordinary, object(), object())
-        self.indexer.lightning_indexer_v2.side_effect = lambda *args, **kwargs: (
-            candidates if kwargs.get("candidate_topk_blocks") is not None else ordinary
-        )
-        with patch.dict("sys.modules", self.modules):
-            ops = self.ns["_dsv41_a3_ops"]()
-        args = (object(), object(), object(), 512)
-        self.assertIs(ops.indexer(*args), ordinary)
+        self.assertIs(ops.indexer, self.indexer.quant_lightning_indexer)
         self.assertIs(
-            ops.candidate(*args, candidate_topk_blocks=2048, candidate_block_size=8),
-            candidates,
+            ops.indexer_metadata, self.indexer.quant_lightning_indexer_metadata
         )
+
+    def test_rejects_a2_and_cann91_before_loading_int8_path(self):
+        for soc, version in ((220, "9.2.0"), (250, "9.1.0")):
+            self.modules["torch_npu"]._C._npu_get_soc_version = lambda: soc
+            self.modules["sgl_kernel_npu.operators.utils.cann"].detect_cann_version = (
+                lambda: version
+            )
+            with patch.dict("sys.modules", self.modules):
+                with self.assertRaisesRegex(RuntimeError, "A3.*9.2"):
+                    self.ns["_dsv41_a3_ops"]()
 
     def test_public_api_resolution_is_cached(self):
         with patch.dict("sys.modules", self.modules):
@@ -682,7 +739,7 @@ class TestA3OpLoading(unittest.TestCase):
             )
 
     def test_missing_public_api_does_not_fall_back_to_standalone_vendor(self):
-        del self.indexer.sparse_lightning_indexer
+        del self.indexer.quant_lightning_indexer_metadata
         with patch.dict("sys.modules", self.modules):
             with self.assertRaises(ImportError):
                 self.ns["_dsv41_a3_ops"]()
