@@ -3517,6 +3517,12 @@ class DeepseekV4AscendAttnBackend(
             in_capture=in_capture,
         )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if self._dsv4_has_low_ratio and not is_npu_arch35():
+            # QLI metadata consumes device lengths and supports graph capture.
+            # Replay refreshes the persistent dispatch buffers before indexing.
+            self._dsv41_index_kernel_metadata(forward_batch)
+
     def _init_dsv4_graph_metadata(
         self,
         *,
@@ -4208,7 +4214,8 @@ class DeepseekV4AscendAttnBackend(
             self.forward_metadata = fm
             try:
                 self._dsv41_attention_kernel_metadata(ctx.forward_batch)
-                self._dsv41_index_kernel_metadata(ctx.forward_batch)
+                if is_npu_arch35():
+                    self._dsv41_index_kernel_metadata(ctx.forward_batch)
             finally:
                 self.forward_metadata = previous
             return

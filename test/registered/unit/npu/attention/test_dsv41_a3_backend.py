@@ -621,7 +621,12 @@ class TestA3GraphInitContract(unittest.TestCase):
             if isinstance(node, ast.ClassDef)
             and node.name == "DeepseekV4AscendAttnBackend"
         )
-        names = {"init_forward_metadata_out_graph", "_init_dsv4_graph_metadata"}
+        names = {
+            "init_forward_metadata_out_graph",
+            "init_forward_metadata_in_graph",
+            "_init_dsv4_graph_metadata",
+            "_refresh_graph_kernel_metadata",
+        }
         methods = [
             node
             for node in backend_class.body
@@ -648,6 +653,7 @@ class TestA3GraphInitContract(unittest.TestCase):
             "GraphInitBackend", (), {name: namespace[name] for name in names}
         )
         self.backend = backend_type()
+        self.namespace = namespace
         b = self.backend
         b.device = torch.device("cpu")
         b.is_hybrid_swa = False
@@ -710,6 +716,42 @@ class TestA3GraphInitContract(unittest.TestCase):
         b._apply_dsv4_graph_metadata.assert_called_once_with(
             metadata_key=2, forward_batch=self.forward_batch, in_capture=False
         )
+
+    def test_a3_indexer_metadata_runs_in_graph_only(self):
+        b = self.backend
+        original = SimpleNamespace()
+        captured = SimpleNamespace()
+        b.forward_metadata = original
+        b._dsv41_attention_kernel_metadata = Mock()
+        b._dsv41_index_kernel_metadata = Mock()
+        ctx = SimpleNamespace(fm=captured, forward_batch=self.forward_batch)
+        b._refresh_graph_kernel_metadata(ctx)
+        b._dsv41_attention_kernel_metadata.assert_called_once_with(self.forward_batch)
+        b._dsv41_index_kernel_metadata.assert_not_called()
+        self.assertIs(b.forward_metadata, original)
+        b.forward_metadata = captured
+        b.init_forward_metadata_in_graph(self.forward_batch)
+        b._dsv41_index_kernel_metadata.assert_called_once_with(self.forward_batch)
+
+    def test_a5_keeps_indexer_metadata_outside_graph(self):
+        self.namespace["is_npu_arch35"] = lambda: True
+        b = self.backend
+        b.forward_metadata = SimpleNamespace()
+        b._dsv41_attention_kernel_metadata = Mock()
+        b._dsv41_index_kernel_metadata = Mock()
+        ctx = SimpleNamespace(fm=b.forward_metadata, forward_batch=self.forward_batch)
+        b._refresh_graph_kernel_metadata(ctx)
+        b._dsv41_index_kernel_metadata.assert_called_once_with(self.forward_batch)
+        b._dsv41_index_kernel_metadata.reset_mock()
+        b.init_forward_metadata_in_graph(self.forward_batch)
+        b._dsv41_index_kernel_metadata.assert_not_called()
+
+    def test_non_low_ratio_graph_does_not_run_qli_metadata(self):
+        b = self.backend
+        b._dsv4_has_low_ratio = False
+        b._dsv41_index_kernel_metadata = Mock()
+        b.init_forward_metadata_in_graph(self.forward_batch)
+        b._dsv41_index_kernel_metadata.assert_not_called()
 
 
 class TestA3OpLoading(unittest.TestCase):
