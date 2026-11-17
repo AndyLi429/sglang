@@ -401,6 +401,15 @@ class TestA3Backend(unittest.TestCase):
             self.assertEqual(buf.data_ptr(), ptrs[ratio])
             self.assertTrue(torch.all(buf == (self.fb.seq_lens // ratio).sum()))
 
+    def test_int8_metadata_does_not_require_index_page_tables(self):
+        # Eager prefill creates dispatch metadata before compressor page tables.
+        del self.fm.c1_index_page_table
+        del self.fm.c2_index_page_table
+        out = self.backend._dsv41_index_kernel_metadata(self.fb)
+        self.assertEqual(set(out), {"c1a_qli_metadata", "c2a_qli_metadata"})
+        for call in self.a3.indexer_metadata.call_args_list:
+            self.assertNotIn("block_table", call.kwargs)
+
     def _init_graph(self, bs=8):
         fm = SimpleNamespace(
             block_tables=torch.ones(bs, 2, dtype=torch.int32),

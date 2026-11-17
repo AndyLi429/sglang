@@ -1762,6 +1762,9 @@ class LowRatioCompressAscendBackendMixin:
             candidate_topk_index=candidates,
             candidate_topk_blocks=layer.indexer.candidate_topk_blocks,
             candidate_block_size=layer.indexer.candidate_block_size,
+            block_table=getattr(self.forward_metadata, f"c{ratio}_index_page_table").to(
+                torch.int32
+            ),
             **self._dsv41_a3_index_kwargs(forward_batch, ratio),
         )
         # QLI may return score order. SMLA consumes chronological visible rows.
@@ -1779,9 +1782,6 @@ class LowRatioCompressAscendBackendMixin:
             cu_seqlens_q=self.forward_metadata.actual_seq_lengths_q_pa,
             seqused_k=seq_lens // ratio,
             cmp_residual_k=seq_lens % ratio if ratio > 1 else None,
-            block_table=getattr(self.forward_metadata, f"c{ratio}_index_page_table").to(
-                torch.int32
-            ),
             layout_q="TND",
             layout_k="PA_BBND",
             mask_mode=3,
@@ -1942,7 +1942,6 @@ class LowRatioCompressAscendBackendMixin:
             out = {}
             for ratio in self._dsv41_low_ratios():
                 kwargs = self._dsv41_a3_index_kwargs(forward_batch, ratio)
-                kwargs.pop("block_table")
                 value = _dsv41_a3_ops().indexer_metadata(
                     self._dsv4_index_n_heads,
                     1,
