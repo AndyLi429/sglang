@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4_mhc import HcSubLayer, HcTriplet
