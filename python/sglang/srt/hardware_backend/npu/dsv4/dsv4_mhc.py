@@ -75,6 +75,35 @@ def mix_stats_torch(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     return pre, post_mix, comb
 
 
+@lru_cache(maxsize=1)
+def _has_a3_mhc_post() -> bool:
+    import torch_npu
+
+    return torch_npu._C._npu_get_soc_version() // 10 * 10 == 250 and _has_cann_92()
+
+
+def post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        envs.SGLANG_NPU_DSV41_A3_MHC_POST.get()
+        and residual.shape[1] == 4
+        and x.shape[-1] % 128 == 0
+        and x.dtype == residual.dtype == torch.bfloat16
+        and post_mix.dtype == comb.dtype == torch.float32
+        and _has_a3_mhc_post()
+    ):
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+
+        return mhc_post_dpskv4(
+            x, residual, post_mix, comb, impl="cann_ops_transformers_cann920"
+        )
+    return post_torch(x, residual, post_mix, comb)
+
+
 def post_torch(
     x: torch.Tensor,
     residual: torch.Tensor,
