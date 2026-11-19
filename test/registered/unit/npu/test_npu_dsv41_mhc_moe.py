@@ -1,5 +1,6 @@
 """CPU references for A3 DSV4.1 mHC and clipped W8A8 activations."""
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -58,6 +59,7 @@ class TestA3Mhc(unittest.TestCase):
                 with (
                     patch.object(mhc, "_is_npu", True),
                     patch.object(mhc, "is_npu_arch35", return_value=False),
+                    npu_mhc.envs.SGLANG_NPU_DSV41_A3_MHC_SINKHORN.override(False),
                 ):
                     actual = mhc._combine(hc, state, None)
                 expected = (
@@ -70,6 +72,26 @@ class TestA3Mhc(unittest.TestCase):
                     state.stats, npu_mhc.mix_stats_torch(hc, x)
                 ):
                     torch.testing.assert_close(result, reference)
+
+    def test_fused_stats_feed_next_sublayer_without_using_vendor_hin(self):
+        hc, x = _hc_fixture()
+        previous = torch.rand(3, 4)
+        pre, post, comb = npu_mhc.mix_stats_torch(hc, x)
+        vendor_hin = torch.full_like(x[:, 0], float("nan"))
+        fused = Mock(return_value=(vendor_hin, post, comb.flatten(1), pre))
+        operators = SimpleNamespace(mhc_pre_sinkhorn=fused)
+        state = SimpleNamespace(stats=None)
+        with (
+            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": operators}),
+            patch.object(mhc, "is_npu_arch35", return_value=False),
+            patch.object(npu_mhc, "_has_cann_92", return_value=True),
+            npu_mhc.envs.SGLANG_NPU_DSV41_A3_MHC_SINKHORN.override(True),
+        ):
+            actual = mhc._npu_combine_premix(hc, state, x, previous)
+        expected = (x.float() * previous.unsqueeze(-1)).sum(1).bfloat16()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertIs(state.stats[0], pre)
+        self.assertEqual(fused.call_args.kwargs, {"return_pre": True})
 
     def test_post_matrix_orientation_and_bf16_output(self):
         hc, residual = _hc_fixture()
