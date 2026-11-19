@@ -121,6 +121,27 @@ def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
     return (exps << 23).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
 
 
+def _use_a3_e8m0_lut(weight: torch.Tensor) -> bool:
+    if (
+        weight.device.type != "npu"
+        or weight.dtype != torch.int8
+        or not envs.SGLANG_NPU_DSV41_A3_ENGRAM_E8M0_LUT.get()
+    ):
+        return False
+
+    import torch_npu
+    from sgl_kernel_npu.operators.utils.cann import detect_cann_version
+
+    return (
+        torch_npu._C._npu_get_soc_version() // 10 * 10 == 250
+        and detect_cann_version().startswith("9.2.")
+    )
+
+
+def _e8m0_lut_gather(raw: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
+    return lut.index_select(0, raw.reshape(-1).to(torch.int32)).view(raw.shape)
+
+
 def _is_prime(n: int) -> bool:
     """Deterministic Miller-Rabin; exact for n < 3.3e24 with these witnesses."""
     if n < 2:
@@ -1194,6 +1215,12 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+        lut = None
+        if _use_a3_e8m0_lut(self.weight):
+            # Build the exact values on the host once, including 0 and 255.
+            raw = torch.arange(256, device="cpu", dtype=torch.int32)
+            lut = _e8m0_to_float(raw).to(self.weight.device)
+        self.register_buffer("_e8m0_lut", lut, persistent=False)
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1377,7 +1404,11 @@ class EngramEmbedding(nn.Module):
                 # Only the requested rows are dequantized, using graph-safe
                 # INT8/UINT8 gathers and FP32 arithmetic (no FP8 casts on A3).
                 weight = weight[local]
-                scale = _e8m0_to_float(scale[local])
+                scale = scale[local]
+                if self._e8m0_lut is None:
+                    scale = _e8m0_to_float(scale)
+                else:
+                    scale = _e8m0_lut_gather(scale, self._e8m0_lut)
             elif _needs_fp8_byte_view():
                 # A5 has neither an fp8 index nor an e8m0 cast, so both tables are
                 # read as bytes and the scale's float bits are built directly.
