@@ -384,9 +384,11 @@ def mix_stats_from_state(
 
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     if _is_npu and not is_npu_arch35() and hc.cfg.pre_from_prev:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import (
+            mix_stats as npu_mix_stats,
+        )
 
-        return mix_stats_torch(hc, x)
+        return npu_mix_stats(hc, x)
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -578,9 +580,11 @@ def _npu_combine_premix(
         )
         return hc.norm(x[:, 0, :])
     if not is_npu_arch35():
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import (
+            mix_stats as npu_mix_stats,
+        )
 
-        state.stats = mix_stats_torch(hc, x)
+        state.stats = npu_mix_stats(hc, x)
         mixed = x[:, 0, :] if apply_pre is None else combine_premix(x, apply_pre)
         return hc.norm(mixed)
     if apply_pre is None:
