@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_mhc as npu_mhc
+from sglang.srt.hardware_backend.npu.dsv4 import mhc_coeff
 from sglang.srt.hardware_backend.npu.moe import activation
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,6 +30,35 @@ def _hc_fixture(tokens=3):
 
 
 class TestA3Mhc(unittest.TestCase):
+    def test_coefficient_op_is_opt_in_and_checks_shape(self):
+        hc, _ = _hc_fixture()
+        hc.fn = torch.zeros(24, 20480)
+        x = torch.zeros(24, 4, 5120, dtype=torch.bfloat16)
+        expected = npu_mhc.mix_stats_torch(hc, x)
+        bridge_result = (*expected[:2], expected[2].flatten(1))
+        flag = npu_mhc.envs.SGLANG_NPU_DSV41_A3_MHC_COEFF
+
+        with (
+            patch.object(npu_mhc, "_has_a3_mhc_coeff", return_value=True),
+            patch.object(mhc_coeff, "coefficients", return_value=bridge_result) as op,
+        ):
+            with flag.override(False):
+                npu_mhc.mix_stats(hc, x)
+                op.assert_not_called()
+            with flag.override(True):
+                actual = npu_mhc.mix_stats(hc, x)
+                op.assert_called_once_with(
+                    x, hc.fn, hc.scale, hc.base, 4, 20, 1e-6, 1e-20
+                )
+                for value, reference in zip(actual, expected):
+                    torch.testing.assert_close(value, reference)
+                for value, reference in zip(
+                    npu_mhc.mix_stats(hc, x[:7]),
+                    npu_mhc.mix_stats_torch(hc, x[:7]),
+                ):
+                    torch.testing.assert_close(value, reference)
+                self.assertEqual(op.call_count, 1)
+
     def test_triplet_matches_fused_sinkhorn_formula(self):
         hc, x = _hc_fixture()
         flat = x.flatten(1).float()
