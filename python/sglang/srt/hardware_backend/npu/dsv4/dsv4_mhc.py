@@ -1,14 +1,74 @@
-"""A3 DSV4.1 mHC using native Torch operators, without the A5 fused kernels."""
+"""A3 DSV4.1 mHC coefficients and residual mixing."""
 
 from __future__ import annotations
 
+import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4_mhc import HcSubLayer, HcTriplet
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _has_a3_mhc_coeff() -> bool:
+    from sgl_kernel_npu.operators.utils.cann import detect_cann_version
+
+    return (
+        torch.npu.get_device_name() == "Ascend910_9362"
+        and detect_cann_version() == "9.2.0"
+    )
+
+
+@lru_cache(maxsize=None)
+def _log_mhc_coeff_route(rows: int) -> None:
+    logger.info("MhcPreSinkhornCoeff route M=%d", rows)
+
+
+def mix_stats(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    cfg = hc.cfg
+    if (
+        envs.SGLANG_NPU_DSV41_A3_MHC_COEFF.get()
+        and x.shape[0] in (6, 12, 24, 48, 72, 4096, 8192)
+        and x.shape[1:] == (4, 5120)
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and hc.fn.dtype == hc.scale.dtype == hc.base.dtype == torch.float32
+        and hc.fn.shape == (24, 20480)
+        and hc.scale.shape == (3,)
+        and hc.base.shape == (24,)
+        and hc.fn.is_contiguous()
+        and hc.scale.is_contiguous()
+        and hc.base.is_contiguous()
+        and cfg.mult == 4
+        and cfg.sinkhorn_iters == 20
+        and cfg.eps == 1e-6
+        and cfg.rms_eps == 1e-20
+        and _has_a3_mhc_coeff()
+    ):
+        from sglang.srt.hardware_backend.npu.dsv4.mhc_coeff import coefficients
+
+        pre, post, comb = coefficients(
+            x,
+            hc.fn,
+            hc.scale,
+            hc.base,
+            cfg.mult,
+            cfg.sinkhorn_iters,
+            cfg.eps,
+            cfg.rms_eps,
+        )
+        _log_mhc_coeff_route(x.shape[0])
+        return pre, post, comb.reshape(-1, cfg.mult, cfg.mult)
+
+    return mix_stats_torch(hc, x)
 
 
 def mix_stats_torch(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:

@@ -1987,6 +1987,8 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # Requires the A3 MhcPreSinkhornCoeff custom OPP for CANN 9.2.0.
+    SGLANG_NPU_DSV41_A3_MHC_COEFF = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
