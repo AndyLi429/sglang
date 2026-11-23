@@ -36,6 +36,35 @@ class TestModelSlimMapping(CustomTestCase):
                 prefix=prefix,
             )
 
+    def test_deepseek_v4_remapping_uses_model_architecture(self):
+        checkpoint_key = "layers.0.attn.wq_a.weight"
+        runtime_key = "model.layers.0.self_attn.wq_a.weight"
+        dsv4_module = SimpleNamespace(
+            DeepseekV4ForCausalLM=SimpleNamespace(
+                remap_weight_name_to_dpsk_hf_format={checkpoint_key: runtime_key}.get
+            )
+        )
+        with patch.dict("sys.modules", {"sglang.srt.models.deepseek_v4": dsv4_module}):
+            config = ModelSlimConfig.from_config(
+                {
+                    "hf_config": SimpleNamespace(
+                        architectures=["DeepseekV4ForCausalLM"]
+                    ),
+                    checkpoint_key: "W8A8",
+                }
+            )
+        self.assertEqual(config.quant_description, {runtime_key: "W8A8"})
+
+    def test_other_architecture_preserves_native_expert_key(self):
+        checkpoint_key = "layers.0.ffn.experts.0.w1.weight"
+        config = ModelSlimConfig.from_config(
+            {
+                "hf_config": SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+                checkpoint_key: "W8A8",
+            }
+        )
+        self.assertEqual(config.quant_description, {checkpoint_key: "W8A8"})
+
     def test_qwen_qkvz_uses_model_mapping_and_creates_int8_weights(self):
         """Use qkv + z descriptions to create an INT8 qkvz weight."""
         parent = "model.layers.0.linear_attn."

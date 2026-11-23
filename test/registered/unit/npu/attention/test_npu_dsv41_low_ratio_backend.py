@@ -235,6 +235,11 @@ class TestRowLayout(unittest.TestCase):
         # 64 payload bytes + 4 scale bytes per 128-dim row == 68.
         self.assertEqual(get_dsv4_indexer_bytes_per_token(128, True), 68)
 
+    def test_index_row_is_bf16_on_a3(self):
+        self.assertEqual(
+            get_dsv4_indexer_bytes_per_token(128, False, use_bf16_indexer=True), 256
+        )
+
     def test_empty_head_dim_is_rejected(self):
         with self.assertRaises(AssertionError):
             NPUDSV4KVLayout.V41_CMP_FP4.kv_info(0, 0)
