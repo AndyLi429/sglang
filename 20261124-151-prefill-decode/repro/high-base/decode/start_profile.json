@@ -1,0 +1,10 @@
+{
+  "output_dir": "/tmp/dsv41-a3-throughput-next-20261124/high-base/decode/traces",
+  "num_steps": 5,
+  "activities": [
+    "CPU",
+    "GPU"
+  ],
+  "with_stack": false,
+  "record_shapes": false
+}

@@ -1,0 +1,4 @@
+set -eo pipefail
+source /tmp/dsv41-a3-moe-runtime-20261119/env.sh
+export BENCH_PREFIX_TOKENS=59008 BENCH_ATTN_DP=8 SGLANG_IS_IN_CI=0
+exec python /tmp/dsv41-a3-sla-matrix-20261123/bench_cache.py --backend sglang --host 127.0.0.1 --port 25013 --model /mnt/paas/weights/DeepSeek-V4.1-Flash-1017-w4a8 --served-model-name dsv41-a3-int8-indexer --tokenizer /mnt/paas/weights/DeepSeek-V4.1-Flash-1017-w4a8 --dataset-name random --dataset-path /tmp/pr1045-lph1118-20261119/bench-inputs.json --random-input-len 65536 --random-output-len 1024 --random-range-ratio 1 --tokenize-prompt --num-prompts 128 --max-concurrency 64 --request-rate inf --temperature 0 --warmup-requests 0 --seed 12346 --disable-tqdm --cache-report --output-details --tag throughput-high-eplb512-12346 --output-file /tmp/dsv41-a3-throughput-next-20261124/high-eplb512/timing2/raw.jsonl
