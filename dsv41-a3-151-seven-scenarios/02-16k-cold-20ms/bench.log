@@ -1,0 +1,70 @@
+/usr/local/python3.12.15/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:13: FutureWarning: triton.language.extra.cann.extension.atan2 is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.atan2 instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.atan2")
+/usr/local/python3.12.15/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:35: FutureWarning: triton.language.extra.cann.extension.isfinited is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.isfinited instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.isfinited")
+/usr/local/python3.12.15/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:49: FutureWarning: triton.language.extra.cann.extension.finitef is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.finitef instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.finitef")
+benchmark_args=Namespace(backend='sglang', base_url=None, host='127.0.0.1', port=25013, ready_check_timeout_sec=60, dataset_name='random', dataset_path='/tmp/pr1045-lph1118-20261119/bench-inputs.json', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='/mnt/paas/weights/DeepSeek-V4.1-Flash-1017-w4a8', served_model_name='dsv41-a3-int8-indexer', tokenizer='/mnt/paas/weights/DeepSeek-V4.1-Flash-1017-w4a8', num_prompts=26, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=16384, random_output_len=1024, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=13, output_file='/tmp/dsv41-a3-mhc-premix-151/runs/perf-premix/seed-12346/raw.jsonl', output_details=True, goodput=None, print_requests=False, disable_tqdm=True, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=True, seed=12346, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=0, tokenize_prompt=True, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='mhc-premix-perf-premix-12346', header=None, rust_client=False, rust_worker_threads=None)
+Waiting up to 60s for http://127.0.0.1:25013/v1/models to become ready...
+Server ready in 0.0s.
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+
+WARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.
+Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.
+
+Namespace(backend='sglang', base_url=None, host='127.0.0.1', port=25013, ready_check_timeout_sec=60, dataset_name='random', dataset_path='/tmp/pr1045-lph1118-20261119/bench-inputs.json', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='/mnt/paas/weights/DeepSeek-V4.1-Flash-1017-w4a8', served_model_name='dsv41-a3-int8-indexer', tokenizer='/mnt/paas/weights/DeepSeek-V4.1-Flash-1017-w4a8', num_prompts=26, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=16384, random_output_len=1024, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=13, output_file='/tmp/dsv41-a3-mhc-premix-151/runs/perf-premix/seed-12346/raw.jsonl', output_details=True, goodput=None, print_requests=False, disable_tqdm=True, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=True, seed=12346, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=False, flush_cache_timeout=60.0, warmup_requests=0, tokenize_prompt=True, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag='mhc-premix-perf-premix-12346', header=None, rust_client=False, rust_worker_threads=None)
+
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+#Input tokens: 425984
+#Output tokens: 26624
+Starting warmup with 0 sequences...
+Warmup completed with 0 sequences. Starting main benchmark run...
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang    
+Traffic request rate:                    inf       
+Max request concurrency:                 13        
+Successful requests:                     26        
+Benchmark duration (s):                  51.81     
+Total input tokens:                      425984    
+Total input text tokens:                 425984    
+Total generated tokens:                  26624     
+Total generated tokens (retokenized):    26610     
+Request throughput (req/s):              0.50      
+Input token throughput (tok/s):          8222.67   
+Output token throughput (tok/s):         513.92    
+Peak output token throughput (tok/s):    1158.00   
+Peak concurrent requests:                25        
+Total token throughput (tok/s):          8736.58   
+Concurrency:                             12.94     
+Accept length:                           6.00      
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   25787.17  
+Median E2E Latency (ms):                 25782.83  
+P90 E2E Latency (ms):                    26390.24  
+P95 E2E Latency (ms):                    26438.38  
+P99 E2E Latency (ms):                    33948.15  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          6784.54   
+Median TTFT (ms):                        6692.73   
+P90 TTFT (ms):                           10023.54  
+P95 TTFT (ms):                           10025.43  
+P99 TTFT (ms):                           12153.18  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          18.58     
+Median TPOT (ms):                        18.66     
+P90 TPOT (ms):                           22.47     
+P95 TPOT (ms):                           22.52     
+P99 TPOT (ms):                           25.00     
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           18.58     
+Median ITL (ms):                         11.53     
+P90 ITL (ms):                            18.47     
+P95 ITL (ms):                            18.74     
+P99 ITL (ms):                            28.61     
+Max ITL (ms):                            1667.52   
+----------------Cache Hit Details-----------------
+Total prompt tokens:                     425984    
+Total cached tokens:                     0         
+Cache hit rate:                          0.0%
+==================================================
