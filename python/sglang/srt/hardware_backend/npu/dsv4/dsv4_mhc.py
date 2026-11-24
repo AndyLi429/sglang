@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,13 +13,6 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4_mhc import HcSubLayer, HcTriplet
 
 
-@lru_cache(maxsize=1)
-def _has_cann_92() -> bool:
-    from sgl_kernel_npu.operators.utils.cann import detect_cann_version
-
-    return detect_cann_version().startswith("9.2.")
-
-
 def mix_stats(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     cfg = hc.cfg
     if (
@@ -28,7 +20,6 @@ def mix_stats(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         or x.shape[0] == 0
         or cfg.mult != 4
         or cfg.sinkhorn_iters != 20
-        or not _has_cann_92()
     ):
         return mix_stats_torch(hc, x)
 
