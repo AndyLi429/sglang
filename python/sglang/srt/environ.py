@@ -2144,7 +2144,6 @@ class Envs:
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
-    SGLANG_NPU_DSV41_A3_MHC_SINKHORN = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)

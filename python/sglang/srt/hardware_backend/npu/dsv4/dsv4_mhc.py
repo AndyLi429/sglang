@@ -7,20 +7,13 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
-
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4_mhc import HcSubLayer, HcTriplet
 
 
 def mix_stats(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     cfg = hc.cfg
-    if (
-        not envs.SGLANG_NPU_DSV41_A3_MHC_SINKHORN.get()
-        or x.shape[0] == 0
-        or cfg.mult != 4
-        or cfg.sinkhorn_iters != 20
-    ):
+    if x.shape[0] == 0 or cfg.mult != 4 or cfg.sinkhorn_iters != 20:
         return mix_stats_torch(hc, x)
 
     from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
